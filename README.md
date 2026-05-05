@@ -87,3 +87,4 @@ jobs:
   - [ ] Docker build & push steps
   - [ ] Slack / Discord notifications
   - [ ] RBAC and multi-user support
+test
