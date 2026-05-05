@@ -13,9 +13,17 @@ const (
 	StatusCancelled RunStatus = "cancelled"
 )
 
+// Source defines where the pipeline code comes from.
+type Source struct {
+	Type string `yaml:"type" json:"type"`
+	URL  string `yaml:"url"  json:"url"`
+	Ref  string `yaml:"ref"  json:"ref"`
+}
+
 // Pipeline is the top-level definition parsed from a .drev.yml file.
 type Pipeline struct {
 	Name     string            `yaml:"name"     json:"name"`
+	Source   Source            `yaml:"source"   json:"source"`
 	Triggers []string          `yaml:"triggers" json:"triggers"`
 	Env      map[string]string `yaml:"env"      json:"env"`
 	Jobs     []Job             `yaml:"jobs"     json:"jobs"`

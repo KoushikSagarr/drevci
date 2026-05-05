@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
@@ -39,7 +39,7 @@ func New(store store.Store) (*Runner, error) {
 	}, nil
 }
 
-func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, logWriter io.Writer) error {
+func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
 	fmt.Fprintf(logWriter, "[drev] pulling image: %s\n", job.Image)
 	reader, err := r.docker.ImagePull(ctx, job.Image, image.PullOptions{})
 	if err != nil {
@@ -47,12 +47,6 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 	}
 	io.Copy(logWriter, reader)
 	reader.Close()
-
-	workspaceDir, err := os.MkdirTemp("", "drev-workspace-*")
-	if err != nil {
-		return fmt.Errorf("creating workspace dir: %w", err)
-	}
-	defer os.RemoveAll(workspaceDir)
 
 	var cmds []string
 	for _, step := range job.Steps {
@@ -72,7 +66,7 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 		WorkingDir: "/workspace",
 		Env:        envVars,
 	}, &container.HostConfig{
-		Binds: []string{workspaceDir + ":/workspace"},
+		Binds: []string{w.Dir + ":/workspace"},
 	}, nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("creating container: %w", err)

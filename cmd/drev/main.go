@@ -108,12 +108,12 @@ func main() {
 			var run drevtypes.Run
 			json.NewDecoder(res.Body).Decode(&run)
 
-			if run.Status == drevtypes.StatusSuccess {
+			if run.Status == drevtypes.StatusFailed || run.Status == drevtypes.StatusCancelled {
+				fmt.Printf("✗ Pipeline failed (status: %s)\n", run.Status)
+				os.Exit(1)
+			} else {
 				fmt.Println("✓ Pipeline succeeded")
 				os.Exit(0)
-			} else {
-				fmt.Println("✗ Pipeline failed")
-				os.Exit(1)
 			}
 		},
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/drevci/drev/internal/runner"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 	"golang.org/x/sync/errgroup"
 )
@@ -95,6 +96,18 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 		runJobMap[rj.JobName] = rj
 	}
 
+	w, err := workspace.Create()
+	if err != nil {
+		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+		return err
+	}
+	defer w.Cleanup()
+
+	if err := w.Clone(ctx, pipeline.Source, logWriter); err != nil {
+		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+		return err
+	}
+
 	jobDoneChans := make(map[string]chan struct{})
 	for _, job := range pipeline.Jobs {
 		jobDoneChans[job.Name] = make(chan struct{})
@@ -122,7 +135,7 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 
 			s.store.UpdateRunJobStatus(egCtx, rj.ID, drevtypes.StatusRunning)
 
-			err := s.runner.RunJob(egCtx, run, &job, logWriter)
+			err := s.runner.RunJob(egCtx, run, &job, w, logWriter)
 
 			if err != nil {
 				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)

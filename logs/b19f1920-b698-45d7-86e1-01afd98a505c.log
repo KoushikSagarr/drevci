@@ -1,0 +1,8 @@
+[drev] cloning https://github.com/golang/example.git @ master
+Cloning into '.'...
+[drev] pulling image: golang:1.23-alpine
+{"status":"Pulling from library/golang","id":"1.23-alpine"}
+{"status":"Digest: sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f"}
+{"status":"Status: Image is up to date for golang:1.23-alpine"}
+[drev] --- step: install deps ---
+[drev] --- step: run tests ---

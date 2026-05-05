@@ -1,0 +1,32 @@
+[drev] cloning https://github.com/golang/example.git @ master
+Cloning into '.'...
+[drev] pulling image: golang:1.23-alpine
+{"status":"Pulling from library/golang","id":"1.23-alpine"}
+{"status":"Digest: sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f"}
+{"status":"Status: Image is up to date for golang:1.23-alpine"}
+[drev] --- step: install deps ---
+[drev] --- step: run tests ---
+?   	golang.org/x/example/appengine-hello	[no test files]
+?   	golang.org/x/example/gotypes	[no test files]
+?   	golang.org/x/example/gotypes/defsuses	[no test files]
+?   	golang.org/x/example/gotypes/doc	[no test files]
+?   	golang.org/x/example/gotypes/hello	[no test files]
+?   	golang.org/x/example/gotypes/hugeparam	[no test files]
+?   	golang.org/x/example/gotypes/implements	[no test files]
+?   	golang.org/x/example/gotypes/lookup	[no test files]
+?   	golang.org/x/example/gotypes/nilfunc	[no test files]
+?   	golang.org/x/example/gotypes/pkginfo	[no test files]
+?   	golang.org/x/example/gotypes/skeleton	[no test files]
+?   	golang.org/x/example/gotypes/typeandvalue	[no test files]
+?   	golang.org/x/example/internal/cmd/weave	[no test files]
+ok  	golang.org/x/example/slog-handler-guide/indenthandler1	0.006s
+ok  	golang.org/x/example/slog-handler-guide/indenthandler2	0.007s
+ok  	golang.org/x/example/slog-handler-guide/indenthandler3	0.008s
+ok  	golang.org/x/example/slog-handler-guide/indenthandler4	0.008s
+?   	golang.org/x/example/template	[no test files]
+[drev] pulling image: golang:1.23-alpine
+{"status":"Pulling from library/golang","id":"1.23-alpine"}
+{"status":"Digest: sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f"}
+{"status":"Status: Image is up to date for golang:1.23-alpine"}
+[drev] --- step: build binary ---
+pattern ./hello/...: directory prefix hello does not contain main module or its selected dependencies

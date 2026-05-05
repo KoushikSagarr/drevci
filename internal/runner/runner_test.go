@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker/client"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
@@ -37,8 +38,11 @@ func TestRunJob_Success(t *testing.T) {
 		},
 	}
 
+	w, _ := workspace.Create()
+	defer w.Cleanup()
+
 	var buf bytes.Buffer
-	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, &buf)
+	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, w, &buf)
 	if err != nil {
 		t.Errorf("RunJob() error = %v", err)
 	}
@@ -71,8 +75,11 @@ func TestRunJob_Failure(t *testing.T) {
 		},
 	}
 
+	w, _ := workspace.Create()
+	defer w.Cleanup()
+
 	var buf bytes.Buffer
-	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, &buf)
+	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, w, &buf)
 	if err == nil {
 		t.Fatalf("RunJob() expected error, got nil")
 	}
@@ -105,8 +112,11 @@ func TestRunJob_MultiStep(t *testing.T) {
 		},
 	}
 
+	w, _ := workspace.Create()
+	defer w.Cleanup()
+
 	var buf bytes.Buffer
-	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, &buf)
+	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, w, &buf)
 	if err != nil {
 		t.Errorf("RunJob() error = %v", err)
 	}
@@ -148,8 +158,11 @@ func TestRunJob_EnvVars(t *testing.T) {
 		},
 	}
 
+	w, _ := workspace.Create()
+	defer w.Cleanup()
+
 	var buf bytes.Buffer
-	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, &buf)
+	err = r.RunJob(context.Background(), &drevtypes.Run{}, job, w, &buf)
 	if err != nil {
 		t.Errorf("RunJob() error = %v", err)
 	}
