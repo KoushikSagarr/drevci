@@ -56,9 +56,7 @@ func (h *Handler) Routes() http.Handler {
 
 	r.Get("/api/v1/health", h.health)
 
-	if h.webhookHandler != nil {
-		r.Post("/webhooks/github", h.webhookHandler.Handle)
-	}
+	r.Post("/webhooks/github", h.webhookHandler.Handle)
 
 	r.Group(func(r chi.Router) {
 		tokensStr := os.Getenv("DREV_API_TOKENS")
