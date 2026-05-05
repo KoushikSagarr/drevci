@@ -1,91 +1,76 @@
 # Drev CI
 
-Lightweight self-hosted CI runner. Define pipelines in 
-.drev.yml, run them in Docker containers.
+Lightweight self-hosted CI runner written in Go. Define pipelines in `.drev.yml`, run them inside Docker containers, and trigger them automatically from your GitHub repository via webhooks!
 
-## Quick start
+## What We Have Built So Far
 
-    # Start the server
-    drevd --port 8080
+1. **Docker-based Job Execution Engine (`drev` / `drevd`)**
+   - **Daemon (`drevd`)**: The central backend server that listens for triggers, parses `.drev.yml` configurations, orchestrates job sequences, manages state in SQLite, and streams live logs via Server-Sent Events (SSE).
+   - **CLI (`drev`)**: The command line interface used to manually trigger pipelines, stream running logs natively in your terminal, and inspect run statuses.
+2. **DAG (Directed Acyclic Graph) Scheduler**
+   - Resolves job dependencies defined via `depends_on`.
+   - Prevents circular dependencies.
+   - Executes independent jobs in parallel and blocked jobs sequentially once their dependencies succeed.
+3. **Automated Git Workspaces**
+   - Dynamically clones targeted Git repositories via HTTP or Webhooks using optimized `--depth 1` cloning.
+   - Fallback execution seamlessly targets exact commit SHAs.
+   - Shares the cloned `workspace` directory seamlessly across all jobs in a given pipeline, enabling state propagation (e.g. `test` downloads deps -> `build` compiles the binary).
+4. **GitHub Webhooks Integration**
+   - Secures payload execution using strict `X-Hub-Signature-256` HMAC-SHA256 signature verification.
+   - Maps specific GitHub pushes (`repo` & `branch`) directly to custom `.drev.yml` configs hosted server-side.
 
-    # In another terminal, trigger a pipeline
-    drev run configs/example.drev.yml
+## How to Start and Run the System
 
-    # Stream logs of a previous run
-    drev logs <run-id> --follow
+Since you have shut down the system, here is how you safely spin Drev CI back up from scratch:
 
-    # Check run status
-    drev status <run-id>
+### 1. Start the Server (`drevd`)
+Open a new terminal window inside the `drevci` project directory. Run:
+```bash
+make build
+make run-server
+```
+Alternatively, using direct binary execution:
+```bash
+go build -o bin/drevd.exe ./cmd/drevd
+./bin/drevd.exe
+```
+**Important:** When the server starts up, it will generate an authentication token (e.g., `DREV_TOKEN=xxxxx`) and a webhook secret (e.g., `Webhook secret: yyyyy`). Take note of both, as you will need them.
 
-## Pipeline syntax (full example)
-```yaml
-name: drev-ci-pipeline
-
-triggers:
-  - push
-  - pull_request
-
-env:
-  GO_ENV: production
-  APP_NAME: drev
-
-jobs:
-  - name: test
-    image: golang:1.22-alpine
-    steps:
-      - name: checkout deps
-        run: go mod download
-
-      - name: run tests
-        run: go test -race -coverprofile=coverage.out ./...
-
-      - name: upload coverage
-        run: |
-          apk add --no-cache curl
-          curl -sf https://codecov.io/bash | sh -s -- -f coverage.out
-
-  - name: build
-    image: golang:1.22-alpine
-    depends_on:
-      - test
-    steps:
-      - name: build binary
-        run: |
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/drev ./cmd/drev
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/drevd ./cmd/drevd
-
-      - name: print binary size
-        run: ls -lh bin/
+### 2. Configure the CLI (`drev`)
+To use the CLI to interact with the daemon manually, export the generated token into your terminal session:
+```bash
+$env:DREV_TOKEN="<your-generated-token>"
+```
+You can now safely manually trigger pipelines:
+```bash
+go run ./cmd/drev run configs/example.drev.yml
+go run ./cmd/drev status <run_id>
+go run ./cmd/drev logs <run_id> --follow
 ```
 
-## API reference
-- `POST /api/v1/pipelines/trigger`
-  Trigger a new pipeline run.
-  `curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"pipeline_path":"configs/example.drev.yml"}' http://localhost:8080/api/v1/pipelines/trigger`
-- `GET /api/v1/runs`
-  List all runs.
-  `curl -H "Authorization: Bearer <token>" http://localhost:8080/api/v1/runs`
-- `GET /api/v1/runs/{runID}`
-  Get details for a single run.
-  `curl -H "Authorization: Bearer <token>" http://localhost:8080/api/v1/runs/{runID}`
-- `GET /api/v1/runs/{runID}/jobs`
-  List jobs for a specific run.
-  `curl -H "Authorization: Bearer <token>" http://localhost:8080/api/v1/runs/{runID}/jobs`
-- `GET /api/v1/runs/{runID}/logs`
-  Stream logs via Server-Sent Events (SSE).
-  `curl -N -H "Authorization: Bearer <token>" http://localhost:8080/api/v1/runs/{runID}/logs`
-- `GET /api/v1/health`
-  Health check endpoint (no auth required).
-  `curl http://localhost:8080/api/v1/health`
+### 3. Setup GitHub Webhooks (Automatic Triggers)
+If you want GitHub to automatically trigger pipelines when you push:
+1. Ensure your local server is exposed to the internet (e.g., using `ngrok http 8080`).
+2. Go to your GitHub Repository **Settings -> Webhooks -> Add webhook**.
+3. Set the **Payload URL** to `http://<your-ngrok-url>/webhooks/github`.
+4. Set **Content type** to `application/json`.
+5. Paste the **Webhook secret** generated by the server startup logs into the Secret field.
+6. Trigger the webhook by pushing a commit to your repository. The server will intercept it and automatically begin Docker execution!
+
+## API Reference
+- `POST /api/v1/pipelines/trigger`: Trigger a new pipeline manually.
+- `GET /api/v1/runs`: List all runs.
+- `GET /api/v1/runs/{runID}`: Get details for a single run.
+- `GET /api/v1/runs/{runID}/jobs`: List jobs for a specific run.
+- `GET /api/v1/runs/{runID}/logs`: Stream logs via SSE.
+- `POST /webhooks/github`: Receives push payloads directly from GitHub.
 
 ## Roadmap
-  - [ ] Git repository cloning
-  - [ ] GitHub webhook integration  
-  - [ ] Runner pools (multiple agents)
-  - [ ] Web dashboard
-  - [ ] Postgres support
-  - [ ] Docker build & push steps
-  - [ ] Slack / Discord notifications
-  - [ ] RBAC and multi-user support
-test
-test
+- [x] Git repository cloning
+- [x] GitHub webhook integration  
+- [ ] Runner pools (multiple agents)
+- [ ] Web dashboard
+- [ ] Postgres support
+- [ ] Docker build & push steps
+- [ ] Slack / Discord notifications
+- [ ] RBAC and multi-user support

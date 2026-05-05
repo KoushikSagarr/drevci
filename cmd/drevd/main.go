@@ -19,9 +19,12 @@ import (
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 	"github.com/drevci/drev/internal/webhook"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	_ = godotenv.Load()
+
 	var port int
 	var dbPath string
 	var logDir string
@@ -37,6 +40,8 @@ func main() {
 			if token == "" {
 				token = os.Getenv("DREV_TOKEN")
 			}
+
+			var envUpdates []string
 			if token == "" {
 				t, err := auth.GenerateToken()
 				if err != nil {
@@ -44,7 +49,7 @@ func main() {
 				}
 				token = t
 				fmt.Printf("No token set. Generated token: %s\n", token)
-				fmt.Printf("Set DREV_TOKEN=%s to reuse on restart\n", token)
+				envUpdates = append(envUpdates, fmt.Sprintf("DREV_TOKEN=%s", token))
 			}
 
 			if webhookSecret == "" {
@@ -56,6 +61,19 @@ func main() {
 					log.Fatalf("failed to generate webhook secret: %v", err)
 				}
 				webhookSecret = t
+				fmt.Printf("No webhook secret set. Generated secret: %s\n", webhookSecret)
+				envUpdates = append(envUpdates, fmt.Sprintf("DREV_WEBHOOK_SECRET=%s", webhookSecret))
+			}
+
+			if len(envUpdates) > 0 {
+				f, err := os.OpenFile(".env", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+				if err == nil {
+					for _, update := range envUpdates {
+						f.WriteString(update + "\n")
+					}
+					f.Close()
+					fmt.Println("Saved newly generated secrets to .env file for persistence.")
+				}
 			}
 
 			// Expose token to API via env var

@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/drevci/drev/internal/auth"
 	"github.com/drevci/drev/pkg/drevtypes"
+	"github.com/joho/godotenv"
+	"github.com/spf13/cobra"
 )
 
 var (
@@ -46,6 +47,8 @@ func doReq(req *http.Request) (*http.Response, error) {
 }
 
 func main() {
+	_ = godotenv.Load()
+
 	var rootCmd = &cobra.Command{Use: "drev"}
 	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:8080", "server URL")
 	rootCmd.PersistentFlags().StringVar(&token, "token", "", "API token (or read from DREV_TOKEN env var)")
