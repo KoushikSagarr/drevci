@@ -49,6 +49,10 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_ASKPASS=echo",
 			"GCM_INTERACTIVE=never",
+			"GIT_TRACE=1",
+			"GIT_CURL_VERBOSE=1",
+			"GIT_HTTP_LOW_SPEED_LIMIT=1000",
+			"GIT_HTTP_LOW_SPEED_TIME=30",
 		)
 		return cmd.Run()
 	}
