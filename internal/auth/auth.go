@@ -24,19 +24,21 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				sendUnauthorized(w)
-				return
+			token := ""
+
+			if authHeader != "" {
+				parts := strings.SplitN(authHeader, " ", 2)
+				if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
+					token = parts[1]
+				}
 			}
 
-			parts := strings.SplitN(authHeader, " ", 2)
-			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-				sendUnauthorized(w)
-				return
+			// Fallback to query parameter (useful for EventSource/SSE)
+			if token == "" {
+				token = r.URL.Query().Get("token")
 			}
 
-			token := parts[1]
-			if !validTokens[token] {
+			if token == "" || !validTokens[token] {
 				sendUnauthorized(w)
 				return
 			}
