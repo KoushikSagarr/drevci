@@ -1,24 +1,44 @@
 # Requires PowerShell 5.1 or newer
 
-$existingProcess = Get-Process drevd -ErrorAction SilentlyContinue
-if ($existingProcess) {
-    Write-Host "Stopping existing Drev CI Daemon..." -ForegroundColor Yellow
-    Stop-Process -Name drevd -Force
-    Start-Sleep -Seconds 2
+# --- 1. Cleanup old processes ---
+$processes = @("drevd", "drev-router", "ngrok")
+foreach ($p in $processes) {
+    $existing = Get-Process $p -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "Stopping existing $p..." -ForegroundColor Yellow
+        Stop-Process -Name $p -Force
+        Start-Sleep -Seconds 1
+    }
 }
 
-Write-Host "Compiling Drev CI..." -ForegroundColor Cyan
+# --- 2. Compile everything ---
+Write-Host "Compiling Drev CI Ecosystem..." -ForegroundColor Cyan
 go build -o bin/drevd.exe ./cmd/drevd
 go build -o bin/drev.exe ./cmd/drev
 go build -o bin/drev-router.exe ./cmd/drev-router
 
-Write-Host "Starting Drev CI Daemon..." -ForegroundColor Green
+# --- 3. Launch everything ---
+Write-Host "Launching Drev CI Ecosystem..." -ForegroundColor Green
+
+# Start Backend (9090)
+Write-Host "  > Starting Backend..." -ForegroundColor Gray
 Start-Process -NoNewWindow -FilePath ".\bin\drevd.exe"
 
-Write-Host ""
-Write-Host "Drev CI Server is running!" -ForegroundColor Yellow
-Write-Host "To view processes: Get-Process drevd"
-Write-Host "To stop the server: Stop-Process -Name drevd"
-Write-Host ""
-Write-Host "You can now run commands natively, for example:" -ForegroundColor Cyan
-Write-Host ".\bin\drev.exe run configs\example.drev.yml"
+# Start Router (8888)
+Write-Host "  > Starting Router..." -ForegroundColor Gray
+Start-Process -NoNewWindow -FilePath ".\bin\drev-router.exe"
+
+# Start ngrok (with your permanent domain)
+Write-Host "  > Starting ngrok Tunnel..." -ForegroundColor Gray
+Start-Process -NoNewWindow -FilePath "ngrok" -ArgumentList "http --domain=picked-indirectly-cheetah.ngrok-free.app 8888"
+
+# Start Dashboard (3000)
+Write-Host "  > Starting Dashboard..." -ForegroundColor Gray
+Start-Process -NoNewWindow -FilePath "npm.cmd" -ArgumentList "run dev" -WorkingDirectory ".\dashboard"
+
+Write-Host "`nAll systems are GO!" -ForegroundColor Green
+Write-Host "--------------------------------------------------"
+Write-Host "Dashboard: http://localhost:3000" -ForegroundColor Cyan
+Write-Host "Public URL: https://picked-indirectly-cheetah.ngrok-free.app" -ForegroundColor Cyan
+Write-Host "--------------------------------------------------"
+Write-Host "To stop everything, simply close this terminal or run: Stop-Process -Name drevd, drev-router, ngrok" -ForegroundColor Yellow
