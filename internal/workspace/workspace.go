@@ -47,50 +47,27 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	fmt.Fprintf(logWriter, "[drev] initializing workspace via ZIP download (bypassing Git binary)\n")
+	fmt.Fprintf(logWriter, "[drev] initializing workspace via Local Copy (DREV_LOCAL_REPO is set)\n")
 
-	// Create a custom client with a strict timeout
-	client := &http.Client{
-		Timeout: 30 * time.Second,
+	localPath := os.Getenv("DREV_LOCAL_REPO")
+	if localPath == "" {
+		return fmt.Errorf("DREV_LOCAL_REPO environment variable is not set")
 	}
 
-	req, err := http.NewRequestWithContext(cloneCtx, "GET", zipURL, nil)
-	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
-	}
-	// GitHub sometimes blocks requests without a User-Agent
-	req.Header.Set("User-Agent", "Drev-CI-Runner/1.0")
+	// Use Windows 'robocopy' to efficiently copy the folder (bypassing node_modules and .git)
+	// robocopy <source> <dest> /E /XF <files> /XD <dirs>
+	robocopy := exec.CommandContext(cloneCtx, "robocopy", localPath, w.Dir, "/E", "/XD", ".git", "node_modules", "bin", "/NFL", "/NDL", "/NJH", "/NJS", "/nc", "/ns", "/np")
 	
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("downloading repo zip: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to download zip: status %d", resp.StatusCode)
-	}
-
-	zipFile := fmt.Sprintf("%s/repo.zip", w.Dir)
-	out, err := os.Create(zipFile)
-	if err != nil {
-		return fmt.Errorf("creating zip file: %w", err)
-	}
-	
-	_, err = io.Copy(out, resp.Body)
-	out.Close()
-	if err != nil {
-		return fmt.Errorf("saving zip body: %w", err)
+	// Robocopy exit codes 0-7 are success (it's weird)
+	err := robocopy.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() > 7 {
+			return fmt.Errorf("robocopy failed with exit code %d", exitErr.ExitCode())
+		}
+	} else if err != nil {
+		return fmt.Errorf("running robocopy: %w", err)
 	}
 
-	// Extract using Windows built-in tar (which supports zip)
-	tarCmd := exec.CommandContext(cloneCtx, "tar", "-xf", "repo.zip", "--strip-components=1")
-	tarCmd.Dir = w.Dir
-	if err := tarCmd.Run(); err != nil {
-		return fmt.Errorf("extraction failed: %w", err)
-	}
-	
-	os.Remove(zipFile)
 	return nil
 }
 
