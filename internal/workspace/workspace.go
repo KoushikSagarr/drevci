@@ -11,7 +11,7 @@ import (
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
-// Workspace manages the lifecycle of a build directory in a safe, non-synced location.
+// Workspace manages the lifecycle of a build directory with quiet checkout for speed.
 type Workspace struct {
 	Dir string
 }
