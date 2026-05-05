@@ -99,3 +99,6 @@ jobs:
 - [ ] PostgreSQL Persistence Layer
 - [ ] Multi-Cloud Provider Integration
 - [ ] Notification Webhooks (Slack/Discord)
+
+## License
+This project is licensed under the GNU GPL v3.0 License.
