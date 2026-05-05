@@ -3,9 +3,14 @@
 @theme {
   --color-background: #0d1117;
   --color-surface: #161b22;
+  --color-surface-hover: #1c2129;
   --color-border: #30363d;
+  --color-border-light: #21262d;
   --color-text-primary: #e6edf3;
   --color-text-secondary: #8b949e;
+  --color-text-muted: #484f58;
+  --color-accent: #388bfd;
+  --color-accent-hover: #58a6ff;
   
   --color-status-pending: #8b949e;
   --color-status-running: #388bfd;
@@ -14,8 +19,59 @@
   --color-status-cancelled: #8b949e;
 }
 
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #30363d;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #484f58;
+}
+
+/* Smooth transitions globally */
+* {
+  transition-property: background-color, border-color, color, opacity;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
 body {
   background-color: var(--color-background);
   color: var(--color-text-primary);
   font-family: 'Inter', sans-serif;
+}
+
+/* Custom glow for running status */
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 4px rgba(56, 139, 253, 0.4); }
+  50% { box-shadow: 0 0 12px rgba(56, 139, 253, 0.7); }
+}
+
+.glow-running {
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+
+/* Gradient shimmer for skeleton loading */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #161b22 25%, #21262d 50%, #161b22 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 4px;
+}
+
+/* Log line hover */
+.log-line:hover {
+  background-color: rgba(56, 139, 253, 0.06);
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
 )
@@ -32,29 +33,41 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		ref = "main"
 	}
 
+	// 1. Create a sub-context with a timeout to prevent infinite hangs
+	cloneCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
 	fmt.Fprintf(logWriter, "[drev] cloning %s @ %s\n", source.URL, ref)
 
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", "--branch", ref, source.URL, ".")
-	cmd.Dir = w.Dir
-	cmd.Stdout = logWriter
-	cmd.Stderr = logWriter
+	// Helper to run git commands with proper environment
+	runGit := func(args ...string) error {
+		cmd := exec.CommandContext(cloneCtx, "git", args...)
+		cmd.Dir = w.Dir
+		cmd.Stdout = logWriter
+		cmd.Stderr = logWriter
+		// Ensure Git never prompts for credentials (which causes hangs)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		return cmd.Run()
+	}
 
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(logWriter, "[drev] branch clone failed, trying default clone and checkout: %v\n", err)
+	// Attempt 1: Fast shallow clone of specific branch
+	if err := runGit("clone", "--depth", "1", "--branch", ref, source.URL, "."); err != nil {
+		fmt.Fprintf(logWriter, "[drev] branch clone failed, cleaning up and retrying: %v\n", err)
 		
-		cmd2 := exec.CommandContext(ctx, "git", "clone", "--depth", "1", source.URL, ".")
-		cmd2.Dir = w.Dir
-		cmd2.Stdout = logWriter
-		cmd2.Stderr = logWriter
-		if err2 := cmd2.Run(); err2 != nil {
+		// 2. CRITICAL: Clean the directory before retrying
+		// Git will not clone into a non-empty directory
+		entries, _ := os.ReadDir(w.Dir)
+		for _, entry := range entries {
+			os.RemoveAll(fmt.Sprintf("%s/%s", w.Dir, entry.Name()))
+		}
+
+		// Attempt 2: Full shallow clone
+		if err2 := runGit("clone", "--depth", "1", source.URL, "."); err2 != nil {
 			return fmt.Errorf("git clone failed: %w", err2)
 		}
 
-		cmd3 := exec.CommandContext(ctx, "git", "checkout", ref)
-		cmd3.Dir = w.Dir
-		cmd3.Stdout = logWriter
-		cmd3.Stderr = logWriter
-		if err3 := cmd3.Run(); err3 != nil {
+		// Attempt 3: Checkout specific ref
+		if err3 := runGit("checkout", ref); err3 != nil {
 			return fmt.Errorf("git checkout failed: %w", err3)
 		}
 	}

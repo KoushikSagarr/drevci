@@ -9,9 +9,14 @@ const headers = () => ({
 });
 
 export async function getRuns(limit = 20): Promise<Run[]> {
-  const res = await fetch(`${BASE}/api/v1/runs?limit=${limit}`, { headers: headers(), cache: 'no-store' });
-  if (!res.ok) throw new Error('Failed to fetch runs');
-  return res.json();
+  try {
+    const res = await fetch(`${BASE}/api/v1/runs?limit=${limit}`, { headers: headers(), cache: 'no-store' });
+    if (!res.ok) return [];
+    return res.json();
+  } catch (err) {
+    console.error('Network error fetching runs:', err);
+    return [];
+  }
 }
 
 export async function getRun(id: string): Promise<Run> {

@@ -110,8 +110,8 @@ func (s *SQLiteStore) prepare() error {
 
 	s.stmtUpdateRunStatus, err = s.db.Prepare(
 		`UPDATE runs SET status = ?, 
-		 started_at = CASE WHEN ? = 'running' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE started_at END,
-		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE finished_at END
+		 started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
+		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
 		 WHERE id = ?`)
 	if err != nil {
 		return err
@@ -131,8 +131,8 @@ func (s *SQLiteStore) prepare() error {
 
 	s.stmtUpdateRunJobStatus, err = s.db.Prepare(
 		`UPDATE run_jobs SET status = ?, 
-		 started_at = CASE WHEN ? = 'running' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE started_at END,
-		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE finished_at END
+		 started_at = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
+		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
 		 WHERE id = ?`)
 	if err != nil {
 		return err
@@ -198,7 +198,8 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, er
 }
 
 func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
-	res, err := s.stmtUpdateRunStatus.ExecContext(ctx, string(status), string(status), string(status), id)
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.stmtUpdateRunStatus.ExecContext(ctx, string(status), string(status), now, string(status), now, id)
 	if err != nil {
 		return err
 	}
@@ -256,7 +257,8 @@ func (s *SQLiteStore) CreateRunJob(ctx context.Context, job *drevtypes.RunJob) e
 }
 
 func (s *SQLiteStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
-	res, err := s.stmtUpdateRunJobStatus.ExecContext(ctx, string(status), string(status), string(status), id)
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.stmtUpdateRunJobStatus.ExecContext(ctx, string(status), string(status), now, string(status), now, id)
 	if err != nil {
 		return err
 	}

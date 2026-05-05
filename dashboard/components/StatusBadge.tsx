@@ -1,25 +1,34 @@
 import { RunStatus } from '../lib/types';
 
-export default function StatusBadge({ status, pulse }: { status: RunStatus, pulse?: boolean }) {
-  const colors = {
-    pending: 'bg-status-pending text-status-pending',
-    running: 'bg-status-running text-status-running',
-    success: 'bg-status-success text-status-success',
-    failed: 'bg-status-failed text-status-failed',
-    cancelled: 'bg-status-cancelled text-status-cancelled',
-  };
+const config: Record<RunStatus, { bg: string; text: string; label: string }> = {
+  pending:   { bg: 'bg-status-pending/20', text: 'text-status-pending',   label: 'Pending' },
+  running:   { bg: 'bg-status-running/20', text: 'text-status-running',   label: 'Running' },
+  success:   { bg: 'bg-status-success/20', text: 'text-status-success',   label: 'Success' },
+  failed:    { bg: 'bg-status-failed/20',  text: 'text-status-failed',    label: 'Failed' },
+  cancelled: { bg: 'bg-status-cancelled/20', text: 'text-status-cancelled', label: 'Cancelled' },
+};
 
-  const bg = colors[status] || colors.pending;
+const dotBg: Record<RunStatus, string> = {
+  pending: 'bg-status-pending',
+  running: 'bg-status-running',
+  success: 'bg-status-success',
+  failed: 'bg-status-failed',
+  cancelled: 'bg-status-cancelled',
+};
+
+export default function StatusBadge({ status, pulse }: { status: RunStatus; pulse?: boolean }) {
+  const c = config[status] || config.pending;
+  const dot = dotBg[status] || dotBg.pending;
 
   return (
-    <span className="inline-flex items-center gap-2 rounded-full border border-border bg-surface px-2.5 py-1 text-xs font-medium text-text-primary">
+    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${c.bg} ${c.text}`}>
       <span className="relative flex h-2 w-2">
         {status === 'running' && pulse && (
-          <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${bg.split(' ')[0]}`} />
+          <span className={`absolute inline-flex h-full w-full animate-ping rounded-full opacity-75 ${dot}`} />
         )}
-        <span className={`relative inline-flex h-2 w-2 rounded-full ${bg.split(' ')[0]}`} />
+        <span className={`relative inline-flex h-2 w-2 rounded-full ${dot}`} />
       </span>
-      {status.charAt(0).toUpperCase() + status.slice(1)}
+      {c.label}
     </span>
   );
 }
