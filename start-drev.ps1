@@ -1,6 +1,12 @@
 # Requires PowerShell 5.1 or newer
 
 # --- 1. Cleanup old processes ---
+Write-Host "Cleaning up port 3000 (Next.js)..." -ForegroundColor Yellow
+$port3000 = Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue
+if ($port3000) {
+    Stop-Process -Id $port3000.OwningProcess -Force -ErrorAction SilentlyContinue
+}
+
 $processes = @("drevd", "drev-router", "ngrok")
 foreach ($p in $processes) {
     $existing = Get-Process $p -ErrorAction SilentlyContinue
