@@ -9,6 +9,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Parser handles pipeline configuration parsing.
+type Parser struct{}
+
+func NewParser() *Parser { return &Parser{} }
+
 // ParseError represents a validation error in a pipeline definition.
 type ParseError struct {
 	Field   string
