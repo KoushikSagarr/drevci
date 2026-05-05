@@ -150,16 +150,8 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
         </div>
       </div>
 
-      {/* Main Stats Banner */}
+      {/* Header */}
       <div className="rounded-xl border border-border bg-surface overflow-hidden shadow-xl">
-        {isLive && (
-          <div className="h-1.5 bg-background">
-            <div
-              className={`h-full transition-all duration-1000 ${failedCount > 0 ? 'bg-status-failed' : 'bg-status-running'}`}
-              style={{ width: `${Math.max(progress, 2)}%` }}
-            />
-          </div>
-        )}
         <div className="p-8">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-8">
             <div className="space-y-4">
