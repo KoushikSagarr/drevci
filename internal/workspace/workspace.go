@@ -49,10 +49,19 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 
 	fmt.Fprintf(logWriter, "[drev] initializing workspace via ZIP download (bypassing Git binary)\n")
 
-	// Convert git URL to ZIP URL: https://github.com/user/repo/archive/refs/heads/main.zip
-	zipURL := strings.TrimSuffix(source.URL, ".git") + "/archive/refs/heads/" + ref + ".zip"
+	// Create a custom client with a strict timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(cloneCtx, "GET", zipURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	// GitHub sometimes blocks requests without a User-Agent
+	req.Header.Set("User-Agent", "Drev-CI-Runner/1.0")
 	
-	resp, err := http.Get(zipURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("downloading repo zip: %w", err)
 	}
