@@ -50,14 +50,25 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	runGit := func(args ...string) error {
 		cmd := exec.CommandContext(cloneCtx, "git", args...)
 		cmd.Dir = w.Dir
-		cmd.Stdout = logWriter
-		cmd.Stderr = logWriter
+		
+		// Use a simple pipe to read logs and write them to the logWriter in the background
+		// This prevents the logWriter (streamer) from blocking the Git process
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+		
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		
+		go io.Copy(logWriter, stdout)
+		go io.Copy(logWriter, stderr)
+		
 		cmd.Env = append(os.Environ(), 
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_ASKPASS=echo",
 			"GCM_INTERACTIVE=never",
 		)
-		return cmd.Run()
+		return cmd.Wait()
 	}
 
 	// Manual sequence (Optimized for Windows performance)
