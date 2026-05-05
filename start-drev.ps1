@@ -14,6 +14,7 @@ foreach ($p in $processes) {
 # --- 2. Compile everything ---
 Write-Host "Compiling Drev CI Ecosystem..." -ForegroundColor Cyan
 go build -o bin/drevd.exe ./cmd/drevd
+if ($LASTEXITCODE -ne 0) { Write-Host "CRITICAL: Backend build failed! Fixing code now..." -ForegroundColor Red; exit 1 }
 go build -o bin/drev.exe ./cmd/drev
 go build -o bin/drev-router.exe ./cmd/drev-router
 
