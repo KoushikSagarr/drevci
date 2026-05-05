@@ -51,8 +51,8 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	}
 
 	// Attempt 1: Fast shallow treeless clone of specific branch
-	// Using -c to set stability flags and --filter=blob:none for speed
-	if err := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "clone", "--filter=blob:none", "--depth", "1", "--branch", ref, source.URL, "."); err != nil {
+	// Using -c to disable credential helpers and UI prompts to prevent hangs on Windows
+	if err := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "-c", "credential.helper=", "clone", "--filter=blob:none", "--depth", "1", "--branch", ref, source.URL, "."); err != nil {
 		fmt.Fprintf(logWriter, "[drev] branch clone failed, cleaning up and retrying: %v\n", err)
 		
 		// 2. CRITICAL: Clean the directory before retrying
@@ -61,8 +61,8 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			os.RemoveAll(fmt.Sprintf("%s/%s", w.Dir, entry.Name()))
 		}
 
-		// Attempt 2: Full shallow treeless clone (with stability flags)
-		if err2 := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "clone", "--filter=blob:none", "--depth", "1", source.URL, "."); err2 != nil {
+		// Attempt 2: Full shallow treeless clone
+		if err2 := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "-c", "credential.helper=", "clone", "--filter=blob:none", "--depth", "1", source.URL, "."); err2 != nil {
 			return fmt.Errorf("git clone failed: %w", err2)
 		}
 
