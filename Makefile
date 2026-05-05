@@ -1,23 +1,27 @@
-.PHONY: build build-cli build-server run-server clean test lint
+.PHONY: build build-cli build-server run-server clean test lint token example
 
 BINARY_DIR := bin
 
-build: build-cli build-server
-
-build-cli:
+build:
 	go build -o $(BINARY_DIR)/drev ./cmd/drev
-
-build-server:
 	go build -o $(BINARY_DIR)/drevd ./cmd/drevd
 
 run-server:
 	go run ./cmd/drevd
 
-clean:
-	rm -rf $(BINARY_DIR)
-
 test:
-	go test -race ./...
+	go test ./... -v -count=1
 
 lint:
-	golangci-lint run ./...
+	go vet ./...
+
+clean:
+	rm -rf $(BINARY_DIR) logs/ drev.db
+
+token:
+	go run ./cmd/drev token generate
+
+example:
+	go run ./cmd/drevd &
+	sleep 1
+	go run ./cmd/drev run configs/example.drev.yml

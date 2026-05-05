@@ -1,0 +1,64 @@
+[drev] pulling image: golang:1.22-alpine
+{"status":"Pulling from library/golang","id":"1.22-alpine"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"4f4fb700ef54"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"afa154b433c7"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"1f3e46996e29"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"4d75fd4b7386"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"5f837c998576"}
+{"status":"Already exists","progressDetail":{"hidecounts":true},"id":"4f4fb700ef54"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"5f837c998576"}
+{"status":"Downloading","progressDetail":{"current":1048576,"total":69364787},"progress":"[\u003e                                                  ]  1.049MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":3145728,"total":69364787},"progress":"[==\u003e                                                ]  3.146MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":294898,"total":294898},"progress":"[==================================================\u003e]  294.9kB/294.9kB","id":"4d75fd4b7386"}
+{"status":"Downloading","progressDetail":{"current":5242880,"total":69364787},"progress":"[===\u003e                                               ]  5.243MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":6291456,"total":69364787},"progress":"[====\u003e                                              ]  6.291MB/69.36MB","id":"afa154b433c7"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"4d75fd4b7386"}
+{"status":"Downloading","progressDetail":{"current":6291456,"total":69364787},"progress":"[====\u003e                                              ]  6.291MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":8388608,"total":69364787},"progress":"[======\u003e                                            ]  8.389MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":9437184,"total":69364787},"progress":"[======\u003e                                            ]  9.437MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":1048576,"total":3641715},"progress":"[==============\u003e                                    ]  1.049MB/3.642MB","id":"1f3e46996e29"}
+{"status":"Downloading","progressDetail":{"current":11534336,"total":69364787},"progress":"[========\u003e                                          ]  11.53MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":3145728,"total":3641715},"progress":"[===========================================\u003e       ]  3.146MB/3.642MB","id":"1f3e46996e29"}
+{"status":"Downloading","progressDetail":{"current":12632064,"total":69364787},"progress":"[=========\u003e                                         ]  12.63MB/69.36MB","id":"afa154b433c7"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"1f3e46996e29"}
+{"status":"Downloading","progressDetail":{"current":15728640,"total":69364787},"progress":"[===========\u003e                                       ]  15.73MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":17825792,"total":69364787},"progress":"[============\u003e                                      ]  17.83MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":19922944,"total":69364787},"progress":"[==============\u003e                                    ]  19.92MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":22020096,"total":69364787},"progress":"[===============\u003e                                   ]  22.02MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":25165824,"total":69364787},"progress":"[==================\u003e                                ]  25.17MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":27262976,"total":69364787},"progress":"[===================\u003e                               ]  27.26MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":30408704,"total":69364787},"progress":"[=====================\u003e                             ]  30.41MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":31457280,"total":69364787},"progress":"[======================\u003e                            ]  31.46MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":33554432,"total":69364787},"progress":"[========================\u003e                          ]  33.55MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":35651584,"total":69364787},"progress":"[=========================\u003e                         ]  35.65MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":37748736,"total":69364787},"progress":"[===========================\u003e                       ]  37.75MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":38797312,"total":69364787},"progress":"[===========================\u003e                       ]   38.8MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":40894464,"total":69364787},"progress":"[=============================\u003e                     ]  40.89MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":44040192,"total":69364787},"progress":"[===============================\u003e                   ]  44.04MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":45088768,"total":69364787},"progress":"[================================\u003e                  ]  45.09MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":47185920,"total":69364787},"progress":"[==================================\u003e                ]  47.19MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":48234496,"total":69364787},"progress":"[==================================\u003e                ]  48.23MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":50331648,"total":69364787},"progress":"[====================================\u003e              ]  50.33MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":52428800,"total":69364787},"progress":"[=====================================\u003e             ]  52.43MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":53477376,"total":69364787},"progress":"[======================================\u003e            ]  53.48MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":56623104,"total":69364787},"progress":"[========================================\u003e          ]  56.62MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":57671680,"total":69364787},"progress":"[=========================================\u003e         ]  57.67MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":59768832,"total":69364787},"progress":"[===========================================\u003e       ]  59.77MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":61865984,"total":69364787},"progress":"[============================================\u003e      ]  61.87MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":63963136,"total":69364787},"progress":"[==============================================\u003e    ]  63.96MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":66060288,"total":69364787},"progress":"[===============================================\u003e   ]  66.06MB/69.36MB","id":"afa154b433c7"}
+{"status":"Downloading","progressDetail":{"current":66060288,"total":69364787},"progress":"[===============================================\u003e   ]  66.06MB/69.36MB","id":"afa154b433c7"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"afa154b433c7"}
+{"status":"Digest: sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"}
+{"status":"Status: Downloaded newer image for golang:1.22-alpine"}
+[drev] --- step: checkout deps ---
+go: no modules specified (see 'go help mod download')
+sh: curl: not found
+[drev] pulling image: golang:1.22-alpine
+{"status":"Pulling from library/golang","id":"1.22-alpine"}
+{"status":"Digest: sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052"}
+{"status":"Status: Image is up to date for golang:1.22-alpine"}
+[drev] --- step: build binary ---
+go: go.mod file not found in current directory or any parent directory; see 'go help modules'
+go: go.mod file not found in current directory or any parent directory; see 'go help modules'
+sh: syntax error: unexpected "&&"
