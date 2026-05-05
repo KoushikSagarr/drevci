@@ -19,7 +19,6 @@ foreach ($p in $processes) {
 }
 
 # --- 2. Build and Start Backend ---
-$env:DREV_LOCAL_REPO = $PSScriptRoot
 Write-Host "Compiling Drev CI Ecosystem..." -ForegroundColor Cyan
 go build -o bin/drevd.exe ./cmd/drevd
 if ($LASTEXITCODE -ne 0) { Write-Host "CRITICAL: Backend build failed! Fixing code now..." -ForegroundColor Red; exit 1 }
