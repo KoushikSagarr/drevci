@@ -46,8 +46,12 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		cmd.Dir = w.Dir
 		cmd.Stdout = logWriter
 		cmd.Stderr = logWriter
-		// Ensure Git never prompts for credentials (which causes hangs)
-		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		// Ensure Git never prompts for credentials or UI (which causes hangs)
+		cmd.Env = append(os.Environ(), 
+			"GIT_TERMINAL_PROMPT=0",
+			"GIT_ASKPASS=echo",
+			"GCM_INTERACTIVE=never",
+		)
 		return cmd.Run()
 	}
 
