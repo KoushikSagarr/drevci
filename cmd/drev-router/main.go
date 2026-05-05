@@ -10,7 +10,7 @@ import (
 
 func main() {
 	drevTarget, _ := url.Parse("http://localhost:9090")
-	otherTarget, _ := url.Parse("http://localhost:3001") // Change 3001 to your other project's port
+	otherTarget, _ := url.Parse("http://localhost:3000") 
 
 	drevProxy := httputil.NewSingleHostReverseProxy(drevTarget)
 	otherProxy := httputil.NewSingleHostReverseProxy(otherTarget)
