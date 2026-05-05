@@ -11,7 +11,7 @@ import (
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
-// Workspace manages the lifecycle of a build directory in a stable, optimized location.
+// Workspace manages the lifecycle of a build directory.
 type Workspace struct {
 	Dir string
 }
@@ -24,17 +24,7 @@ func Create() (*Workspace, error) {
 	return &Workspace{Dir: dir}, nil
 }
 
-func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWriter io.Writer) error {
-	if source.URL == "" {
-		return nil
-	}
-
-	ref := source.Ref
-	if ref == "" {
-		ref = "main"
-	}
-
-	//func (w *Workspace) Clone(ctx context.Context, source drevtypes.Repository, ref string, logWriter io.Writer) error {
+func (w *Workspace) Clone(ctx context.Context, source drevtypes.Repository, ref string, logWriter io.Writer) error {
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
