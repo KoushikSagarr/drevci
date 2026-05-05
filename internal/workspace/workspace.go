@@ -47,60 +47,37 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 
 	fmt.Fprintf(logWriter, "[drev] initializing workspace for %s @ %s\n", source.URL, ref)
 
-	runGit := func(args ...string) error {
-		cmd := exec.CommandContext(cloneCtx, "git", args...)
-		cmd.Dir = w.Dir
-		
-		// Use a simple pipe to read logs and write them to the logWriter in the background
-		// This prevents the logWriter (streamer) from blocking the Git process
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-		
-		if err := cmd.Start(); err != nil {
-			return err
-		}
-		
-		go io.Copy(logWriter, stdout)
-		go io.Copy(logWriter, stderr)
-		
-		cmd.Env = append(os.Environ(), 
-			"GIT_TERMINAL_PROMPT=0",
-			"GIT_ASKPASS=echo",
-			"GCM_INTERACTIVE=never",
-		)
-		return cmd.Wait()
+	// Use a single, heavily-optimized clone command
+	// We disable CRLF conversion, GC, and file monitoring to prevent hangs
+	args := []string{
+		"-c", "core.autocrlf=false",
+		"-c", "core.fscache=true",
+		"-c", "gc.auto=0",
+		"-c", "core.fsmonitor=false",
+		"clone",
+		"--depth", "1",
+		"--no-tags",
+		"--single-branch",
+		"--branch", ref,
+		source.URL,
+		w.Dir,
 	}
 
-	// Manual sequence (Optimized for Windows performance)
-	steps := [][]string{
-		{"init"},
-		{"config", "core.fscache", "true"},
-		{"config", "core.preloadindex", "true"},
-		{"config", "core.longpaths", "true"},
-		{"-c", "credential.helper=", "remote", "add", "origin", source.URL},
-		{
-			"-c", "core.compression=0", 
-			"-c", "pack.threads=1", 
-			"-c", "credential.helper=", 
-			"fetch", "--no-tags", "--no-recurse-submodules", "--filter=blob:none", "--depth", "1", "origin", ref,
-		},
-		// Stream files directly to disk (Bypasses Windows file-locking hangs)
-		{"archive", "--format=tar", "FETCH_HEAD", "-o", "repo.tar"},
-	}
+	cmd := exec.CommandContext(cloneCtx, "git", args...)
+	
+	// Direct piping to avoid buffering issues
+	cmd.Stdout = logWriter
+	cmd.Stderr = logWriter
+	
+	cmd.Env = append(os.Environ(), 
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=echo",
+		"GCM_INTERACTIVE=never",
+	)
 
-	for _, args := range steps {
-		if err := runGit(args...); err != nil {
-			return fmt.Errorf("git %s failed: %w", args[0], err)
-		}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
 	}
-
-	// Extract the archive manually using Windows built-in tar
-	tarCmd := exec.CommandContext(cloneCtx, "tar", "-xf", "repo.tar")
-	tarCmd.Dir = w.Dir
-	if err := tarCmd.Run(); err != nil {
-		return fmt.Errorf("tar extraction failed: %w", err)
-	}
-	os.Remove(fmt.Sprintf("%s/repo.tar", w.Dir))
 
 	return nil
 }
