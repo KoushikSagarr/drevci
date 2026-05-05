@@ -25,9 +25,14 @@ func Create() (*Workspace, error) {
 	return &Workspace{Dir: dir}, nil
 }
 
-func (w *Workspace) Clone(ctx context.Context, source drevtypes.Repository, ref string, logWriter io.Writer) error {
+func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWriter io.Writer) error {
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+
+	ref := source.Ref
+	if ref == "" {
+		ref = "main"
+	}
 
 	// HYBRID LOGIC: If it's the Drev Self-Test (this repo), use Local Copy Bypass
 	localPath := os.Getenv("DREV_LOCAL_REPO")
