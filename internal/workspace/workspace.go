@@ -51,18 +51,18 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	}
 
 	// Attempt 1: Fast shallow clone of specific branch
-	if err := runGit("clone", "--depth", "1", "--branch", ref, source.URL, "."); err != nil {
+	// Using -c to set stability flags that prevent "index-pack" failures
+	if err := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "clone", "--depth", "1", "--branch", ref, source.URL, "."); err != nil {
 		fmt.Fprintf(logWriter, "[drev] branch clone failed, cleaning up and retrying: %v\n", err)
 		
 		// 2. CRITICAL: Clean the directory before retrying
-		// Git will not clone into a non-empty directory
 		entries, _ := os.ReadDir(w.Dir)
 		for _, entry := range entries {
 			os.RemoveAll(fmt.Sprintf("%s/%s", w.Dir, entry.Name()))
 		}
 
-		// Attempt 2: Full shallow clone
-		if err2 := runGit("clone", "--depth", "1", source.URL, "."); err2 != nil {
+		// Attempt 2: Full shallow clone (with stability flags)
+		if err2 := runGit("-c", "core.compression=0", "-c", "pack.threads=1", "clone", "--depth", "1", source.URL, "."); err2 != nil {
 			return fmt.Errorf("git clone failed: %w", err2)
 		}
 
