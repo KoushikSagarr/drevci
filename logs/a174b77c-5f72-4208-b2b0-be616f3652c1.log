@@ -1,0 +1,10 @@
+[drev] cloning https://github.com/KoushikSagarr/drevci.git @ main
+Cloning into '.'...
+[drev] pulling image: alpine
+{"status":"Pulling from library/alpine","id":"latest"}
+{"status":"Digest: sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11"}
+{"status":"Status: Image is up to date for alpine:latest"}
+[drev] --- step: print info ---
+Drev CI triggered by webhook!
+[drev] --- step: show commit ---
+Pipeline is alive
