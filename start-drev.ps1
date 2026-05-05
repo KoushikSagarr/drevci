@@ -2,9 +2,10 @@
 
 # --- 1. Cleanup old processes ---
 Write-Host "Cleaning up port 3000 (Next.js)..." -ForegroundColor Yellow
-$port3000 = Get-NetTCPConnection -LocalPort 3000 -ErrorAction SilentlyContinue
-if ($port3000) {
-    Stop-Process -Id $port3000.OwningProcess -Force -ErrorAction SilentlyContinue
+$pid3000 = (netstat -ano | findstr :3000 | ForEach-Object { $_.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[-1] } | Select-Object -Unique)
+if ($pid3000) {
+    Write-Host "Killing process $pid3000 on port 3000..." -ForegroundColor Yellow
+    Stop-Process -Id $pid3000 -Force -ErrorAction SilentlyContinue
 }
 
 $processes = @("drevd", "drev-router", "ngrok")
