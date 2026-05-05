@@ -17,7 +17,14 @@ type Workspace struct {
 }
 
 func Create() (*Workspace, error) {
-	dir, err := os.MkdirTemp("", "drev-workspace-*")
+	// Use a dedicated root directory to avoid OneDrive/Sync issues in User folders
+	baseDir := `C:\drev-workspaces`
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		// Fallback to system temp if C:\ is not writable
+		baseDir = "" 
+	}
+	
+	dir, err := os.MkdirTemp(baseDir, "drev-workspace-*")
 	if err != nil {
 		return nil, fmt.Errorf("creating workspace dir: %w", err)
 	}
@@ -49,10 +56,6 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			"GIT_TERMINAL_PROMPT=0",
 			"GIT_ASKPASS=echo",
 			"GCM_INTERACTIVE=never",
-			"GIT_TRACE=1",
-			"GIT_CURL_VERBOSE=1",
-			"GIT_HTTP_LOW_SPEED_LIMIT=1000",
-			"GIT_HTTP_LOW_SPEED_TIME=30",
 		)
 		return cmd.Run()
 	}
