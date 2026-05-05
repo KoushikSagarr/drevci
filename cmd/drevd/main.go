@@ -134,7 +134,7 @@ func main() {
 		},
 	}
 
-	rootCmd.Flags().IntVar(&port, "port", 8080, "HTTP port")
+	rootCmd.Flags().IntVar(&port, "port", 8085, "HTTP port")
 	rootCmd.Flags().StringVar(&dbPath, "db", "./drev.db", "SQLite DB path")
 	rootCmd.Flags().StringVar(&logDir, "log-dir", "./logs", "log file directory")
 	rootCmd.Flags().StringVar(&token, "token", "", "API token (or DREV_TOKEN env var)")

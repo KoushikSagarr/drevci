@@ -1,5 +1,12 @@
 # Requires PowerShell 5.1 or newer
 
+$existingProcess = Get-Process drevd -ErrorAction SilentlyContinue
+if ($existingProcess) {
+    Write-Host "Stopping existing Drev CI Daemon..." -ForegroundColor Yellow
+    Stop-Process -Name drevd -Force
+    Start-Sleep -Seconds 2
+}
+
 Write-Host "Compiling Drev CI..." -ForegroundColor Cyan
 go build -o bin/drevd.exe ./cmd/drevd
 go build -o bin/drev.exe ./cmd/drev
