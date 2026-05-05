@@ -65,6 +65,7 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		{"init"},
 		{"config", "core.fscache", "true"},
 		{"config", "core.preloadindex", "true"},
+		{"config", "core.longpaths", "true"},
 		{"-c", "credential.helper=", "remote", "add", "origin", source.URL},
 		{
 			"-c", "core.compression=0", 
@@ -72,7 +73,7 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			"-c", "credential.helper=", 
 			"fetch", "--no-tags", "--no-recurse-submodules", "--filter=blob:none", "--depth", "1", "origin", ref,
 		},
-		{"checkout", "--quiet", "FETCH_HEAD"},
+		{"reset", "--hard", "FETCH_HEAD"},
 	}
 
 	for _, args := range steps {
