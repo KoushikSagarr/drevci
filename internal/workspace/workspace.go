@@ -45,40 +45,41 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	fmt.Fprintf(logWriter, "[drev] initializing workspace for %s @ %s\n", source.URL, ref)
+	fmt.Fprintf(logWriter, "[drev] initializing workspace via ZIP download (bypassing Git binary)\n")
 
-	// Use a single, heavily-optimized clone command
-	// We disable CRLF conversion, GC, and file monitoring to prevent hangs
-	args := []string{
-		"-c", "core.autocrlf=false",
-		"-c", "core.fscache=true",
-		"-c", "gc.auto=0",
-		"-c", "core.fsmonitor=false",
-		"clone",
-		"--depth", "1",
-		"--no-tags",
-		"--single-branch",
-		"--branch", ref,
-		source.URL,
-		w.Dir,
+	// Convert git URL to ZIP URL: https://github.com/user/repo/archive/refs/heads/main.zip
+	zipURL := strings.TrimSuffix(source.URL, ".git") + "/archive/refs/heads/" + ref + ".zip"
+	
+	resp, err := http.Get(zipURL)
+	if err != nil {
+		return fmt.Errorf("downloading repo zip: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download zip: status %d", resp.StatusCode)
 	}
 
-	cmd := exec.CommandContext(cloneCtx, "git", args...)
+	zipFile := fmt.Sprintf("%s/repo.zip", w.Dir)
+	out, err := os.Create(zipFile)
+	if err != nil {
+		return fmt.Errorf("creating zip file: %w", err)
+	}
 	
-	// Direct piping to avoid buffering issues
-	cmd.Stdout = logWriter
-	cmd.Stderr = logWriter
-	
-	cmd.Env = append(os.Environ(), 
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-		"GCM_INTERACTIVE=never",
-	)
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+	_, err = io.Copy(out, resp.Body)
+	out.Close()
+	if err != nil {
+		return fmt.Errorf("saving zip body: %w", err)
 	}
 
+	// Extract using Windows built-in tar (which supports zip)
+	tarCmd := exec.CommandContext(cloneCtx, "tar", "-xf", "repo.zip", "--strip-components=1")
+	tarCmd.Dir = w.Dir
+	if err := tarCmd.Run(); err != nil {
+		return fmt.Errorf("extraction failed: %w", err)
+	}
+	
+	os.Remove(zipFile)
 	return nil
 }
 
