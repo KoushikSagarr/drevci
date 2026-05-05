@@ -1,6 +1,6 @@
 import { Run, RunJob } from './types';
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8085';
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:9090';
 const TOKEN = process.env.NEXT_PUBLIC_API_TOKEN ?? '';
 
 const headers = () => ({
