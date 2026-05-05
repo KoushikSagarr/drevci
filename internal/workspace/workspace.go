@@ -57,12 +57,19 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		return cmd.Run()
 	}
 
-	// Manual sequence (often more robust than 'clone')
+	// Manual sequence (Optimized for Windows performance)
 	steps := [][]string{
 		{"init"},
+		{"config", "core.fscache", "true"},
+		{"config", "core.preloadindex", "true"},
 		{"-c", "credential.helper=", "remote", "add", "origin", source.URL},
-		{"-c", "core.compression=0", "-c", "pack.threads=1", "-c", "credential.helper=", "fetch", "--depth", "1", "origin", ref},
-		{"checkout", "FETCH_HEAD"},
+		{
+			"-c", "core.compression=0", 
+			"-c", "pack.threads=1", 
+			"-c", "credential.helper=", 
+			"fetch", "--no-tags", "--no-recurse-submodules", "--filter=blob:none", "--depth", "1", "origin", ref,
+		},
+		{"checkout", "--progress", "FETCH_HEAD"},
 	}
 
 	for _, args := range steps {
