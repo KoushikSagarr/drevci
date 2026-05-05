@@ -88,3 +88,4 @@ jobs:
   - [ ] Slack / Discord notifications
   - [ ] RBAC and multi-user support
 test
+test

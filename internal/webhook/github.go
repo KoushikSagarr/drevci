@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -75,29 +76,20 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sigHeader := r.Header.Get("X-Hub-Signature-256")
-	if sigHeader == "" {
+	sig := r.Header.Get("X-Hub-Signature-256")
+	if sig == "" {
 		http.Error(w, "missing signature", http.StatusBadRequest)
-		return
-	}
-
-	parts := strings.SplitN(sigHeader, "=", 2)
-	if len(parts) != 2 || parts[0] != "sha256" {
-		http.Error(w, "invalid signature format", http.StatusBadRequest)
-		return
-	}
-
-	sigBytes, err := hex.DecodeString(parts[1])
-	if err != nil {
-		http.Error(w, "invalid signature hex", http.StatusUnauthorized)
 		return
 	}
 
 	mac := hmac.New(sha256.New, []byte(h.secret))
 	mac.Write(body)
-	expectedMAC := mac.Sum(nil)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
-	if !hmac.Equal(sigBytes, expectedMAC) {
+	log.Printf("received sig: %s", sig)
+	log.Printf("expected sig: %s", expected)
+
+	if !hmac.Equal([]byte(sig), []byte(expected)) {
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}
