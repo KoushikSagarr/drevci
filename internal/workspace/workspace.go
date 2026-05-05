@@ -11,6 +11,7 @@ import (
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
+// Workspace manages the lifecycle of a build directory.
 type Workspace struct {
 	Dir string
 }
