@@ -73,7 +73,8 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			"-c", "credential.helper=", 
 			"fetch", "--no-tags", "--no-recurse-submodules", "--filter=blob:none", "--depth", "1", "origin", ref,
 		},
-		{"reset", "--hard", "FETCH_HEAD"},
+		// Stream files directly to disk (Bypasses Windows file-locking hangs)
+		{"archive", "--format=tar", "FETCH_HEAD", "-o", "repo.tar"},
 	}
 
 	for _, args := range steps {
@@ -81,6 +82,14 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			return fmt.Errorf("git %s failed: %w", args[0], err)
 		}
 	}
+
+	// Extract the archive manually using Windows built-in tar
+	tarCmd := exec.CommandContext(cloneCtx, "tar", "-xf", "repo.tar")
+	tarCmd.Dir = w.Dir
+	if err := tarCmd.Run(); err != nil {
+		return fmt.Errorf("tar extraction failed: %w", err)
+	}
+	os.Remove(fmt.Sprintf("%s/repo.tar", w.Dir))
 
 	return nil
 }
