@@ -1,0 +1,9 @@
+name: drev-self-test
+jobs:
+  - name: verify
+    image: alpine
+    steps:
+      - name: print info
+        run: echo "Drev CI triggered by webhook!"
+      - name: show commit
+        run: echo "Pipeline is alive"

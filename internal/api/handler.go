@@ -15,6 +15,7 @@ import (
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
+	"github.com/drevci/drev/internal/webhook"
 	"github.com/drevci/drev/pkg/drevtypes"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -22,25 +23,29 @@ import (
 )
 
 type Handler struct {
-	store     store.Store
-	scheduler *scheduler.Scheduler
-	parser    *parser.Parser
-	logDir    string
-	streamer  *streamer.LogStreamer
+	store          store.Store
+	scheduler      *scheduler.Scheduler
+	parser         *parser.Parser
+	logDir         string
+	streamer       *streamer.LogStreamer
+	webhookHandler *webhook.GitHubHandler
 }
 
 func New(
 	store store.Store,
 	scheduler *scheduler.Scheduler,
 	parser *parser.Parser,
+	streamer *streamer.LogStreamer,
+	webhookHandler *webhook.GitHubHandler,
 	logDir string,
 ) *Handler {
 	return &Handler{
-		store:     store,
-		scheduler: scheduler,
-		parser:    parser,
-		logDir:    logDir,
-		streamer:  streamer.New(logDir),
+		store:          store,
+		scheduler:      scheduler,
+		parser:         parser,
+		logDir:         logDir,
+		streamer:       streamer,
+		webhookHandler: webhookHandler,
 	}
 }
 
@@ -50,6 +55,10 @@ func (h *Handler) Routes() http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/api/v1/health", h.health)
+
+	if h.webhookHandler != nil {
+		r.Post("/webhooks/github", h.webhookHandler.Handle)
+	}
 
 	r.Group(func(r chi.Router) {
 		tokensStr := os.Getenv("DREV_API_TOKENS")

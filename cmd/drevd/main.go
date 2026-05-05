@@ -17,6 +17,8 @@ import (
 	"github.com/drevci/drev/internal/runner"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/streamer"
+	"github.com/drevci/drev/internal/webhook"
 )
 
 func main() {
@@ -25,6 +27,8 @@ func main() {
 	var logDir string
 	var token string
 	var host string
+	var webhookSecret string
+	var webhookConfig string
 
 	var rootCmd = &cobra.Command{
 		Use:   "drevd",
@@ -41,6 +45,17 @@ func main() {
 				token = t
 				fmt.Printf("No token set. Generated token: %s\n", token)
 				fmt.Printf("Set DREV_TOKEN=%s to reuse on restart\n", token)
+			}
+
+			if webhookSecret == "" {
+				webhookSecret = os.Getenv("DREV_WEBHOOK_SECRET")
+			}
+			if webhookSecret == "" {
+				t, err := auth.GenerateToken()
+				if err != nil {
+					log.Fatalf("failed to generate webhook secret: %v", err)
+				}
+				webhookSecret = t
 			}
 
 			// Expose token to API via env var
@@ -63,8 +78,10 @@ func main() {
 
 			sched := scheduler.New(r, s)
 			p := parser.NewParser()
+			stream := streamer.New(logDir)
+			wh := webhook.New(s, sched, p, stream, webhookSecret, webhookConfig)
 
-			h := api.New(s, sched, p, logDir)
+			h := api.New(s, sched, p, stream, wh, logDir)
 
 			addr := fmt.Sprintf("%s:%d", host, port)
 			server := &http.Server{
@@ -76,6 +93,8 @@ func main() {
 			fmt.Printf("│   Drev CI  v0.1.0      │\n")
 			fmt.Printf("│   http://%-13s │\n", addr)
 			fmt.Println("└─────────────────────────┘")
+			fmt.Printf("Webhook URL: http://%s/webhooks/github\n", addr)
+			fmt.Printf("Webhook secret: %s\n", webhookSecret)
 
 			go func() {
 				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -102,6 +121,8 @@ func main() {
 	rootCmd.Flags().StringVar(&logDir, "log-dir", "./logs", "log file directory")
 	rootCmd.Flags().StringVar(&token, "token", "", "API token (or DREV_TOKEN env var)")
 	rootCmd.Flags().StringVar(&host, "host", "0.0.0.0", "bind host")
+	rootCmd.Flags().StringVar(&webhookSecret, "webhook-secret", "", "HMAC secret for GitHub (or DREV_WEBHOOK_SECRET env)")
+	rootCmd.Flags().StringVar(&webhookConfig, "webhook-config", "./configs/webhooks", "dir for per-repo pipeline configs")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

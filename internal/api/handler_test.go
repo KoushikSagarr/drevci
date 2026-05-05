@@ -12,6 +12,7 @@ import (
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/streamer"
 )
 
 func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
@@ -26,10 +27,11 @@ func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
 
 	p := parser.NewParser()
 	sched := scheduler.New(nil, s) // Mock scheduler with nil runner
+	stream := streamer.New(logDir)
 
 	os.Setenv("DREV_API_TOKENS", "test-token")
 
-	h := New(s, sched, p, logDir)
+	h := New(s, sched, p, stream, nil, logDir)
 	server := httptest.NewServer(h.Routes())
 
 	t.Cleanup(func() {

@@ -1,0 +1,19 @@
+name: example-webhook-pipeline
+source:
+  type: git
+  url: ""        # filled automatically from push payload
+  ref: ""        # filled automatically from push branch
+jobs:
+  - name: test
+    image: golang:1.23-alpine
+    steps:
+      - name: download deps
+        run: go mod download
+      - name: run tests
+        run: go test ./...
+  - name: build
+    image: golang:1.23-alpine
+    depends_on: [test]
+    steps:
+      - name: build
+        run: go build ./...
