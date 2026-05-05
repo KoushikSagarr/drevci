@@ -50,7 +50,7 @@ func main() {
 	_ = godotenv.Load()
 
 	var rootCmd = &cobra.Command{Use: "drev"}
-	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:8085", "server URL")
+	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:9090", "server URL")
 	rootCmd.PersistentFlags().StringVar(&token, "token", "", "API token (or read from DREV_TOKEN env var)")
 
 	if envSrv := os.Getenv("DREV_SERVER"); envSrv != "" {
