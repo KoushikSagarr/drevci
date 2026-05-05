@@ -16,6 +16,7 @@ import (
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
+// Runner handles the execution of jobs in Docker containers.
 type Runner struct {
 	docker *client.Client
 	store  store.Store
