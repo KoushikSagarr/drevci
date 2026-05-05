@@ -9,7 +9,6 @@ import (
 )
 
 func main() {
-	// Define your backend targets
 	drevTarget, _ := url.Parse("http://localhost:9090")
 	otherTarget, _ := url.Parse("http://localhost:3001") // Change 3001 to your other project's port
 
