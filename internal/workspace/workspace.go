@@ -45,25 +45,35 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	fmt.Fprintf(logWriter, "[drev] initializing workspace via Local Copy (DREV_LOCAL_REPO is set)\n")
+	fmt.Fprintf(logWriter, "[drev] initializing workspace for %s @ %s\n", source.URL, ref)
 
-	localPath := os.Getenv("DREV_LOCAL_REPO")
-	if localPath == "" {
-		return fmt.Errorf("DREV_LOCAL_REPO environment variable is not set")
+	// Use the hardened clone command in the safe zone
+	args := []string{
+		"-c", "core.autocrlf=false",
+		"-c", "core.fscache=true",
+		"-c", "gc.auto=0",
+		"-c", "core.fsmonitor=false",
+		"clone",
+		"--depth", "1",
+		"--no-tags",
+		"--single-branch",
+		"--branch", ref,
+		source.URL,
+		w.Dir,
 	}
 
-	// Use Windows 'robocopy' to efficiently copy the folder (bypassing node_modules and .git)
-	// robocopy <source> <dest> /E /XF <files> /XD <dirs>
-	robocopy := exec.CommandContext(cloneCtx, "robocopy", localPath, w.Dir, "/E", "/XD", ".git", "node_modules", "bin", "/NFL", "/NDL", "/NJH", "/NJS", "/nc", "/ns", "/np")
+	cmd := exec.CommandContext(cloneCtx, "git", args...)
+	cmd.Stdout = logWriter
+	cmd.Stderr = logWriter
 	
-	// Robocopy exit codes 0-7 are success (it's weird)
-	err := robocopy.Run()
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if exitErr.ExitCode() > 7 {
-			return fmt.Errorf("robocopy failed with exit code %d", exitErr.ExitCode())
-		}
-	} else if err != nil {
-		return fmt.Errorf("running robocopy: %w", err)
+	cmd.Env = append(os.Environ(), 
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=echo",
+		"GCM_INTERACTIVE=never",
+	)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
 	}
 
 	return nil
