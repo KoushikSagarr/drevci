@@ -36,11 +36,12 @@ func New(store store.Store) (*Runner, error) {
 	return &Runner{
 		docker: cli,
 		store:  store,
-	}, nil
+		}, nil
 }
 
+func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
 	// Check if image exists locally to save time
-	_, _, err = r.docker.ImageInspectWithRaw(ctx, job.Image)
+	_, _, err := r.docker.ImageInspectWithRaw(ctx, job.Image)
 	if err != nil {
 		fmt.Fprintf(logWriter, "[drev] image not found locally, pulling: %s\n", job.Image)
 		reader, err := r.docker.ImagePull(ctx, job.Image, image.PullOptions{})
