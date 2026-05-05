@@ -39,14 +39,19 @@ func New(store store.Store) (*Runner, error) {
 	}, nil
 }
 
-func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
-	fmt.Fprintf(logWriter, "[drev] pulling image: %s\n", job.Image)
-	reader, err := r.docker.ImagePull(ctx, job.Image, image.PullOptions{})
+	// Check if image exists locally to save time
+	_, _, err = r.docker.ImageInspectWithRaw(ctx, job.Image)
 	if err != nil {
-		return fmt.Errorf("pulling image: %w", err)
+		fmt.Fprintf(logWriter, "[drev] image not found locally, pulling: %s\n", job.Image)
+		reader, err := r.docker.ImagePull(ctx, job.Image, image.PullOptions{})
+		if err != nil {
+			return fmt.Errorf("pulling image: %w", err)
+		}
+		io.Copy(logWriter, reader)
+		reader.Close()
+	} else {
+		fmt.Fprintf(logWriter, "[drev] using cached image: %s\n", job.Image)
 	}
-	io.Copy(logWriter, reader)
-	reader.Close()
 
 	var cmds []string
 	for _, step := range job.Steps {
