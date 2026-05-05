@@ -37,6 +37,7 @@ type Store interface {
 	ListRuns(ctx context.Context, limit int) ([]*drevtypes.Run, error)
 	CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error
 	UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
+	ResetGhostRuns(ctx context.Context) error
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 }
 
@@ -296,4 +297,20 @@ func (s *SQLiteStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtype
 	}
 
 	return jobs, rows.Err()
+}
+
+func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	// Mark stuck runs as failed
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = 'failed', finished_at = ? 
+		WHERE status IN ('running', 'pending')`, now)
+	if err != nil {
+		return err
+	}
+	// Mark stuck jobs as failed
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE run_jobs SET status = 'failed', finished_at = ? 
+		WHERE status IN ('running', 'pending')`, now)
+	return err
 }

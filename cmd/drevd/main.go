@@ -101,6 +101,11 @@ func main() {
 			}
 			defer s.Close()
 
+			// Cleanup stuck pipelines from previous session
+			if err := s.ResetGhostRuns(context.Background()); err != nil {
+				log.Printf("Warning: failed to reset ghost runs: %v", err)
+			}
+
 			r, err := runner.New(s)
 			if err != nil {
 				log.Fatalf("failed to create runner: %v", err)

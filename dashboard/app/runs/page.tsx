@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useMemo } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { getRuns } from '../../lib/api';
 import { Run, RunStatus } from '../../lib/types';
 import StatusBadge from '../../components/StatusBadge';
@@ -62,6 +63,7 @@ function QueueBar({ qs }: { qs: QueueStatus | null }) {
 }
 
 export default function RunsPage() {
+  const router = useRouter();
   const [runs, setRuns] = useState<Run[]>([]);
   const [loading, setLoading] = useState(true);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
@@ -109,7 +111,7 @@ export default function RunsPage() {
     });
   }, [runs, search, filter]);
 
-  // --- Compute metrics ---
+  // --- Metrics ---
   const validRuns = runs.filter(r => r.started_at && r.started_at !== '0001-01-01T00:00:00Z');
   const total = validRuns.length;
   const succeeded = validRuns.filter(r => r.status === 'success').length;
@@ -232,7 +234,7 @@ export default function RunsPage() {
                     className={`border-b border-border transition-colors hover:bg-surface-hover cursor-pointer group ${
                       run.status === 'running' ? 'glow-running' : ''
                     }`}
-                    onClick={() => window.location.href = `/runs/${run.id}`}
+                    onClick={() => router.push(`/runs/${run.id}`)}
                   >
                     <td className="px-5 py-3.5">
                       <span className="font-mono text-xs text-text-secondary group-hover:text-accent">
