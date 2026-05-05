@@ -72,7 +72,7 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 			"-c", "credential.helper=", 
 			"fetch", "--no-tags", "--no-recurse-submodules", "--filter=blob:none", "--depth", "1", "origin", ref,
 		},
-		{"checkout", "--progress", "FETCH_HEAD"},
+		{"checkout", "--quiet", "FETCH_HEAD"},
 	}
 
 	for _, args := range steps {
