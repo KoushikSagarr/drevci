@@ -1,0 +1,37 @@
+name: drev-ci-pipeline
+
+triggers:
+  - push
+  - pull_request
+
+env:
+  GO_ENV: production
+  APP_NAME: drev
+
+jobs:
+  - name: test
+    image: golang:1.22-alpine
+    steps:
+      - name: checkout deps
+        run: go mod download
+
+      - name: run tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: upload coverage
+        run: |
+          apk add --no-cache curl
+          curl -sf https://codecov.io/bash | sh -s -- -f coverage.out
+
+  - name: build
+    image: golang:1.22-alpine
+    depends_on:
+      - test
+    steps:
+      - name: build binary
+        run: |
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/drev ./cmd/drev
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/drevd ./cmd/drevd
+
+      - name: print binary size
+        run: ls -lh bin/
