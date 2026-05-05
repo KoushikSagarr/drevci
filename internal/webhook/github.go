@@ -1,7 +1,6 @@
 package webhook
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,9 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/drevci/drev/internal/parser"
-	"github.com/drevci/drev/internal/scheduler"
+	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 	"github.com/drevci/drev/pkg/drevtypes"
@@ -25,7 +25,7 @@ import (
 
 type GitHubHandler struct {
 	store     store.Store
-	scheduler *scheduler.Scheduler
+	queue     *queue.Queue
 	parser    *parser.Parser
 	streamer  *streamer.LogStreamer
 	secret    string
@@ -34,7 +34,7 @@ type GitHubHandler struct {
 
 func New(
 	store store.Store,
-	scheduler *scheduler.Scheduler,
+	q *queue.Queue,
 	parser *parser.Parser,
 	streamer *streamer.LogStreamer,
 	secret string,
@@ -42,7 +42,7 @@ func New(
 ) *GitHubHandler {
 	return &GitHubHandler{
 		store:     store,
-		scheduler: scheduler,
+		queue:     q,
 		parser:    parser,
 		streamer:  streamer,
 		secret:    secret,
@@ -153,14 +153,21 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	go func() {
-		ctx := context.Background()
-		logW, err := h.streamer.Writer(runID)
-		if err == nil {
-			defer logW.Close()
-			h.scheduler.RunPipeline(ctx, pipeline, runID, logW)
-		}
-	}()
+	logW, err := h.streamer.Writer(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := h.queue.Enqueue(&queue.Job{
+		RunID:      runID,
+		Pipeline:   pipeline,
+		LogWriter:  logW,
+		EnqueuedAt: time.Now(),
+	}); err != nil {
+		logW.Close()
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 
 	shortSHA := payload.HeadCommit.ID
 	if len(shortSHA) > 7 {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/drevci/drev/internal/auth"
 	"github.com/drevci/drev/internal/parser"
+	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
@@ -28,6 +29,8 @@ type Handler struct {
 	parser         *parser.Parser
 	logDir         string
 	streamer       *streamer.LogStreamer
+	queue          *queue.Queue
+	workers        int
 	webhookHandler *webhook.GitHubHandler
 }
 
@@ -36,6 +39,8 @@ func New(
 	scheduler *scheduler.Scheduler,
 	parser *parser.Parser,
 	streamer *streamer.LogStreamer,
+	q *queue.Queue,
+	workers int,
 	webhookHandler *webhook.GitHubHandler,
 	logDir string,
 ) *Handler {
@@ -45,6 +50,8 @@ func New(
 		parser:         parser,
 		logDir:         logDir,
 		streamer:       streamer,
+		queue:          q,
+		workers:        workers,
 		webhookHandler: webhookHandler,
 	}
 }
@@ -69,6 +76,7 @@ func (h *Handler) Routes() http.Handler {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/api/v1/health", h.health)
+	r.Get("/api/v1/queue", h.queueStatus)
 
 	r.Post("/webhooks/github", h.webhookHandler.Handle)
 
@@ -98,6 +106,19 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
 		"version": "0.1.0",
+	})
+}
+
+func (h *Handler) queueStatus(w http.ResponseWriter, r *http.Request) {
+	depth := 0
+	if h.queue != nil {
+		depth = h.queue.Depth()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"depth":   depth,
+		"workers": h.workers,
+		"status":  "healthy",
 	})
 }
 
@@ -151,14 +172,21 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	go func() {
-		ctx := context.Background()
-		logW, err := h.streamer.Writer(runID)
-		if err == nil {
-			defer logW.Close()
-			h.scheduler.RunPipeline(ctx, pipeline, runID, logW)
-		}
-	}()
+	logW, err := h.streamer.Writer(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := h.queue.Enqueue(&queue.Job{
+		RunID:      runID,
+		Pipeline:   pipeline,
+		LogWriter:  logW,
+		EnqueuedAt: time.Now(),
+	}); err != nil {
+		logW.Close()
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)

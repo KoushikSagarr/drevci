@@ -10,6 +10,7 @@ if ($existingProcess) {
 Write-Host "Compiling Drev CI..." -ForegroundColor Cyan
 go build -o bin/drevd.exe ./cmd/drevd
 go build -o bin/drev.exe ./cmd/drev
+go build -o bin/drev-router.exe ./cmd/drev-router
 
 Write-Host "Starting Drev CI Daemon..." -ForegroundColor Green
 Start-Process -NoNewWindow -FilePath ".\bin\drevd.exe"
