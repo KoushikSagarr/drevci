@@ -12,6 +12,7 @@ import (
 
 	"github.com/drevci/drev/internal/api"
 	"github.com/drevci/drev/internal/auth"
+	"github.com/drevci/drev/internal/notify"
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/pool"
 	"github.com/drevci/drev/internal/queue"
@@ -36,6 +37,8 @@ func main() {
 	var webhookConfig string
 	var workers int
 	var queueSize int
+	var slackWebhook string
+	var discordWebhook string
 
 	var rootCmd = &cobra.Command{
 		Use:   "drevd",
@@ -115,8 +118,35 @@ func main() {
 			p := parser.NewParser()
 			stream := streamer.New(logDir)
 
+			// Notifications
+			if slackWebhook == "" {
+				slackWebhook = os.Getenv("DREV_SLACK_WEBHOOK")
+			}
+			if discordWebhook == "" {
+				discordWebhook = os.Getenv("DREV_DISCORD_WEBHOOK")
+			}
+			notifEnabled := slackWebhook != "" || discordWebhook != ""
+			notif := notify.New(notify.NotificationConfig{
+				SlackWebhookURL:   slackWebhook,
+				DiscordWebhookURL: discordWebhook,
+				Enabled:           notifEnabled,
+			})
+			if notifEnabled {
+				slackStatus := "no"
+				if slackWebhook != "" {
+					slackStatus = "yes"
+				}
+				discordStatus := "no"
+				if discordWebhook != "" {
+					discordStatus = "yes"
+				}
+				fmt.Printf("Notifications enabled: Slack=%s Discord=%s\n", slackStatus, discordStatus)
+			} else {
+				fmt.Println("Notifications disabled (no webhooks configured)")
+			}
+
 			q := queue.New(queueSize)
-			wp := pool.New(workers, q, sched, s)
+			wp := pool.New(workers, q, sched, s, notif)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -125,7 +155,7 @@ func main() {
 			defer wp.Stop()
 
 			wh := webhook.New(s, q, p, stream, webhookSecret, webhookConfig)
-			h := api.New(s, sched, p, stream, q, workers, wh, logDir)
+			h := api.New(s, sched, p, stream, q, workers, wh, logDir, notifEnabled)
 
 			addr := fmt.Sprintf("%s:%d", host, port)
 			server := &http.Server{
@@ -170,6 +200,8 @@ func main() {
 	rootCmd.Flags().StringVar(&webhookConfig, "webhook-config", "./configs/webhooks", "dir for per-repo pipeline configs")
 	rootCmd.Flags().IntVar(&workers, "workers", 3, "number of concurrent pipeline workers (1-20)")
 	rootCmd.Flags().IntVar(&queueSize, "queue-size", 100, "max queued pipelines")
+	rootCmd.Flags().StringVar(&slackWebhook, "slack-webhook", "", "Slack incoming webhook URL (or DREV_SLACK_WEBHOOK env)")
+	rootCmd.Flags().StringVar(&discordWebhook, "discord-webhook", "", "Discord webhook URL (or DREV_DISCORD_WEBHOOK env)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

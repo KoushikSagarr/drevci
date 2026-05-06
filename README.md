@@ -88,6 +88,34 @@ jobs:
 
 ---
 
+## Notifications
+
+Drev CI supports pipeline completion notifications via Slack and Discord webhooks. Both services receive rich-formatted messages with pipeline status, job summary, duration, and a direct link to the dashboard.
+
+### Slack Integration
+
+1. Create an Incoming Webhook in your Slack workspace:
+   **Workspace Settings → API → Incoming Webhooks**
+2. Copy the webhook URL
+3. Set environment variable:
+   ```powershell
+   $env:DREV_SLACK_WEBHOOK = "https://hooks.slack.com/services/..."
+   ```
+4. Restart drevd
+
+### Discord Integration
+
+1. Create a webhook in your Discord server:
+   **Server Settings → Integrations → Webhooks → New Webhook**
+2. Copy the webhook URL
+3. Set environment variable:
+   ```powershell
+   $env:DREV_DISCORD_WEBHOOK = "https://discord.com/api/webhooks/..."
+   ```
+4. Restart drevd
+
+---
+
 ## Roadmap
 
 - [x] DAG Job Scheduling
@@ -95,7 +123,8 @@ jobs:
 - [x] Live SSE Log Streaming
 - [x] Web Dashboard Integration
 - [x] Hybrid Workspace Initialization
+- [x] Slack & Discord Notifications
 - [ ] Distributed Runner Pools
 - [ ] PostgreSQL Persistence Layer
 - [ ] Multi-Cloud Provider Integration
-- [ ] Notification Webhooks (Slack/Discord)
+
