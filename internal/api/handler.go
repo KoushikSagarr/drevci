@@ -24,15 +24,14 @@ import (
 )
 
 type Handler struct {
-	store                store.Store
-	scheduler            *scheduler.Scheduler
-	parser               *parser.Parser
-	logDir               string
-	streamer             *streamer.LogStreamer
-	queue                *queue.Queue
-	workers              int
-	webhookHandler       *webhook.GitHubHandler
-	notificationsEnabled bool
+	store          store.Store
+	scheduler      *scheduler.Scheduler
+	parser         *parser.Parser
+	logDir         string
+	streamer       *streamer.LogStreamer
+	queue          *queue.Queue
+	workers        int
+	webhookHandler *webhook.GitHubHandler
 }
 
 func New(
@@ -44,18 +43,16 @@ func New(
 	workers int,
 	webhookHandler *webhook.GitHubHandler,
 	logDir string,
-	notificationsEnabled bool,
 ) *Handler {
 	return &Handler{
-		store:                store,
-		scheduler:            scheduler,
-		parser:               parser,
-		logDir:               logDir,
-		streamer:             streamer,
-		queue:                q,
-		workers:              workers,
-		webhookHandler:       webhookHandler,
-		notificationsEnabled: notificationsEnabled,
+		store:          store,
+		scheduler:      scheduler,
+		parser:         parser,
+		logDir:         logDir,
+		streamer:       streamer,
+		queue:          q,
+		workers:        workers,
+		webhookHandler: webhookHandler,
 	}
 }
 
@@ -106,10 +103,9 @@ func (h *Handler) Routes() http.Handler {
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":                 "ok",
-		"version":                "0.1.0",
-		"notifications_enabled":  h.notificationsEnabled,
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"version": "0.1.0",
 	})
 }
 

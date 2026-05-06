@@ -3,7 +3,5 @@ logs/
 .env
 *.exe
 *.db
-*.db-shm
-*.db-wal
 coverage.out
 drev-workspace-*

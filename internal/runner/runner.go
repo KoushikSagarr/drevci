@@ -41,20 +41,13 @@ func New(store store.Store) (*Runner, error) {
 }
 
 func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
-	// Helper to log errors to the dashboard before returning them
-	logErr := func(msg string, err error) error {
-		wrapped := fmt.Errorf("%s: %w", msg, err)
-		fmt.Fprintf(logWriter, "[drev] ✗ ERROR: %s\n", wrapped)
-		return wrapped
-	}
-
 	// Check if image exists locally to save time
 	_, _, err := r.docker.ImageInspectWithRaw(ctx, job.Image)
 	if err != nil {
 		fmt.Fprintf(logWriter, "[drev] image not found locally, pulling: %s\n", job.Image)
 		reader, err := r.docker.ImagePull(ctx, job.Image, image.PullOptions{})
 		if err != nil {
-			return logErr("pulling image", err)
+			return fmt.Errorf("pulling image: %w", err)
 		}
 		io.Copy(logWriter, reader)
 		reader.Close()
@@ -83,7 +76,7 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 		Binds: []string{w.Dir + ":/workspace"},
 	}, nil, nil, "")
 	if err != nil {
-		return logErr("creating container", err)
+		return fmt.Errorf("creating container: %w", err)
 	}
 
 	containerID := resp.ID
@@ -92,7 +85,7 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 	}()
 
 	if err := r.docker.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return logErr("starting container", err)
+		return fmt.Errorf("starting container: %w", err)
 	}
 
 	logsReader, err := r.docker.ContainerLogs(ctx, containerID, container.LogsOptions{
@@ -101,27 +94,25 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 		Follow:     true,
 	})
 	if err != nil {
-		return logErr("getting container logs", err)
+		return fmt.Errorf("getting container logs: %w", err)
 	}
 	defer logsReader.Close()
 
 	// Use stdcopy to demultiplex stdout/stderr properly
 	_, err = stdcopy.StdCopy(logWriter, logWriter, logsReader)
 	if err != nil {
-		return logErr("streaming logs", err)
+		return fmt.Errorf("streaming logs: %w", err)
 	}
 
 	statusCh, errCh := r.docker.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return logErr("waiting for container", err)
+			return fmt.Errorf("waiting for container: %w", err)
 		}
 	case status := <-statusCh:
 		if status.StatusCode != 0 {
-			err := fmt.Errorf("job %q failed with exit code %d", job.Name, status.StatusCode)
-			fmt.Fprintf(logWriter, "[drev] ✗ %s\n", err)
-			return err
+			return fmt.Errorf("job %q failed with exit code %d", job.Name, status.StatusCode)
 		}
 	case <-ctx.Done():
 		return ctx.Err()

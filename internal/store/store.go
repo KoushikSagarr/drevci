@@ -301,22 +301,16 @@ func (s *SQLiteStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtype
 
 func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	// Only reset runs that have been stuck for more than 60 seconds.
-	// This prevents nuking runs that are actively completing or just finished.
-	cutoff := time.Now().Add(-60 * time.Second).UTC().Format(time.RFC3339)
-
-	// Mark stuck runs as failed (only if they started more than 60s ago or never started)
+	// Mark stuck runs as failed
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET status = 'failed', finished_at = ? 
-		WHERE status IN ('running', 'pending')
-		AND (started_at IS NULL OR started_at < ?)`, now, cutoff)
+		WHERE status IN ('running', 'pending')`, now)
 	if err != nil {
 		return err
 	}
 	// Mark stuck jobs as failed
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE run_jobs SET status = 'failed', finished_at = ? 
-		WHERE status IN ('running', 'pending')
-		AND (started_at IS NULL OR started_at < ?)`, now, cutoff)
+		WHERE status IN ('running', 'pending')`, now)
 	return err
 }
