@@ -1,104 +1,246 @@
 # Drev CI
 
-[![Go](https://img.shields.io/badge/Go-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev/)
-[![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Next.js](https://img.shields.io/badge/Next.js-000000?style=for-the-badge&logo=nextdotjs&logoColor=white)](https://nextjs.org/)
-[![SQLite](https://img.shields.io/badge/SQLite-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+⚡ Lightweight self-hosted CI runner. Define pipelines in `.drev.yml`, trigger via git push or CLI, watch logs stream live.
 
-Drev CI is a high-performance, self-hosted CI/CD orchestration engine designed for local and private infrastructure. It enables automated pipeline execution within isolated Docker containers, featuring real-time log streaming and a unified web dashboard for pipeline management.
+## Features
 
----
-
-## Technical Features
-
-### Containerized Execution
-Isolated job execution using Docker. Every job runs in a clean container environment defined by your preferred image (Alpine, Ubuntu, Golang, etc.).
-
-### DAG-Based Scheduling
-A Directed Acyclic Graph (DAG) scheduler resolves job dependencies, prevents circular references, and optimizes execution order through parallelized job processing.
-
-### Hybrid Workspace Management
-Intelligent workspace initialization with dual-mode support:
-- **Local Proxy Mode**: High-speed local disk synchronization for development and self-testing.
-- **Repository Mode**: Automated Git cloning with optimized depth-1 fetches for standard pipelines.
-
-### Live Telemetry and Logging
-Real-time log streaming from Docker containers to the dashboard via Server-Sent Events (SSE).
-
-### Secure Webhook Integration
-Direct integration with GitHub via HMAC-SHA256 signed payloads, ensuring only authenticated push events trigger pipeline execution.
-
----
-
-## System Architecture
-
-The ecosystem consists of three primary components:
-
-1. **Drev Daemon (`drevd`)**: The Go-based core engine responsible for job scheduling, container management, and log orchestration.
-2. **Web Dashboard**: A modern Next.js interface for visualizing pipeline runs, inspecting logs, and managing deployment history.
-3. **Internal Router**: A centralized proxy that handles API routing and ensures compatibility with external tunneling services like ngrok.
-
----
+- **YAML pipelines** — Simple `.drev.yml` syntax with multi-job DAG support
+- **Docker execution** — Isolated containers, any image
+- **Git integration** — Auto-clone repos on push, GitHub webhook triggers
+- **Real-time logs** — Stream logs live via SSE to CLI or web dashboard
+- **Job parallelism** — Run independent jobs concurrently
+- **Worker pools** — Configurable workers, queued jobs
+- **Web dashboard** — View runs, logs, job status in real time
+- **Notifications** — Slack and Discord alerts on pipeline completion
+- **Zero setup** — Single binary, SQLite database, no external services
 
 ## Quick Start
 
-### Prerequisites
-- Go 1.21 or higher
-- Docker Engine
-- Node.js & npm (for the Dashboard)
+### Install
 
-### Initialization
-The system includes a hardened startup script for environment preparation:
-
-```powershell
-./start-drev.ps1
+```bash
+git clone https://github.com/drevci/drev.git
+cd drev
+go mod download
+go build -o bin/drev ./cmd/drev
+go build -o bin/drevd ./cmd/drevd
 ```
 
-This script handles:
-- Port cleanup and process management.
-- Backend compilation and execution.
-- Frontend dependency verification and startup.
-- Environment variable injection.
+### Start the server
 
-### Configuration
-Pipelines are defined using the `.drev.yml` specification:
+```bash
+./bin/drevd --port 9090
+# outputs: Webhook URL and API token
+```
+
+### Run your first pipeline
+
+```bash
+export DREV_SERVER=http://localhost:9090
+export DREV_TOKEN=<token-from-startup>
+
+./bin/drev run configs/example.drev.yml
+```
+
+Watch logs stream in real time. When done:
+```
+✓ Pipeline succeeded
+```
+
+### View in dashboard
+
+Open `http://localhost:3000/runs` to see all pipeline runs.
+
+## Pipeline Syntax
+
+Create `.drev.yml` in your repo:
 
 ```yaml
-name: example-pipeline
+name: my-pipeline
+source:
+  type: git
+  url: https://github.com/myorg/myrepo.git
+  ref: main
 jobs:
-  test:
+  - name: test
     image: golang:1.23-alpine
     steps:
-      - name: install-deps
-        run: go mod download
-      - name: run-tests
+      - name: run tests
         run: go test ./...
+
+  - name: build
+    image: golang:1.23-alpine
+    depends_on: [test]
+    steps:
+      - name: build binary
+        run: go build -o app ./cmd/app
 ```
 
----
+### Pipeline Schema
 
-## API Specification
+```yaml
+name: string                    # required
+source:
+  type: git
+  url: string                   # git clone URL
+  ref: string                   # branch, tag, or commit
+triggers:
+  - push                        # GitHub push event
+  - pull_request
+env:
+  KEY: VALUE                    # top-level env vars
+jobs:
+  - name: string                # unique job name
+    image: string               # Docker image
+    env:
+      KEY: VALUE                # job-level env vars
+    depends_on: [job1, job2]    # DAG dependencies
+    steps:
+      - name: string
+        run: string             # shell command
+```
 
-| Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/api/v1/runs` | GET | List all pipeline executions |
-| `/api/v1/runs/{id}` | GET | Retrieve detailed run state |
-| `/api/v1/runs/{id}/logs` | GET | Stream real-time container logs |
-| `/webhooks/github` | POST | Receive GitHub push event payloads |
+## GitHub Webhook Setup
 
----
+1. Start Drev CI server and expose it (e.g., ngrok):
+   ```bash
+   ngrok http 9090
+   ```
+
+2. Go to your GitHub repo → Settings → Webhooks → Add webhook:
+   - Payload URL: `https://<your-ngrok-url>/webhooks/github`
+   - Content type: `application/json`
+   - Secret: (copy from drevd startup output)
+   - Events: Just the push event
+   - Click Add webhook
+
+3. Push to your repo — pipeline triggers automatically.
+
+## Slack/Discord Notifications
+
+Set webhook URLs to get notified when pipelines complete:
+
+```bash
+./bin/drevd \
+  --port 9090 \
+  --slack-webhook https://hooks.slack.com/... \
+  --discord-webhook https://discordapp.com/api/...
+```
+
+Messages include run status, duration, and a link to the dashboard.
+
+## CLI Commands
+
+```bash
+# Run a pipeline
+drev run <.drev.yml path>
+
+# Check status
+drev status <run-id>
+
+# Stream logs
+drev logs <run-id> --follow
+
+# Generate API token
+drev token generate
+
+# Show version
+drev version
+```
+
+## Architecture
+
+```
+┌──────────────────────────────────────┐
+│         GitHub / CLI User            │
+└──────────────────────────────────────┘
+                    ↓
+┌──────────────────────────────────────┐
+│    Drev CI API (drevd :9090)         │
+│  - REST API, auth, webhooks          │
+│  - Job queue & worker pool           │
+│  - YAML parser & DAG scheduler       │
+└──────────────────────────────────────┘
+                    ↓
+┌──────────────────────────────────────┐
+│  Docker Engine                       │
+│  - Execute jobs in containers        │
+│  - Stream logs                       │
+└──────────────────────────────────────┘
+                    ↓
+┌──────────────────────────────────────┐
+│  SQLite + Log Files                  │
+│  - Persist runs and history          │
+└──────────────────────────────────────┘
+
+Dashboard: http://localhost:3000
+  - View all runs
+  - Stream logs in real time
+  - Job timeline
+```
+
+## Configuration
+
+**Server flags:**
+
+| Flag | Default | Description |
+|:-----|:--------|:------------|
+| `--port` | `9090` | HTTP port |
+| `--db` | `./drev.db` | SQLite database path |
+| `--log-dir` | `./logs` | Log file directory |
+| `--token` | *(auto-gen)* | API token |
+| `--workers` | `3` | Concurrent workers |
+| `--queue-size` | `100` | Max queued pipelines |
+| `--webhook-secret` | — | GitHub webhook HMAC secret |
+| `--webhook-config` | `./configs/webhooks` | Per-repo pipeline configs |
+| `--slack-webhook` | — | Slack webhook URL |
+| `--discord-webhook` | — | Discord webhook URL |
+
+**Environment variables:**
+
+| Variable | Description |
+|:---------|:------------|
+| `DREV_SERVER` | CLI server URL (default `localhost:9090`) |
+| `DREV_TOKEN` | API token |
+| `DREV_WEBHOOK_SECRET` | GitHub webhook secret |
+| `DREV_SLACK_WEBHOOK` | Slack webhook URL |
+| `DREV_DISCORD_WEBHOOK` | Discord webhook URL |
+
+## Testing
+
+```bash
+go test ./... -v
+```
+
+Run with Docker running for integration tests (runner tests skip gracefully if Docker unavailable).
+
+## Status
+
+- ✅ Core engine (YAML parser, DAG scheduler, Docker runner)
+- ✅ Real-time log streaming (CLI + web dashboard)
+- ✅ GitHub webhook integration
+- ✅ REST API with token auth
+- ✅ Job queue and worker pools
+- ✅ SQLite persistence
+- ✅ Slack/Discord notifications
 
 ## Roadmap
 
-- [x] DAG Job Scheduling
-- [x] Docker Container Orchestration
-- [x] Live SSE Log Streaming
-- [x] Web Dashboard Integration
-- [x] Hybrid Workspace Initialization
-- [ ] Distributed Runner Pools
-- [ ] PostgreSQL Persistence Layer
-- [ ] Multi-Cloud Provider Integration
-- [ ] Notification Webhooks (Slack/Discord)
+- [ ] Distributed runners (agents on multiple machines)
+- [ ] PostgreSQL support
+- [ ] Pipeline caching (shared volumes)
+- [ ] Manual trigger/cancel from dashboard
+- [ ] Metrics and observability (Prometheus)
+- [ ] Multi-workspace support
+
+## Contributing
+
+Issues and PRs welcome. Please file an issue first to discuss major changes. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup.
 
 ## License
-This project is licensed under the GNU GPL v3.0 License.
+
+MIT License — see [LICENSE](LICENSE) file.
+
+## Author
+
+Built by the Drev team. Questions? [Open an issue](https://github.com/drevci/drev/issues) on GitHub.
