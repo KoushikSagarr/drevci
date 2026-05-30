@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -89,16 +90,26 @@ func (h *Handler) Routes() http.Handler {
 		if tokensStr != "" {
 			tokens = strings.Split(tokensStr, ",")
 		} else {
-			tokens = []string{"test-token"} // default fallback
+			tokens = []string{"test-token"} // default fallback for local dev
 		}
 
-		r.Use(auth.Middleware(auth.Config{Tokens: tokens}))
+		// Build a DB-backed token lookup for SaaS mode
+		dbLookup := auth.TokenLookup(func(ctx context.Context, tokenHash string) (string, string, string, int, error) {
+			org, err := h.store.GetOrgFromToken(ctx, tokenHash)
+			if err != nil {
+				return "", "", "", 0, err
+			}
+			return org.ID, org.Slug, org.Plan, org.WorkerLimit, nil
+		})
+
+		r.Use(auth.Middleware(auth.Config{Tokens: tokens}, dbLookup))
 
 		r.Post("/api/v1/pipelines/trigger", h.trigger)
 		r.Get("/api/v1/runs", h.listRuns)
 		r.Get("/api/v1/runs/{runID}", h.getRun)
 		r.Get("/api/v1/runs/{runID}/jobs", h.getRunJobs)
 		r.Get("/api/v1/runs/{runID}/logs", h.getRunLogs)
+		r.Get("/api/v1/org", h.getOrg)
 	})
 
 	return r
@@ -151,11 +162,30 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		pipeline.Env[k] = v
 	}
 
+	// ── Multi-tenant: extract org context ─────────────────────────────────
+	org := auth.GetOrgContext(r)
+
+	// Check worker limit for SaaS plans
+	if org != nil && org.WorkerLimit > 0 {
+		if h.queue.Depth() >= org.WorkerLimit {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("worker limit reached for your plan (%s: %d workers)", org.Plan, org.WorkerLimit),
+			})
+			return
+		}
+	}
+
 	runID := uuid.New().String()
 	run := &drevtypes.Run{
-		ID:         runID,
-		PipelineID: pipeline.Name,
-		Status:     drevtypes.StatusPending,
+		ID:          runID,
+		PipelineID:  pipeline.Name,
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "api",
+	}
+	if org != nil {
+		run.OrgID = org.OrgID
 	}
 
 	if err := h.store.CreateRun(r.Context(), run); err != nil {
@@ -192,6 +222,15 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Record usage asynchronously
+	if org != nil {
+		go func() {
+			if err := h.store.RecordUsage(context.Background(), org.OrgID, "pipeline_run", runID); err != nil {
+				log.Printf("[api] usage record error: %v", err)
+			}
+		}()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{
@@ -202,17 +241,26 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) listRuns(w http.ResponseWriter, r *http.Request) {
 	limit := 20
-	limitStr := r.URL.Query().Get("limit")
-	if limitStr != "" {
-		if l, err := strconv.Atoi(limitStr); err == nil {
-			limit = l
-			if limit > 100 {
-				limit = 100
-			}
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
+		if l > 100 {
+			l = 100
 		}
+		limit = l
 	}
 
-	runs, err := h.store.ListRuns(r.Context(), limit)
+	var (
+		runs []*drevtypes.Run
+		err  error
+	)
+
+	// Filter by org when authenticated in SaaS mode
+	org := auth.GetOrgContext(r)
+	if org != nil {
+		runs, err = h.store.ListRunsByOrg(r.Context(), org.OrgID, limit)
+	} else {
+		runs, err = h.store.ListRuns(r.Context(), limit)
+	}
+
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -238,8 +286,7 @@ func (h *Handler) getRun(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getRunJobs(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
-	_, err := h.store.GetRun(r.Context(), runID)
-	if err != nil {
+	if _, err := h.store.GetRun(r.Context(), runID); err != nil {
 		http.Error(w, "run not found", http.StatusNotFound)
 		return
 	}
@@ -256,6 +303,44 @@ func (h *Handler) getRunJobs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(jobs)
 }
+
+// getOrg returns the current org's details and monthly usage stats.
+// GET /api/v1/org
+func (h *Handler) getOrg(w http.ResponseWriter, r *http.Request) {
+	org := auth.GetOrgContext(r)
+	if org == nil {
+		http.Error(w, "org context not available (single-tenant mode)", http.StatusNotFound)
+		return
+	}
+
+	orgData, err := h.store.GetOrgByID(r.Context(), org.OrgID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	runsThisMonth, err := h.store.GetMonthlyUsage(r.Context(), org.OrgID)
+	if err != nil {
+		log.Printf("[api] usage fetch error: %v", err)
+		runsThisMonth = 0
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"org": map[string]interface{}{
+			"id":           orgData.ID,
+			"name":         orgData.Name,
+			"slug":         orgData.Slug,
+			"plan":         orgData.Plan,
+			"worker_limit": orgData.WorkerLimit,
+		},
+		"usage": map[string]interface{}{
+			"runs_this_month": runsThisMonth,
+		},
+	})
+}
+
+// ─── SSE log streaming ────────────────────────────────────────────────────────
 
 type sseWriter struct {
 	w  http.ResponseWriter
@@ -307,6 +392,6 @@ func (h *Handler) getRunLogs(w http.ResponseWriter, r *http.Request) {
 
 	err := h.streamer.Tail(ctx, runID, sw)
 	if err != nil && err != context.Canceled {
-		// Log error silently, SSE stream already active
+		// Log error silently — SSE stream already active
 	}
 }

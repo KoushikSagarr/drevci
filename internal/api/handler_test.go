@@ -10,9 +10,11 @@ import (
 	"testing"
 
 	"github.com/drevci/drev/internal/parser"
+	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
+	"github.com/drevci/drev/internal/webhook"
 )
 
 func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
@@ -31,7 +33,9 @@ func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
 
 	os.Setenv("DREV_API_TOKENS", "test-token")
 
-	h := New(s, sched, p, stream, nil, logDir)
+	q := queue.New(10)
+	wh := webhook.New(s, q, p, stream, "", t.TempDir())
+	h := New(s, sched, p, stream, q, 1, wh, logDir, false)
 	server := httptest.NewServer(h.Routes())
 
 	t.Cleanup(func() {

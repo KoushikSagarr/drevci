@@ -47,12 +47,18 @@ type Step struct {
 
 // Run represents a single execution instance of a pipeline.
 type Run struct {
-	ID         string    `json:"id"`
-	PipelineID string    `json:"pipeline_id"`
-	Status     RunStatus `json:"status"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
-	Jobs       []RunJob  `json:"jobs"`
+	ID           string    `json:"id"`
+	OrgID        string    `json:"org_id,omitempty"`
+	PipelineID   string    `json:"pipeline_id"`
+	PipelineName string    `json:"pipeline_name,omitempty"`
+	Status       RunStatus `json:"status"`
+	TriggeredBy  string    `json:"triggered_by,omitempty"`
+	CommitSHA    string    `json:"commit_sha,omitempty"`
+	CommitMsg    string    `json:"commit_msg,omitempty"`
+	Branch       string    `json:"branch,omitempty"`
+	StartedAt    time.Time `json:"started_at"`
+	FinishedAt   time.Time `json:"finished_at"`
+	Jobs         []RunJob  `json:"jobs"`
 }
 
 // RunJob tracks the execution state of an individual job within a run.
@@ -63,4 +69,49 @@ type RunJob struct {
 	Status     RunStatus `json:"status"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
+}
+
+// ─── Multi-tenant SaaS types ─────────────────────────────────────────────────
+
+// Org represents a tenant (customer organization).
+type Org struct {
+	ID               string    `json:"id"`
+	Name             string    `json:"name"`
+	Slug             string    `json:"slug"`
+	Plan             string    `json:"plan"`
+	WorkerLimit      int       `json:"worker_limit"`
+	QueueLimit       int       `json:"queue_limit"`
+	LogRetentionDays int       `json:"log_retention_days"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// OrgMember links a Supabase auth user to an org with a role.
+type OrgMember struct {
+	ID        string    `json:"id"`
+	OrgID     string    `json:"org_id"`
+	UserID    string    `json:"user_id"`
+	Role      string    `json:"role"` // owner | admin | member | viewer
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// APIToken is an org-scoped API token (hash stored, never plaintext).
+type APIToken struct {
+	ID          string     `json:"id"`
+	OrgID       string     `json:"org_id"`
+	Name        string     `json:"name"`
+	TokenHash   string     `json:"-"` // never serialise the hash
+	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	CreatedBy   string     `json:"created_by"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+}
+
+// UsageEvent records a billable or metered action for an org.
+type UsageEvent struct {
+	ID         string    `json:"id"`
+	OrgID      string    `json:"org_id"`
+	EventType  string    `json:"event_type"` // pipeline_run | worker_minute
+	RunID      string    `json:"run_id,omitempty"`
+	Quantity   float64   `json:"quantity"`
+	RecordedAt time.Time `json:"recorded_at"`
 }

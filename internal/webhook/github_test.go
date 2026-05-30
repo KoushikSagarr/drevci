@@ -13,7 +13,7 @@ import (
 	"testing"
 
 	"github.com/drevci/drev/internal/parser"
-	"github.com/drevci/drev/internal/scheduler"
+	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 )
@@ -33,10 +33,10 @@ func setupTestHandler(t *testing.T, secret string, configDir string) *GitHubHand
 	t.Cleanup(func() { s.Close() })
 
 	p := parser.NewParser()
-	sched := scheduler.New(nil, s)
+	q := queue.New(10)
 	stream := streamer.New(t.TempDir())
 
-	return New(s, sched, p, stream, secret, configDir)
+	return New(s, q, p, stream, secret, configDir)
 }
 
 func TestGitHubWebhook_MissingSignature(t *testing.T) {

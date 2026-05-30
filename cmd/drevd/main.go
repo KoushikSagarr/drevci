@@ -39,6 +39,8 @@ func main() {
 	var queueSize int
 	var slackWebhook string
 	var discordWebhook string
+	var dbType string
+	var dbURL string
 
 	var rootCmd = &cobra.Command{
 		Use:   "drevd",
@@ -98,11 +100,39 @@ func main() {
 				log.Fatalf("failed to create log dir: %v", err)
 			}
 
-			s, err := store.Open(dbPath)
-			if err != nil {
-				log.Fatalf("failed to open store: %v", err)
+			// Resolve database type and URL from flags/env
+			if dbType == "" {
+				dbType = os.Getenv("DREV_DB_TYPE")
 			}
-			defer s.Close()
+			if dbType == "" {
+				dbType = "sqlite"
+			}
+			if dbURL == "" {
+				dbURL = os.Getenv("DREV_DB_URL")
+			}
+
+			var s store.Store
+			switch dbType {
+			case "postgres":
+				if dbURL == "" {
+					log.Fatal("--db-url or DREV_DB_URL is required when --db-type=postgres")
+				}
+				pg, err := store.OpenPostgres(dbURL)
+				if err != nil {
+					log.Fatalf("failed to open postgres store: %v", err)
+				}
+				defer pg.Close()
+				s = pg
+				fmt.Println("Database: PostgreSQL (Supabase)")
+			default:
+				sg, err := store.Open(dbPath)
+				if err != nil {
+					log.Fatalf("failed to open sqlite store: %v", err)
+				}
+				defer sg.Close()
+				s = sg
+				fmt.Printf("Database: SQLite (%s)\n", dbPath)
+			}
 
 			// Cleanup stuck pipelines from previous session
 			if err := s.ResetGhostRuns(context.Background()); err != nil {
@@ -202,6 +232,8 @@ func main() {
 	rootCmd.Flags().IntVar(&queueSize, "queue-size", 100, "max queued pipelines")
 	rootCmd.Flags().StringVar(&slackWebhook, "slack-webhook", "", "Slack incoming webhook URL (or DREV_SLACK_WEBHOOK env)")
 	rootCmd.Flags().StringVar(&discordWebhook, "discord-webhook", "", "Discord webhook URL (or DREV_DISCORD_WEBHOOK env)")
+	rootCmd.Flags().StringVar(&dbType, "db-type", "", "Database type: sqlite (default) or postgres (or DREV_DB_TYPE env)")
+	rootCmd.Flags().StringVar(&dbURL, "db-url", "", "PostgreSQL connection string (or DREV_DB_URL env)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
