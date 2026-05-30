@@ -30,11 +30,25 @@ func setupTestHandler(t *testing.T, secret string, configDir string) *GitHubHand
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
 
 	p := parser.NewParser()
 	q := queue.New(10)
 	stream := streamer.New(t.TempDir())
+
+	t.Cleanup(func() {
+		s.Close()
+		// Drain queue and close any log writers to avoid Windows file lock issues
+		for {
+			select {
+			case job := <-q.Drain():
+				if job.LogWriter != nil {
+					job.LogWriter.Close()
+				}
+			default:
+				return
+			}
+		}
+	})
 
 	return New(s, q, p, stream, secret, configDir)
 }

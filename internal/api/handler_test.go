@@ -41,6 +41,17 @@ func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
 	t.Cleanup(func() {
 		server.Close()
 		s.Close()
+		// Drain queue and close any log writers to avoid Windows file lock issues
+		for {
+			select {
+			case job := <-q.Drain():
+				if job.LogWriter != nil {
+					job.LogWriter.Close()
+				}
+			default:
+				return
+			}
+		}
 	})
 
 	return server, h

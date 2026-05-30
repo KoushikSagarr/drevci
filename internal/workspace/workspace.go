@@ -26,6 +26,10 @@ func Create() (*Workspace, error) {
 }
 
 func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWriter io.Writer) error {
+	if source.URL == "" {
+		return nil
+	}
+
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
@@ -54,7 +58,10 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	cmd := exec.CommandContext(cloneCtx, "git", "clone", "--depth", "1", "--branch", ref, source.URL, w.Dir)
 	cmd.Stdout = logWriter
 	cmd.Stderr = logWriter
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+	return nil
 }
 
 func (w *Workspace) Cleanup() error {
