@@ -76,8 +76,16 @@ if ($Mode -eq "saas") {
     # ── Local / SQLite mode ───────────────────────────────────────────
     Write-Host "  > Mode: Local (SQLite)" -ForegroundColor Cyan
 
+    # Auto-seed if SQLite database doesn't exist
+    if (-not (Test-Path "drev.db")) {
+        Write-Host "  > First run detected! Seeding database with premium sample data..." -ForegroundColor Yellow
+        go run ./cmd/seed --db-type sqlite
+    }
+
     Write-Host "  > Starting Backend (SQLite)..." -ForegroundColor Gray
-    Start-Process -NoNewWindow -FilePath ".\bin\drevd.exe"
+    Start-Process -NoNewWindow -FilePath ".\bin\drevd.exe" -ArgumentList `
+        "--db-type", "sqlite", `
+        "--port", "9090"
 }
 
 # Start Router (8888) — same for both modes

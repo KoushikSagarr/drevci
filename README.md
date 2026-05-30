@@ -214,6 +214,21 @@ go test ./... -v
 
 Run with Docker running for integration tests (runner tests skip gracefully if Docker unavailable).
 
+## Seeding Sample Data
+
+For testing and visual presentation, you can populate your databases (either SQLite or PostgreSQL/Supabase) with premium mock CI data.
+
+To compile and seed the database manually:
+```bash
+go build -o bin/seed.exe ./cmd/seed
+# For SQLite:
+./bin/seed.exe --db-type sqlite
+# For PostgreSQL:
+./bin/seed.exe --db-type postgres --db-url "your-postgresql-connection-string"
+```
+
+*Note: In local SQLite mode, `.\start-drev.ps1` will automatically build and seed your database on the first run if no `drev.db` file is found.*
+
 ## Status
 
 - ✅ Core engine (YAML parser, DAG scheduler, Docker runner)
@@ -223,11 +238,11 @@ Run with Docker running for integration tests (runner tests skip gracefully if D
 - ✅ Job queue and worker pools
 - ✅ SQLite persistence
 - ✅ Slack/Discord notifications
+- ✅ Multi-tenant SaaS infrastructure (PostgreSQL + Auth + Usage tracking)
 
 ## Roadmap
 
 - [ ] Distributed runners (agents on multiple machines)
-- [ ] PostgreSQL support
 - [ ] Pipeline caching (shared volumes)
 - [ ] Manual trigger/cancel from dashboard
 - [ ] Metrics and observability (Prometheus)
