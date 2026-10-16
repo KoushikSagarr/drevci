@@ -7,21 +7,54 @@ export default function LogViewer({ runId, isLive }: { runId: string; isLive: bo
   const [lines, setLines] = useState<string[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [prevRunId, setPrevRunId] = useState(runId);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  const lastRunIdRef = useRef<string | null>(null);
+  const hasFetchedRef = useRef(false);
+
+  // If runId changes, reset lines immediately during render to prevent log mixing
+  if (prevRunId !== runId) {
+    setPrevRunId(runId);
+    setLines([]);
+  }
 
   useEffect(() => {
     let cleanup = () => {};
-    if (isLive || lines.length === 0) {
-      setIsConnected(true);
+    let isSubscribed = true;
+
+    if (lastRunIdRef.current !== runId) {
+      lastRunIdRef.current = runId;
+      hasFetchedRef.current = false;
+    }
+
+    if (isLive || !hasFetchedRef.current) {
       cleanup = streamLogs(
         runId,
-        (line) => setLines((prev) => [...prev, line]),
-        () => setIsConnected(false)
+        (line) => {
+          if (isSubscribed) {
+            hasFetchedRef.current = true;
+            setLines((prev) => [...prev, line]);
+          }
+        },
+        () => {
+          if (isSubscribed) {
+            hasFetchedRef.current = true;
+            setIsConnected(false);
+          }
+        },
+        () => {
+          if (isSubscribed) {
+            setIsConnected(true);
+          }
+        }
       );
-    } else {
-      setIsConnected(false);
     }
-    return () => cleanup();
+
+    return () => {
+      isSubscribed = false;
+      cleanup();
+    };
   }, [runId, isLive]);
 
   useEffect(() => {

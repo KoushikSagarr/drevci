@@ -34,7 +34,8 @@ export async function getRunJobs(id: string): Promise<RunJob[]> {
 export function streamLogs(
   runId: string,
   onLine: (line: string) => void,
-  onDone: () => void
+  onDone: () => void,
+  onOpen?: () => void
 ): () => void {
   const url = `${BASE}/api/v1/runs/${runId}/logs`;
   
@@ -45,11 +46,17 @@ export function streamLogs(
   // To keep it simple and standard:
   const es = new EventSource(`${url}?token=${TOKEN}`);
 
+  if (onOpen) {
+    es.onopen = () => {
+      onOpen();
+    };
+  }
+
   es.onmessage = (event) => {
     onLine(event.data);
   };
 
-  es.onerror = (err) => {
+  es.onerror = () => {
     onDone();
     es.close();
   };

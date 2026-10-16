@@ -95,7 +95,9 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   const { runId } = use(params);
   const [run, setRun] = useState<Run | null>(null);
   const [jobs, setJobs] = useState<RunJob[]>([]);
-  const [, setNow] = useState(Date.now());
+  const [, setNow] = useState(0);
+
+  const status = run?.status;
 
   useEffect(() => {
     const fetchData = async () => {
@@ -107,11 +109,11 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
       } catch (err) { console.error(err); }
     };
     fetchData();
-    const isActive = run?.status === 'pending' || run?.status === 'running';
+    const isActive = !status || status === 'pending' || status === 'running';
     let interval: NodeJS.Timeout;
-    if (isActive || !run) interval = setInterval(fetchData, 3000);
+    if (isActive) interval = setInterval(fetchData, 3000);
     return () => { if (interval) clearInterval(interval); };
-  }, [runId, run?.status]);
+  }, [runId, status]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -131,7 +133,6 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   const isLive = run.status === 'pending' || run.status === 'running';
   const succeededCount = jobs.filter(j => j.status === 'success').length;
   const failedCount = jobs.filter(j => j.status === 'failed').length;
-  const progress = jobs.length > 0 ? Math.round(((succeededCount + failedCount) / jobs.length) * 100) : 0;
 
   return (
     <div className="mx-auto max-w-6xl px-6 py-8 space-y-8">

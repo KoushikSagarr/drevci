@@ -69,32 +69,32 @@ export default function RunsPage() {
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
-  const [, setNow] = useState(Date.now());
+  const [, setNow] = useState(0);
 
   const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:9090';
 
-  const fetchRuns = async () => {
-    try {
-      const data = await getRuns(100);
-      setRuns(data || []);
-    } catch (err) { console.error(err); }
-    finally { setLoading(false); }
-  };
-
-  const fetchQueue = async () => {
-    try {
-      const res = await fetch(`${BASE}/api/v1/queue`);
-      if (res.ok) setQueueStatus(await res.json());
-    } catch (_) {}
-  };
-
   useEffect(() => {
+    const fetchRuns = async () => {
+      try {
+        const data = await getRuns(100);
+        setRuns(data || []);
+      } catch (err) { console.error(err); }
+      finally { setLoading(false); }
+    };
+
+    const fetchQueue = async () => {
+      try {
+        const res = await fetch(`${BASE}/api/v1/queue`);
+        if (res.ok) setQueueStatus(await res.json());
+      } catch {}
+    };
+
     fetchRuns();
     fetchQueue();
     const r = setInterval(fetchRuns, 5000);
     const q = setInterval(fetchQueue, 10000);
     return () => { clearInterval(r); clearInterval(q); };
-  }, []);
+  }, [BASE]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
