@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server run-server clean test lint token example
+.PHONY: build build-cli build-server run-server clean test lint token example dev dev-status dev-logs dev-stop dev-test
 
 BINARY_DIR := bin
 
@@ -8,6 +8,21 @@ build:
 
 run-server:
 	go run ./cmd/drevd
+
+dev:
+	@./scripts/dev.sh start
+
+dev-status:
+	@./scripts/dev.sh status
+
+dev-logs:
+	@./scripts/dev.sh logs $(SERVICE)
+
+dev-stop:
+	@./scripts/dev.sh stop
+
+dev-test:
+	@./test/dev_workflow_test.sh
 
 test:
 	go test ./... -v -count=1

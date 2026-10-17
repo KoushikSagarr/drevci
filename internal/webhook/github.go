@@ -86,10 +86,8 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	mac.Write(body)
 	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
-	log.Printf("received sig: %s", sig)
-	log.Printf("expected sig: %s", expected)
-
 	if !hmac.Equal([]byte(sig), []byte(expected)) {
+		log.Printf("[webhook] signature mismatch from %s", r.RemoteAddr)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
 	}

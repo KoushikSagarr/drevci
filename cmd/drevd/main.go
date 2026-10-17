@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,24 +43,32 @@ func main() {
 	var discordWebhook string
 	var dbType string
 	var dbURL string
+	var dockerHost string
 
 	var rootCmd = &cobra.Command{
 		Use:   "drevd",
 		Short: "Drev CI server daemon",
 		Run: func(cmd *cobra.Command, args []string) {
+			if dockerHost == "" {
+				dockerHost = os.Getenv("DOCKER_HOST")
+			}
+			if dockerHost != "" {
+				os.Setenv("DOCKER_HOST", dockerHost)
+			}
+
 			if token == "" {
 				token = os.Getenv("DREV_TOKEN")
 			}
 
-			var envUpdates []string
+			envUpdates := make(map[string]string)
 			if token == "" {
 				t, err := auth.GenerateToken()
 				if err != nil {
 					log.Fatalf("failed to generate token: %v", err)
 				}
 				token = t
-				fmt.Printf("No token set. Generated token: %s\n", token)
-				envUpdates = append(envUpdates, fmt.Sprintf("DREV_TOKEN=%s", token))
+				fmt.Println("No API token provided; generated a new token and saved to .env.")
+				envUpdates["DREV_TOKEN"] = token
 			}
 
 			if webhookSecret == "" {
@@ -70,17 +80,14 @@ func main() {
 					log.Fatalf("failed to generate webhook secret: %v", err)
 				}
 				webhookSecret = t
-				fmt.Printf("No webhook secret set. Generated secret: %s\n", webhookSecret)
-				envUpdates = append(envUpdates, fmt.Sprintf("DREV_WEBHOOK_SECRET=%s", webhookSecret))
+				fmt.Println("No webhook secret provided; generated a new secret and saved to .env.")
+				envUpdates["DREV_WEBHOOK_SECRET"] = webhookSecret
 			}
 
 			if len(envUpdates) > 0 {
-				f, err := os.OpenFile(".env", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-				if err == nil {
-					for _, update := range envUpdates {
-						f.WriteString(update + "\n")
-					}
-					f.Close()
+				if err := auth.PersistEnvSecrets(".env", envUpdates); err != nil {
+					log.Printf("Warning: failed to persist generated secrets to .env: %v", err)
+				} else {
 					fmt.Println("Saved newly generated secrets to .env file for persistence.")
 				}
 			}
@@ -144,6 +151,19 @@ func main() {
 				log.Fatalf("failed to create runner: %v", err)
 			}
 
+			// Validate Docker daemon connectivity on startup
+			if cli, err := runner.NewDockerClient(); err == nil {
+				pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if _, err := cli.Ping(pingCtx); err != nil {
+					log.Printf("Warning: Docker daemon is unreachable: %v. Pipelines requiring container execution will fail until Docker is running.", err)
+					if os.Getenv("DOCKER_HOST") == "" && runtime.GOOS == "darwin" {
+						log.Println("Hint: If using Docker Desktop on macOS, ensure it is running or set DOCKER_HOST=\"unix://$HOME/.docker/run/docker.sock\".")
+					}
+				}
+				pingCancel()
+				cli.Close()
+			}
+
 			sched := scheduler.New(r, s)
 			p := parser.NewParser()
 			stream := streamer.New(logDir)
@@ -179,10 +199,16 @@ func main() {
 			wp := pool.New(workers, q, sched, s, notif)
 
 			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			var stopPoolOnce sync.Once
+			stopPool := func() {
+				stopPoolOnce.Do(func() {
+					cancel()
+					wp.Stop()
+				})
+			}
+			defer stopPool()
 
 			wp.Start(ctx)
-			defer wp.Stop()
 
 			wh := webhook.New(s, q, p, stream, webhookSecret, webhookConfig)
 			h := api.New(s, sched, p, stream, q, workers, wh, logDir, notifEnabled)
@@ -199,7 +225,6 @@ func main() {
 			fmt.Printf("│   Workers: %-17d │\n", workers)
 			fmt.Println("└──────────────────────────────┘")
 			fmt.Printf("Webhook URL: http://%s/webhooks/github\n", addr)
-			fmt.Printf("Webhook secret: %s\n", webhookSecret)
 
 			go func() {
 				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -212,12 +237,17 @@ func main() {
 			<-stop
 
 			fmt.Println("\nShutting down gracefully...")
+
+			// 1. First drain/stop HTTP server so no new incoming requests or webhook jobs can be enqueued.
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer shutCancel()
 
 			if err := server.Shutdown(shutCtx); err != nil {
-				log.Fatalf("shutdown error: %v", err)
+				log.Printf("HTTP server shutdown warning: %v", err)
 			}
+
+			// 2. Stop workers: cancel context to signal workers to terminate, and wait for pool to exit.
+			stopPool()
 		},
 	}
 
@@ -234,6 +264,7 @@ func main() {
 	rootCmd.Flags().StringVar(&discordWebhook, "discord-webhook", "", "Discord webhook URL (or DREV_DISCORD_WEBHOOK env)")
 	rootCmd.Flags().StringVar(&dbType, "db-type", "", "Database type: sqlite (default) or postgres (or DREV_DB_TYPE env)")
 	rootCmd.Flags().StringVar(&dbURL, "db-url", "", "PostgreSQL connection string (or DREV_DB_URL env)")
+	rootCmd.Flags().StringVar(&dockerHost, "docker-host", "", "Docker daemon host/socket endpoint (or DOCKER_HOST env)")
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

@@ -116,3 +116,27 @@ func TestPool_CancelContext(t *testing.T) {
 		t.Fatal("pool did not stop cleanly after context cancellation")
 	}
 }
+
+func TestPool_RealPool_ContextCancelAllowsStop(t *testing.T) {
+	q := queue.New(10)
+	p := New(3, q, nil, nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx)
+
+	// Cancelling the context must allow p.Stop() to return without deadlocking
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean return verified
+	case <-time.After(3 * time.Second):
+		t.Fatal("real Pool.Stop() deadlocked after context cancellation")
+	}
+}

@@ -16,7 +16,28 @@
 
 ## Quick Start
 
-### Install
+### Local Development Stack (macOS / Linux)
+
+Run the full local development stack (daemon, dashboard, and ngrok tunnel) with a single command:
+
+```bash
+make dev          # Starts drevd (9090), dashboard (3000), and ngrok with health checks
+make dev-status   # Shows process status, PIDs, health checks, and active tunnel URLs
+make dev-logs     # Follows consolidated service logs (or SERVICE=drevd/dashboard/ngrok)
+make dev-stop     # Gracefully shuts down only the managed processes
+```
+
+To use a stable reserved domain for GitHub webhooks, set `NGROK_DOMAIN` in `.env`:
+```bash
+NGROK_DOMAIN=picked-indirectly-cheetah.ngrok-free.app
+```
+When configured, ngrok establishes a verified stable tunnel:
+- **Webhook Payload URL**: `https://picked-indirectly-cheetah.ngrok-free.app/webhooks/github`
+- **Secret**: Must match `DREV_WEBHOOK_SECRET` in your `.env`
+
+
+### Manual Install & Run
+
 
 ```bash
 git clone https://github.com/drevci/drev.git
@@ -203,8 +224,10 @@ Dashboard: http://localhost:3000
 | `DREV_SERVER` | CLI server URL (default `localhost:9090`) |
 | `DREV_TOKEN` | API token |
 | `DREV_WEBHOOK_SECRET` | GitHub webhook secret |
+| `NGROK_DOMAIN` | Reserved ngrok domain (e.g. `picked-indirectly-cheetah.ngrok-free.app`) |
 | `DREV_SLACK_WEBHOOK` | Slack webhook URL |
 | `DREV_DISCORD_WEBHOOK` | Discord webhook URL |
+
 
 ## Testing
 
