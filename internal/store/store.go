@@ -80,8 +80,105 @@ type SQLiteStore struct {
 	stmtGetRunJobs         *sql.Stmt
 }
 
+type columnDef struct {
+	name       string
+	definition string
+}
+
+var requiredRunsColumns = []columnDef{
+	{name: "org_id", definition: "TEXT NOT NULL DEFAULT ''"},
+	{name: "triggered_by", definition: "TEXT NOT NULL DEFAULT 'api'"},
+	{name: "commit_sha", definition: "TEXT"},
+	{name: "commit_msg", definition: "TEXT"},
+	{name: "branch", definition: "TEXT"},
+	{name: "started_at", definition: "DATETIME"},
+	{name: "finished_at", definition: "DATETIME"},
+	{name: "created_at", definition: "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"},
+}
+
+var requiredRunJobsColumns = []columnDef{
+	{name: "started_at", definition: "DATETIME"},
+	{name: "finished_at", definition: "DATETIME"},
+}
+
+func getExistingColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return nil, fmt.Errorf("querying table_info for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return nil, fmt.Errorf("scanning table_info for %s: %w", tableName, err)
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+func migrateTable(ctx context.Context, db *sql.DB, tableName string, requiredCols []columnDef) error {
+	existingCols, err := getExistingColumns(ctx, db, tableName)
+	if err != nil {
+		return err
+	}
+
+	var missing []columnDef
+	for _, col := range requiredCols {
+		if !existingCols[col.name] {
+			missing = append(missing, col)
+		}
+	}
+
+	if len(missing) == 0 {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning migration transaction for %s: %w", tableName, err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	for _, col := range missing {
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, col.name, col.definition)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("executing %q: %w", stmt, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing migration transaction for %s: %w", tableName, err)
+	}
+
+	return nil
+}
+
+func migrateSQLite(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		return fmt.Errorf("creating base schema: %w", err)
+	}
+
+	if err := migrateTable(ctx, db, "runs", requiredRunsColumns); err != nil {
+		return fmt.Errorf("migrating runs table: %w", err)
+	}
+
+	if err := migrateTable(ctx, db, "run_jobs", requiredRunJobsColumns); err != nil {
+		return fmt.Errorf("migrating run_jobs table: %w", err)
+	}
+
+	return nil
+}
+
 // Open creates or opens a SQLite database at dbPath, initialises
-// the schema, enables WAL mode, and prepares all statements.
+// the schema, enables WAL mode, runs safe migrations, and prepares all statements.
 func Open(dbPath string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -93,9 +190,9 @@ func Open(dbPath string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
 	}
 
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrateSQLite(context.Background(), db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("creating schema: %w", err)
+		return nil, fmt.Errorf("migrating schema: %w", err)
 	}
 
 	s := &SQLiteStore{db: db}

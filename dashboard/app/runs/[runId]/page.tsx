@@ -95,30 +95,72 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   const { runId } = use(params);
   const [run, setRun] = useState<Run | null>(null);
   const [jobs, setJobs] = useState<RunJob[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const [, setNow] = useState(0);
 
   const status = run?.status;
 
   useEffect(() => {
+    let isCancelled = false;
+
     const fetchData = async () => {
       try {
         const r = await getRun(runId);
-        setRun(r);
         const j = await getRunJobs(runId);
-        setJobs(j || []);
-      } catch (err) { console.error(err); }
+        if (!isCancelled) {
+          setRun(r);
+          setJobs(j || []);
+          setError(null);
+        }
+      } catch (err) {
+        if (!isCancelled) {
+          console.error('Failed to fetch run data:', err);
+          setError(err instanceof Error ? err.message : 'Failed to fetch run details');
+        }
+      }
     };
+
     fetchData();
     const isActive = !status || status === 'pending' || status === 'running';
-    let interval: NodeJS.Timeout;
+    let interval: NodeJS.Timeout | undefined;
     if (isActive) interval = setInterval(fetchData, 3000);
-    return () => { if (interval) clearInterval(interval); };
-  }, [runId, status]);
+    return () => {
+      isCancelled = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [runId, status, reloadKey]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
+
+  if (error && !run) {
+    return (
+      <div className="mx-auto max-w-6xl px-6 py-16 text-center">
+        <div className="flex flex-col items-center gap-4 rounded-xl border border-border bg-surface p-8 max-w-lg mx-auto">
+          <div className="text-4xl text-status-failed">⚠</div>
+          <h2 className="text-lg font-bold text-text-primary">Unable to load run details</h2>
+          <p className="text-sm text-text-muted">{error}</p>
+          <div className="flex gap-3 mt-2">
+            <button
+              onClick={() => setReloadKey((k) => k + 1)}
+              className="rounded-md border border-border bg-background px-4 py-2 text-xs font-semibold text-text-primary hover:bg-surface-hover transition-colors"
+            >
+              ↻ Try Again
+            </button>
+            <Link
+              href="/runs"
+              className="rounded-md bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent/90 transition-colors"
+            >
+              ← Back to Runs
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (!run) {
     return (

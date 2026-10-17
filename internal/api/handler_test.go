@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 	"github.com/drevci/drev/internal/webhook"
+	"github.com/drevci/drev/pkg/drevtypes"
 )
 
 func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
@@ -178,5 +180,66 @@ func TestAuth_InvalidToken(t *testing.T) {
 
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401 Unauthorized, got %v", res.StatusCode)
+	}
+}
+
+func TestQueueStatus(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	res, err := http.Get(srv.URL + "/api/v1/queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %v", res.StatusCode)
+	}
+
+	var body map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&body)
+	if body["status"] != "healthy" {
+		t.Errorf("expected status healthy, got %v", body["status"])
+	}
+}
+
+func TestGetRunLogs_Unauthorized(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	res, err := http.Get(srv.URL + "/api/v1/runs/test-run/logs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized, got %v", res.StatusCode)
+	}
+}
+
+func TestGetRunLogs_Authorized(t *testing.T) {
+	srv, h := setupTestServer(t)
+
+	ctx := context.Background()
+	_ = h.store.CreateRun(ctx, &drevtypes.Run{
+		ID:         "test-run-logs",
+		PipelineID: "test",
+		Status:     drevtypes.StatusSuccess,
+	})
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/v1/runs/test-run-logs/logs", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %v", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("expected text/event-stream, got %v", ct)
 	}
 }

@@ -3,15 +3,9 @@
 import { useEffect, useState, useMemo } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getRuns } from '../../lib/api';
+import { getRuns, getQueueStatus, QueueStatus } from '../../lib/api';
 import { Run, RunStatus } from '../../lib/types';
 import StatusBadge from '../../components/StatusBadge';
-
-interface QueueStatus {
-  depth: number;
-  workers: number;
-  status: string;
-}
 
 function formatDuration(started: string, finished?: string) {
   if (!started || started === '0001-01-01T00:00:00Z') return 'Pending...';
@@ -66,35 +60,58 @@ export default function RunsPage() {
   const router = useRouter();
   const [runs, setRuns] = useState<Run[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
+  const [reloadKey, setReloadKey] = useState(0);
   const [, setNow] = useState(0);
 
-  const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:9090';
-
   useEffect(() => {
+    let isCancelled = false;
+
     const fetchRuns = async () => {
       try {
         const data = await getRuns(100);
-        setRuns(data || []);
-      } catch (err) { console.error(err); }
-      finally { setLoading(false); }
+        if (!isCancelled) {
+          setRuns(data || []);
+          setError(null);
+        }
+      } catch (err) {
+        if (!isCancelled) {
+          console.error('Failed to fetch runs:', err);
+          setError(err instanceof Error ? err.message : 'Failed to fetch runs');
+        }
+      } finally {
+        if (!isCancelled) {
+          setLoading(false);
+        }
+      }
     };
 
     const fetchQueue = async () => {
       try {
-        const res = await fetch(`${BASE}/api/v1/queue`);
-        if (res.ok) setQueueStatus(await res.json());
-      } catch {}
+        const qs = await getQueueStatus();
+        if (!isCancelled) {
+          setQueueStatus(qs);
+        }
+      } catch (err) {
+        if (!isCancelled) {
+          console.error('Failed to fetch queue:', err);
+        }
+      }
     };
 
     fetchRuns();
     fetchQueue();
     const r = setInterval(fetchRuns, 5000);
     const q = setInterval(fetchQueue, 10000);
-    return () => { clearInterval(r); clearInterval(q); };
-  }, [BASE]);
+    return () => {
+      isCancelled = true;
+      clearInterval(r);
+      clearInterval(q);
+    };
+  }, [reloadKey]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -153,6 +170,25 @@ export default function RunsPage() {
             <span>+</span> New Run
           </button>
         </div>
+
+        {/* Error Banner when cached runs exist but a refresh failed */}
+        {error && runs.length > 0 && (
+          <div className="mb-6 flex items-center justify-between rounded-lg border border-status-failed/30 bg-status-failed/10 px-4 py-3 text-sm text-text-primary">
+            <div className="flex items-center gap-2">
+              <span className="text-status-failed font-bold">⚠</span>
+              <span>Failed to refresh runs: {error}</span>
+            </div>
+            <button
+              onClick={() => {
+                setLoading(true);
+                setReloadKey((k) => k + 1);
+              }}
+              className="text-xs font-medium text-text-secondary hover:text-text-primary underline ml-4"
+            >
+              Retry
+            </button>
+          </div>
+        )}
 
         {/* Metrics Cards */}
         <div className="grid grid-cols-2 md:grid-cols-5 gap-3 mb-8">
@@ -217,6 +253,25 @@ export default function RunsPage() {
                     <td className="px-5 py-4"><div className="skeleton h-7 w-16 ml-auto" /></td>
                   </tr>
                 ))
+              ) : error && runs.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-5 py-16 text-center">
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="text-4xl text-status-failed">⚠</div>
+                      <p className="text-text-primary font-medium text-base">Authentication or Network Error</p>
+                      <p className="text-text-muted text-xs max-w-md">{error}</p>
+                      <button
+                        onClick={() => {
+                          setLoading(true);
+                          setReloadKey((k) => k + 1);
+                        }}
+                        className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-4 py-1.5 text-xs font-semibold text-text-primary hover:bg-surface-hover hover:border-accent/40 transition-colors"
+                      >
+                        ↻ Retry
+                      </button>
+                    </div>
+                  </td>
+                </tr>
               ) : filteredRuns.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="px-5 py-16 text-center">
