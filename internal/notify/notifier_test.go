@@ -30,13 +30,13 @@ func makeTestJobs() []*drevtypes.RunJob {
 		{
 			ID: "job-1", RunID: "abcdef12-3456-7890-abcd-ef1234567890",
 			JobName: "test", Status: drevtypes.StatusSuccess,
-			StartedAt: time.Date(2026, 5, 6, 10, 0, 2, 0, time.UTC),
+			StartedAt:  time.Date(2026, 5, 6, 10, 0, 2, 0, time.UTC),
 			FinishedAt: time.Date(2026, 5, 6, 10, 0, 13, 0, time.UTC),
 		},
 		{
 			ID: "job-2", RunID: "abcdef12-3456-7890-abcd-ef1234567890",
 			JobName: "build", Status: drevtypes.StatusFailed,
-			StartedAt: time.Date(2026, 5, 6, 10, 0, 13, 0, time.UTC),
+			StartedAt:  time.Date(2026, 5, 6, 10, 0, 13, 0, time.UTC),
 			FinishedAt: time.Date(2026, 5, 6, 10, 0, 18, 0, time.UTC),
 		},
 	}

@@ -6,3 +6,4 @@ logs/
 .env.saas.example
 coverage.out
 drev-workspace-*
+workspaces/

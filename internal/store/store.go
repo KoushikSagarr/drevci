@@ -48,7 +48,7 @@ type Store interface {
 	ListRunsByOrg(ctx context.Context, orgID string, limit int) ([]*drevtypes.Run, error)
 	CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error
 	UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
-	ResetGhostRuns(ctx context.Context) error
+	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 
 	// ── Org management (PostgreSQL / SaaS only) ───────────────────────────
@@ -450,18 +450,40 @@ func (s *SQLiteStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtype
 	return jobs, rows.Err()
 }
 
-func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) error {
+func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM runs WHERE status IN ('running', 'pending')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		UPDATE runs SET status = 'failed', finished_at = ?
 		WHERE status IN ('running', 'pending')`, now)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE run_jobs SET status = 'failed', finished_at = ?
 		WHERE status IN ('running', 'pending')`, now)
-	return err
+	return ids, err
 }
 
 // ─── SaaS stubs (not supported in SQLite mode) ───────────────────────────────

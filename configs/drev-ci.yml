@@ -1,0 +1,31 @@
+name: drev-ci-pipeline
+
+source:
+  type: git
+  url: https://github.com/KoushikSagarr/drevci.git
+  ref: main
+
+triggers:
+  - push
+  - pull_request
+
+env:
+  GO_ENV: production
+  APP_NAME: drev
+
+jobs:
+  - name: test
+    image: golang:alpine
+    steps:
+      - name: run tests
+        run: go test ./internal/parser ./internal/auth ./internal/notify ./internal/pool ./internal/queue ./internal/store ./internal/webhook
+
+  - name: build
+    image: golang:alpine
+    depends_on:
+      - test
+    steps:
+      - name: compile daemon
+        run: go build -o /tmp/drevd ./cmd/drevd
+      - name: confirm binary
+        run: ls -lh /tmp/drevd

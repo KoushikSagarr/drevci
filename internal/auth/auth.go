@@ -115,8 +115,8 @@ func Middleware(cfg Config, lookup ...TokenLookup) func(http.Handler) http.Handl
 	}
 }
 
-// extractToken pulls the Bearer token from the Authorization header or
-// falls back to the ?token query parameter (for EventSource / SSE clients).
+// extractToken pulls the Bearer token strictly from the Authorization header.
+// Query-string token authentication is intentionally rejected to prevent credential leakage.
 func extractToken(r *http.Request) string {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
@@ -125,7 +125,7 @@ func extractToken(r *http.Request) string {
 			return parts[1]
 		}
 	}
-	return r.URL.Query().Get("token")
+	return ""
 }
 
 func sendUnauthorized(w http.ResponseWriter, msg string) {

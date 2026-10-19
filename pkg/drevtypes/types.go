@@ -96,14 +96,14 @@ type OrgMember struct {
 
 // APIToken is an org-scoped API token (hash stored, never plaintext).
 type APIToken struct {
-	ID          string     `json:"id"`
-	OrgID       string     `json:"org_id"`
-	Name        string     `json:"name"`
-	TokenHash   string     `json:"-"` // never serialise the hash
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	CreatedBy   string     `json:"created_by"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	ID         string     `json:"id"`
+	OrgID      string     `json:"org_id"`
+	Name       string     `json:"name"`
+	TokenHash  string     `json:"-"` // never serialise the hash
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	CreatedBy  string     `json:"created_by"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 }
 
 // UsageEvent records a billable or metered action for an org.

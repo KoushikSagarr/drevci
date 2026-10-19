@@ -32,6 +32,8 @@ type mockDockerClient struct {
 	containerCreateFn func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 	containerRemoveFn func(ctx context.Context, containerID string, options container.RemoveOptions) error
 	containerStartFn  func(ctx context.Context, containerID string, options container.StartOptions) error
+	containerStopFn   func(ctx context.Context, containerID string, options container.StopOptions) error
+	containerListFn   func(ctx context.Context, options container.ListOptions) ([]types.Container, error)
 	containerLogsFn   func(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
 	containerWaitFn   func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
 }
@@ -69,6 +71,20 @@ func (m *mockDockerClient) ContainerStart(ctx context.Context, containerID strin
 		return m.containerStartFn(ctx, containerID, options)
 	}
 	return nil
+}
+
+func (m *mockDockerClient) ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error {
+	if m.containerStopFn != nil {
+		return m.containerStopFn(ctx, containerID, options)
+	}
+	return nil
+}
+
+func (m *mockDockerClient) ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error) {
+	if m.containerListFn != nil {
+		return m.containerListFn(ctx, options)
+	}
+	return nil, nil
 }
 
 func (m *mockDockerClient) ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error) {
@@ -475,4 +491,248 @@ func TestRunJob_EnvVars(t *testing.T) {
 	if !strings.Contains(out, "hello123") {
 		t.Errorf("RunJob() output = %q, want to contain 'hello123'", out)
 	}
+}
+
+// --- DOCK-01 Resource Constraints Tests ---
+
+func TestResourceLimits_DefaultValues(t *testing.T) {
+	defaults := DefaultResourceLimits()
+
+	if defaults.NanoCPUs != 2*1e9 {
+		t.Errorf("expected default NanoCPUs 2*1e9 (2.0 CPUs), got %d", defaults.NanoCPUs)
+	}
+	if defaults.Memory != 2*1024*1024*1024 {
+		t.Errorf("expected default Memory 2GB (%d bytes), got %d", 2*1024*1024*1024, defaults.Memory)
+	}
+	if defaults.MemorySwap != defaults.Memory {
+		t.Errorf("expected default MemorySwap equal to Memory (swap disabled), got %d vs %d", defaults.MemorySwap, defaults.Memory)
+	}
+	if defaults.PidsLimit != 512 {
+		t.Errorf("expected default PidsLimit 512, got %d", defaults.PidsLimit)
+	}
+	if err := defaults.Validate(); err != nil {
+		t.Errorf("expected default limits to be valid, got: %v", err)
+	}
+}
+
+func TestResourceLimits_AppliedToContainerCreate(t *testing.T) {
+	var capturedHostConfig *container.HostConfig
+
+	mock := &mockDockerClient{
+		inspectFunc: func(ctx context.Context, image string) (types.ImageInspect, []byte, error) {
+			return types.ImageInspect{ID: "mock-image"}, nil, nil
+		},
+		containerCreateFn: func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+			capturedHostConfig = hostConfig
+			return container.CreateResponse{ID: "test-container-res"}, nil
+		},
+	}
+
+	customLimits := ResourceLimits{
+		NanoCPUs:   1500000000,         // 1.5 CPUs
+		Memory:     1024 * 1024 * 1024, // 1 GB
+		MemorySwap: 1024 * 1024 * 1024, // 1 GB (0 additional swap)
+		PidsLimit:  256,
+	}
+
+	r := NewWithLimits(mock, &mockStore{}, customLimits)
+
+	job := &drevtypes.Job{
+		Name:  "test-res-apply",
+		Image: "alpine:latest",
+		Steps: []drevtypes.Step{{Name: "step1", Run: "echo ok"}},
+	}
+
+	w, _ := workspace.Create()
+	defer w.Cleanup()
+
+	var buf bytes.Buffer
+	err := r.RunJob(context.Background(), &drevtypes.Run{}, job, w, &buf)
+	if err != nil {
+		t.Fatalf("RunJob error: %v", err)
+	}
+
+	if capturedHostConfig == nil {
+		t.Fatal("expected ContainerCreate to be called with hostConfig, but was nil")
+	}
+
+	res := capturedHostConfig.Resources
+	if res.NanoCPUs != 1500000000 {
+		t.Errorf("expected NanoCPUs 1500000000, got %d", res.NanoCPUs)
+	}
+	if res.Memory != 1024*1024*1024 {
+		t.Errorf("expected Memory 1073741824, got %d", res.Memory)
+	}
+	if res.MemorySwap != 1024*1024*1024 {
+		t.Errorf("expected MemorySwap 1073741824, got %d", res.MemorySwap)
+	}
+	if res.PidsLimit == nil || *res.PidsLimit != 256 {
+		t.Errorf("expected PidsLimit 256, got %v", res.PidsLimit)
+	}
+
+	logOut := buf.String()
+	if !strings.Contains(logOut, "[drev] enforcing container limits: 1.5 CPUs, 1024MB RAM, 0MB (disabled) swap, 256 PIDs") {
+		t.Errorf("expected limit enforcement log line, got: %s", logOut)
+	}
+}
+
+func TestResourceLimits_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		limits  ResourceLimits
+		wantErr bool
+	}{
+		{
+			name:    "valid defaults",
+			limits:  DefaultResourceLimits(),
+			wantErr: false,
+		},
+		{
+			name: "invalid zero CPU",
+			limits: ResourceLimits{
+				NanoCPUs:   0,
+				Memory:     1024 * 1024 * 1024,
+				MemorySwap: 1024 * 1024 * 1024,
+				PidsLimit:  512,
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid negative CPU",
+			limits: ResourceLimits{
+				NanoCPUs:   -100,
+				Memory:     1024 * 1024 * 1024,
+				MemorySwap: 1024 * 1024 * 1024,
+				PidsLimit:  512,
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid memory below 64MB",
+			limits: ResourceLimits{
+				NanoCPUs:   1e9,
+				Memory:     32 * 1024 * 1024, // 32MB
+				MemorySwap: 32 * 1024 * 1024,
+				PidsLimit:  512,
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid memory swap less than memory",
+			limits: ResourceLimits{
+				NanoCPUs:   1e9,
+				Memory:     1024 * 1024 * 1024, // 1GB
+				MemorySwap: 512 * 1024 * 1024,  // 512MB < 1GB
+				PidsLimit:  512,
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid unlimited swap",
+			limits: ResourceLimits{
+				NanoCPUs:   1e9,
+				Memory:     1024 * 1024 * 1024,
+				MemorySwap: -1, // unlimited swap allowed
+				PidsLimit:  512,
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid additional swap",
+			limits: ResourceLimits{
+				NanoCPUs:   1e9,
+				Memory:     1024 * 1024 * 1024,
+				MemorySwap: 2048 * 1024 * 1024, // 1GB ram + 1GB swap
+				PidsLimit:  512,
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid zero PIDs",
+			limits: ResourceLimits{
+				NanoCPUs:   1e9,
+				Memory:     1024 * 1024 * 1024,
+				MemorySwap: 1024 * 1024 * 1024,
+				PidsLimit:  0,
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.limits.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestResourceLimits_LoadFromEnv(t *testing.T) {
+	t.Setenv("DREV_JOB_CPU_LIMIT", "3.5")
+	t.Setenv("DREV_JOB_MEMORY_LIMIT", "4GB")
+	t.Setenv("DREV_JOB_SWAP_LIMIT", "2GB")
+	t.Setenv("DREV_JOB_PIDS_LIMIT", "1024")
+
+	limits, err := LoadResourceLimitsFromEnv()
+	if err != nil {
+		t.Fatalf("LoadResourceLimitsFromEnv error: %v", err)
+	}
+
+	if limits.NanoCPUs != int64(3.5*1e9) {
+		t.Errorf("expected NanoCPUs %d, got %d", int64(3.5*1e9), limits.NanoCPUs)
+	}
+	if limits.Memory != 4*1024*1024*1024 {
+		t.Errorf("expected Memory 4GB (%d), got %d", 4*1024*1024*1024, limits.Memory)
+	}
+	// MemorySwap = Memory + 2GB = 6GB
+	if limits.MemorySwap != 6*1024*1024*1024 {
+		t.Errorf("expected MemorySwap 6GB (%d), got %d", 6*1024*1024*1024, limits.MemorySwap)
+	}
+	if limits.PidsLimit != 1024 {
+		t.Errorf("expected PidsLimit 1024, got %d", limits.PidsLimit)
+	}
+}
+
+func TestResourceLimits_SwapSemantics(t *testing.T) {
+	t.Run("explicit zero swap", func(t *testing.T) {
+		t.Setenv("DREV_JOB_MEMORY_LIMIT", "1GB")
+		t.Setenv("DREV_JOB_SWAP_LIMIT", "0")
+		limits, err := LoadResourceLimitsFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if limits.MemorySwap != limits.Memory {
+			t.Errorf("expected MemorySwap == Memory for swap=0, got %d vs %d", limits.MemorySwap, limits.Memory)
+		}
+	})
+
+	t.Run("explicit unlimited swap", func(t *testing.T) {
+		t.Setenv("DREV_JOB_MEMORY_LIMIT", "1GB")
+		t.Setenv("DREV_JOB_SWAP_LIMIT", "-1")
+		limits, err := LoadResourceLimitsFromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if limits.MemorySwap != -1 {
+			t.Errorf("expected MemorySwap == -1 for swap=-1, got %d", limits.MemorySwap)
+		}
+	})
+
+	t.Run("invalid cpu env", func(t *testing.T) {
+		t.Setenv("DREV_JOB_CPU_LIMIT", "not-a-number")
+		_, err := LoadResourceLimitsFromEnv()
+		if err == nil {
+			t.Error("expected error for invalid CPU limit string, got nil")
+		}
+	})
+
+	t.Run("invalid memory env", func(t *testing.T) {
+		t.Setenv("DREV_JOB_MEMORY_LIMIT", "invalid-size")
+		_, err := LoadResourceLimitsFromEnv()
+		if err == nil {
+			t.Error("expected error for invalid memory limit string, got nil")
+		}
+	})
 }

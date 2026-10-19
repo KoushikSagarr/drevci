@@ -4,20 +4,25 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
-	"github.com/drevci/drev/internal/runner"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 	"golang.org/x/sync/errgroup"
 )
 
+// JobRunner defines the interface for executing a job in an isolated workspace.
+type JobRunner interface {
+	RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error
+}
+
 type Scheduler struct {
-	runner *runner.Runner
+	runner JobRunner
 	store  store.Store
 }
 
-func New(runner *runner.Runner, store store.Store) *Scheduler {
+func New(runner JobRunner, store store.Store) *Scheduler {
 	return &Scheduler{
 		runner: runner,
 		store:  store,
@@ -113,6 +118,9 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 		jobDoneChans[job.Name] = make(chan struct{})
 	}
 
+	var mu sync.Mutex
+	jobStatuses := make(map[string]drevtypes.RunStatus)
+
 	eg, egCtx := errgroup.WithContext(ctx)
 
 	for _, jobName := range sortedJobs {
@@ -126,6 +134,14 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				case <-egCtx.Done():
 					return egCtx.Err()
 				}
+
+				mu.Lock()
+				status := jobStatuses[depName]
+				mu.Unlock()
+
+				if status != drevtypes.StatusSuccess {
+					return fmt.Errorf("dependency %q failed with status %s", depName, status)
+				}
 			}
 
 			rj, ok := runJobMap[jobName]
@@ -133,14 +149,33 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				return fmt.Errorf("run job not found for %s", jobName)
 			}
 
+			// Single-Parent Snapshot Inheritance (Contract Rule 3, 4, 5):
+			// - Exactly 1 dependency: copy from that dependency's successfully completed workspace
+			// - 0 dependencies (root) or >1 dependencies: copy from central source
+			var parentJob string
+			if len(job.DependsOn) == 1 {
+				parentJob = job.DependsOn[0]
+			}
+
+			jobWorkspace, err := w.CreateJobWorkspace(job.Name, parentJob)
+			if err != nil {
+				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+				return fmt.Errorf("creating workspace for job %s: %w", job.Name, err)
+			}
+
 			s.store.UpdateRunJobStatus(egCtx, rj.ID, drevtypes.StatusRunning)
 
-			err := s.runner.RunJob(egCtx, run, &job, w, logWriter)
+			err = s.runner.RunJob(egCtx, run, &job, jobWorkspace, logWriter)
 
+			mu.Lock()
 			if err != nil {
+				jobStatuses[jobName] = drevtypes.StatusFailed
+				mu.Unlock()
 				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
 				return err
 			}
+			jobStatuses[jobName] = drevtypes.StatusSuccess
+			mu.Unlock()
 
 			s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSuccess)
 			close(jobDoneChans[jobName])

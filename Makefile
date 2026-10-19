@@ -1,4 +1,4 @@
-.PHONY: build build-cli build-server run-server clean test lint token example dev dev-status dev-logs dev-stop dev-test
+.PHONY: build build-cli build-server run-server clean test lint fmt fmt-check token example dev dev-status dev-logs dev-stop dev-test
 
 BINARY_DIR := bin
 
@@ -29,6 +29,17 @@ test:
 
 lint:
 	go vet ./...
+
+fmt:
+	gofmt -w .
+
+fmt-check:
+	@files=$$(git ls-files '*.go' | xargs gofmt -l); \
+	if [ -n "$$files" ]; then \
+		echo "The following tracked Go source files are not formatted:"; \
+		echo "$$files"; \
+		exit 1; \
+	fi
 
 clean:
 	rm -rf $(BINARY_DIR) logs/ drev.db

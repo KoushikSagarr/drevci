@@ -10,7 +10,7 @@ import (
 
 func main() {
 	drevTarget, _ := url.Parse("http://localhost:9090")
-	otherTarget, _ := url.Parse("http://localhost:3000") 
+	otherTarget, _ := url.Parse("http://localhost:3000")
 
 	drevProxy := httputil.NewSingleHostReverseProxy(drevTarget)
 	otherProxy := httputil.NewSingleHostReverseProxy(otherTarget)
@@ -31,7 +31,7 @@ func main() {
 	port := ":8888"
 	log.Printf("⚡ Drev Router active on %s", port)
 	log.Printf("Point ngrok here: ngrok http --domain=picked-indirectly-cheetah.ngrok-free.app 8888")
-	
+
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
 	}
