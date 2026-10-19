@@ -251,14 +251,7 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
           <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">Console Output</h3>
           <LogViewer runId={runId} isLive={isLive} />
           
-          <div className="rounded-lg border border-border bg-surface/30 p-4">
-            <h4 className="text-[10px] font-bold text-text-muted uppercase tracking-widest mb-2">Technical Details</h4>
-            <div className="font-mono text-[11px] text-text-secondary space-y-1">
-              <div className="flex justify-between"><span>Runner Version</span> <span>Drev-Runner v0.1.0-alpha</span></div>
-              <div className="flex justify-between"><span>Execution Node</span> <span>Local-Daemon-Win64</span></div>
-              <div className="flex justify-between"><span>Storage Engine</span> <span>SQLite v3.x (WAL-mode)</span></div>
-            </div>
-          </div>
+
         </div>
       </div>
 
