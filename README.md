@@ -16,9 +16,36 @@
 
 ## Quick Start
 
-### Local Development Stack (macOS / Linux)
+### 1. Production Self-Hosted Deployment (Docker Compose)
 
-Run the full local development stack (daemon, dashboard, and ngrok tunnel) with a single command:
+The recommended way to deploy Drev CI in production is using Docker Compose:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/drevci/drev.git
+cd drev
+
+# 2. Configure environment
+cp .env.example .env
+# Generate and set a secure 32-byte hex token in .env:
+#   openssl rand -hex 32
+
+# 3. Create host workspace directory
+mkdir -p /tmp/drev-workspaces
+
+# 4. Start the stack
+docker compose up -d --build
+```
+
+- **Dashboard**: Open `http://localhost:3000` (bound to `127.0.0.1` by default).
+- **Persistent Data**: SQLite database state and job logs are stored in project-scoped Docker volumes (`drevci_drev-data` and `drevci_drev-logs`).
+- **Production Operations Guide**: For full architecture details, Docker socket security disclosures, verified safe offline backup procedures, and volume migration guides, see [docs/self-hosted.md](docs/self-hosted.md).
+
+---
+
+### 2. Local Development Stack (macOS / Linux)
+
+Run the local development stack (daemon, dashboard, and ngrok tunnel) natively with a single command:
 
 ```bash
 make dev          # Starts drevd (9090), dashboard (3000), and ngrok with health checks
@@ -35,9 +62,9 @@ When configured, ngrok establishes a verified stable tunnel:
 - **Webhook Payload URL**: `https://picked-indirectly-cheetah.ngrok-free.app/webhooks/github`
 - **Secret**: Must match `DREV_WEBHOOK_SECRET` in your `.env`
 
+---
 
-### Manual Install & Run
-
+### 3. Manual Build & Run
 
 ```bash
 git clone https://github.com/drevci/drev.git
@@ -45,32 +72,26 @@ cd drev
 go mod download
 go build -o bin/drev ./cmd/drev
 go build -o bin/drevd ./cmd/drevd
-```
 
-### Start the server
-
-```bash
+# Start the server daemon
 ./bin/drevd --port 9090
-# outputs: Webhook URL and API token
 ```
 
 ### Run your first pipeline
 
 ```bash
-export DREV_SERVER=http://localhost:9090
-export DREV_TOKEN=<token-from-startup>
+export DREV_SERVER=http://localhost:3000  # or http://localhost:9090 if daemon port is published
+export DREV_TOKEN="<your-drev-token>"
 
 ./bin/drev run configs/example.drev.yml
 ```
 
-Watch logs stream in real time. When done:
-```
+Watch logs stream in real time:
+```text
 ✓ Pipeline succeeded
 ```
 
-### View in dashboard
-
-Open `http://localhost:3000/runs` to see all pipeline runs.
+View the execution live in the web dashboard at `http://localhost:3000/runs`.
 
 ## Pipeline Syntax
 
@@ -123,7 +144,7 @@ jobs:
 
 ## GitHub Webhook Setup
 
-1. Start Drev CI server and expose it (e.g., ngrok):
+1. Start Drev CI server and expose it (e.g., via ngrok):
    ```bash
    ngrok http 9090
    ```
@@ -131,7 +152,7 @@ jobs:
 2. Go to your GitHub repo → Settings → Webhooks → Add webhook:
    - Payload URL: `https://<your-ngrok-url>/webhooks/github`
    - Content type: `application/json`
-   - Secret: (copy from drevd startup output)
+   - Secret: (copy from drevd startup output or `.env`)
    - Events: Just the push event
    - Click Add webhook
 
@@ -139,7 +160,7 @@ jobs:
 
 ## Slack/Discord Notifications
 
-Set webhook URLs to get notified when pipelines complete:
+Set webhook URLs in `.env` or flags to get notified when pipelines complete:
 
 ```bash
 ./bin/drevd \
@@ -171,33 +192,38 @@ drev version
 
 ## Architecture
 
-```
-┌──────────────────────────────────────┐
-│         GitHub / CLI User            │
-└──────────────────────────────────────┘
-                    ↓
-┌──────────────────────────────────────┐
-│    Drev CI API (drevd :9090)         │
-│  - REST API, auth, webhooks          │
-│  - Job queue & worker pool           │
-│  - YAML parser & DAG scheduler       │
-└──────────────────────────────────────┘
-                    ↓
-┌──────────────────────────────────────┐
-│  Docker Engine                       │
-│  - Execute jobs in containers        │
-│  - Stream logs                       │
-└──────────────────────────────────────┘
-                    ↓
-┌──────────────────────────────────────┐
-│  SQLite + Log Files                  │
-│  - Persist runs and history          │
-└──────────────────────────────────────┘
+Drev CI uses Docker-out-of-Docker (DooD) to execute jobs in ephemeral sibling containers managed directly by the host Docker engine:
 
-Dashboard: http://localhost:3000
-  - View all runs
-  - Stream logs in real time
-  - Job timeline
+```text
+                       ┌─────────────────────────┐
+                       │     Browser / Client    │
+                       └────────────┬────────────┘
+                                    │ HTTP :3000 (127.0.0.1)
+                                    ▼
+       ┌────────────────────────────────────────────────────────┐
+       │             Next.js Dashboard Container                │
+       │             - Unprivileged non-root user (nextjs)      │
+       │             - Exposes port 3000 to host                │
+       │             - NO Docker socket access                  │
+       └────────────────────────────┬───────────────────────────┘
+                                    │ HTTP :9090 (Internal network: drev-net)
+                                    │ Authorization: Bearer <DREV_TOKEN>
+                                    ▼
+       ┌────────────────────────────────────────────────────────┐
+       │               Drev CI Daemon (`drevd`)                 │
+       │             - Persistent volume: SQLite database       │
+       │             - Persistent volume: Log streams           │
+       │             - Shared mount: /tmp/drev-workspaces       │
+       └────────────────────────────┬───────────────────────────┘
+                                    │
+                                    │ Unix Socket: /var/run/docker.sock
+                                    ▼
+       ┌────────────────────────────────────────────────────────┐
+       │                   Host Docker Engine                   │
+       │             - Executes ephemeral CI job containers     │
+       │             - Enforces CPU, Memory, Swap, & PIDs limits│
+       │             - Labels: ci.drev.managed=true             │
+       └────────────────────────────────────────────────────────┘
 ```
 
 ## Configuration
@@ -217,59 +243,61 @@ Dashboard: http://localhost:3000
 | `--slack-webhook` | — | Slack webhook URL |
 | `--discord-webhook` | — | Discord webhook URL |
 
-**Environment variables:**
+**Environment variables (`.env`):**
 
-| Variable | Description |
-|:---------|:------------|
-| `DREV_SERVER` | CLI server URL (default `localhost:9090`) |
-| `DREV_TOKEN` | API token |
-| `DREV_WEBHOOK_SECRET` | GitHub webhook secret |
-| `NGROK_DOMAIN` | Reserved ngrok domain (e.g. `picked-indirectly-cheetah.ngrok-free.app`) |
-| `DREV_SLACK_WEBHOOK` | Slack webhook URL |
-| `DREV_DISCORD_WEBHOOK` | Discord webhook URL |
-
+| Variable | Default | Description |
+|:---------|:--------|:------------|
+| `DREV_TOKEN` | — | API bearer token (required for engine and dashboard) |
+| `DASHBOARD_BIND_IP` | `127.0.0.1` | Host interface bind address for the web dashboard |
+| `DASHBOARD_PORT` | `3000` | Port for the Next.js web dashboard |
+| `DREV_PORT` | `9090` | Daemon port (internal by default in Docker Compose) |
+| `DREV_WORKSPACE_DIR` | `/tmp/drev-workspaces` | Shared host path for DooD job checkouts |
+| `DREV_JOB_CPU_LIMIT` | — | Maximum CPUs per job container (e.g. `2.0` or `1.5`) |
+| `DREV_JOB_MEMORY_LIMIT`| — | Maximum RAM per job container (e.g. `2GB` or `512MB`) |
+| `DREV_JOB_SWAP_LIMIT` | — | Maximum swap per job container (e.g. `2GB` or `0`) |
+| `DREV_JOB_PIDS_LIMIT` | — | Maximum processes/threads per job container (e.g. `512`) |
+| `DREV_WEBHOOK_SECRET`| — | GitHub webhook HMAC validation secret |
+| `NGROK_DOMAIN` | — | Reserved ngrok domain (e.g. `my-tunnel.ngrok-free.app`) |
+| `DREV_SLACK_WEBHOOK` | — | Slack incoming webhook URL for notifications |
+| `DREV_DISCORD_WEBHOOK`| — | Discord webhook URL for notifications |
 
 ## Testing
 
 ```bash
-go test ./... -v
-```
+# Run unit and race tests
+go test -race -count=1 ./...
 
-Run with Docker running for integration tests (runner tests skip gracefully if Docker unavailable).
+# Run dashboard tests and linter
+npm --prefix dashboard test
+npm --prefix dashboard run lint
+```
 
 ## Seeding Sample Data
 
-For testing and visual presentation, you can populate your databases (either SQLite or PostgreSQL/Supabase) with premium mock CI data.
+To populate your SQLite database with sample pipeline runs for testing and UI evaluation:
 
-To compile and seed the database manually:
 ```bash
-go build -o bin/seed.exe ./cmd/seed
-# For SQLite:
-./bin/seed.exe --db-type sqlite
-# For PostgreSQL:
-./bin/seed.exe --db-type postgres --db-url "your-postgresql-connection-string"
+go build -o bin/seed ./cmd/seed
+./bin/seed --db-type sqlite --db-path ./drev.db
 ```
 
-*Note: In local SQLite mode, `.\start-drev.ps1` will automatically build and seed your database on the first run if no `drev.db` file is found.*
+## Status & Roadmap
 
-## Status
+### Completed
+- ✅ **Core Engine** — YAML parser, DAG scheduler, and Docker DooD runner
+- ✅ **Docker Compose Deployment** — Isolated container stack, non-root dashboard, project-scoped volumes
+- ✅ **Host DooD Alignment** — Coordinated workspace path mapping and exclusive Docker socket confinement
+- ✅ **Resource Limits** — Enforced CPU, Memory, Swap, and PIDs limits per step container
+- ✅ **Persistence & Crash Recovery** — SQLite WAL mode, ghost-run recovery, and orphan container reconciliation
+- ✅ **Operational Runbooks** — Verified offline backup procedures and zero-data-loss volume migrations
+- ✅ **Real-Time Streaming** — SSE log streaming to CLI and dashboard
+- ✅ **Webhooks & Alerts** — GitHub push triggers with HMAC verification; Slack & Discord notifications
 
-- ✅ Core engine (YAML parser, DAG scheduler, Docker runner)
-- ✅ Real-time log streaming (CLI + web dashboard)
-- ✅ GitHub webhook integration
-- ✅ REST API with token auth
-- ✅ Job queue and worker pools
-- ✅ SQLite persistence
-- ✅ Slack/Discord notifications
-- ✅ Multi-tenant SaaS infrastructure (PostgreSQL + Auth + Usage tracking)
-
-## Roadmap
-
-- [ ] Distributed runners (agents on multiple machines)
-- [ ] Pipeline caching (shared volumes)
-- [ ] Manual trigger/cancel from dashboard
-- [ ] Metrics and observability (Prometheus)
-- [ ] Multi-workspace support
+### Planned (Phase 3 & Beyond)
+- [ ] **Dashboard Access Control** — Incoming user authentication & session management
+- [ ] **Enhanced UI Experience** — Multi-pipeline filtering, run search, and job timeline navigation
+- [ ] **Artifact Caching** — Shared build cache volumes and artifact persistence
+- [ ] **MicroVM Isolation** — Firecracker / gVisor runners for untrusted public PR execution
 
 ## Contributing
 
