@@ -3,5 +3,6 @@ logs/
 .env
 *.exe
 *.db
+.env.saas.example
 coverage.out
 drev-workspace-*
