@@ -1,0 +1,75 @@
+name: drevci
+
+services:
+  drevd:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: drevci/drevd:latest
+    container_name: drev-engine
+    restart: unless-stopped
+    environment:
+      - DREV_TOKEN=${DREV_TOKEN}
+      - DREV_WEBHOOK_SECRET=${DREV_WEBHOOK_SECRET:-}
+      - DREV_JOB_CPU_LIMIT=${DREV_JOB_CPU_LIMIT:-}
+      - DREV_JOB_MEMORY_LIMIT=${DREV_JOB_MEMORY_LIMIT:-}
+      - DREV_JOB_SWAP_LIMIT=${DREV_JOB_SWAP_LIMIT:-}
+      - DREV_JOB_PIDS_LIMIT=${DREV_JOB_PIDS_LIMIT:-}
+      - DREV_SLACK_WEBHOOK=${DREV_SLACK_WEBHOOK:-}
+      - DREV_DISCORD_WEBHOOK=${DREV_DISCORD_WEBHOOK:-}
+      - TMPDIR=${DREV_WORKSPACE_DIR:-/tmp/drev-workspaces}
+    volumes:
+      # Persistent SQLite database state (survives container updates)
+      - drev-data:/var/lib/drev/data
+      # Persistent log stream files
+      - drev-logs:/var/lib/drev/logs
+      # Shared workspace directory: mounted at identical host path so the host Docker engine can bind-mount job workspaces
+      - ${DREV_WORKSPACE_DIR:-/tmp/drev-workspaces}:${DREV_WORKSPACE_DIR:-/tmp/drev-workspaces}
+      # Docker engine control socket (CRITICAL: Mounted only into the daemon, never the dashboard)
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - drev-net
+    # Port 9090 is kept internal to the Docker network by default.
+    # To expose to localhost for CLI usage on the host machine, uncomment the ports block:
+    # ports:
+    #   - "127.0.0.1:${DREV_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    image: drevci/dashboard:latest
+    container_name: drev-dashboard
+    restart: unless-stopped
+    environment:
+      - DREV_BACKEND_URL=http://drevd:9090
+      - DREV_TOKEN=${DREV_TOKEN}
+      - DREV_NO_ENV_FILE=true
+      - PORT=3000
+    ports:
+      - "${DASHBOARD_BIND_IP:-127.0.0.1}:${DASHBOARD_PORT:-3000}:3000"
+    networks:
+      - drev-net
+    depends_on:
+      drevd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/v1/health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  drev-data:
+  drev-logs:
+
+networks:
+  drev-net:
+    driver: bridge

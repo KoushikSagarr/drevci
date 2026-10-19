@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/drevci/drev/internal/auth"
@@ -40,8 +41,7 @@ func doReq(req *http.Request) (*http.Response, error) {
 	if res.StatusCode >= 400 {
 		defer res.Body.Close()
 		body, _ := io.ReadAll(res.Body)
-		fmt.Printf("HTTP Error %d: %s\n", res.StatusCode, string(body))
-		os.Exit(1)
+		return nil, fmt.Errorf("HTTP error %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return res, nil
 }
@@ -49,7 +49,11 @@ func doReq(req *http.Request) (*http.Response, error) {
 func main() {
 	_ = godotenv.Load()
 
-	var rootCmd = &cobra.Command{Use: "drev"}
+	var rootCmd = &cobra.Command{
+		Use:     "drev",
+		Version: "0.1.0",
+	}
+	rootCmd.SetVersionTemplate("Drev CI v{{.Version}}\n")
 	rootCmd.PersistentFlags().StringVar(&serverURL, "server", "http://localhost:9090", "server URL")
 	rootCmd.PersistentFlags().StringVar(&token, "token", "", "API token (or read from DREV_TOKEN env var)")
 
@@ -59,6 +63,8 @@ func main() {
 
 	var follow bool
 	var envOverrides []string
+	var timeout time.Duration
+	var pollInterval time.Duration
 
 	var runCmd = &cobra.Command{
 		Use:   "run <pipeline-file>",
@@ -66,62 +72,36 @@ func main() {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			path := args[0]
-			envMap := make(map[string]string)
-			for _, e := range envOverrides {
-				parts := strings.SplitN(e, "=", 2)
-				if len(parts) == 2 {
-					envMap[parts[0]] = parts[1]
+			effectiveTimeout := timeout
+			if !cmd.Flags().Changed("timeout") {
+				if envTimeout := os.Getenv("DREV_TIMEOUT"); envTimeout != "" {
+					if d, err := time.ParseDuration(envTimeout); err == nil {
+						effectiveTimeout = d
+					}
 				}
 			}
 
-			payload := map[string]interface{}{
-				"pipeline_path": path,
-				"env":           envMap,
-			}
-			body, _ := json.Marshal(payload)
-
-			req, _ := http.NewRequest("POST", serverURL+"/api/v1/pipelines/trigger", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			
-			res, err := doReq(req)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				os.Exit(1)
-			}
-			defer res.Body.Close()
-
-			var resp map[string]string
-			json.NewDecoder(res.Body).Decode(&resp)
-			runID := resp["run_id"]
-
-			fmt.Printf("▶ Run started: %s\n", runID)
-
-			if follow {
-				streamLogs(runID)
-			}
-
-			req, _ = http.NewRequest("GET", serverURL+"/api/v1/runs/"+runID, nil)
-			res, err = doReq(req)
-			if err != nil {
-				fmt.Printf("Error checking status: %v\n", err)
-				os.Exit(1)
-			}
-			defer res.Body.Close()
-
-			var run drevtypes.Run
-			json.NewDecoder(res.Body).Decode(&run)
-
-			if run.Status == drevtypes.StatusFailed || run.Status == drevtypes.StatusCancelled {
-				fmt.Printf("✗ Pipeline failed (status: %s)\n", run.Status)
-				os.Exit(1)
-			} else {
-				fmt.Println("✓ Pipeline succeeded")
-				os.Exit(0)
+			exitCode := ExecuteRun(cmd.Context(), RunConfig{
+				ServerURL:    serverURL,
+				Token:        token,
+				PipelinePath: path,
+				EnvOverrides: envOverrides,
+				Follow:       follow,
+				Timeout:      effectiveTimeout,
+				PollInterval: pollInterval,
+				Client:       client,
+				Out:          os.Stdout,
+				ErrOut:       os.Stderr,
+			})
+			if exitCode != 0 {
+				os.Exit(exitCode)
 			}
 		},
 	}
 	runCmd.Flags().BoolVar(&follow, "follow", true, "stream logs after triggering")
 	runCmd.Flags().StringSliceVar(&envOverrides, "env", nil, "extra env overrides KEY=VALUE")
+	runCmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "maximum time to wait for pipeline completion (0 for unlimited)")
+	runCmd.Flags().DurationVar(&pollInterval, "poll-interval", 1*time.Second, "polling interval for status checks")
 
 	var statusCmd = &cobra.Command{
 		Use:   "status <run-id>",
@@ -190,7 +170,9 @@ func main() {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			runID := args[0]
-			streamLogs(runID)
+			if err := streamLogs(cmd.Context(), client, serverURL, token, runID, os.Stdout, os.Stderr); err != nil {
+				os.Exit(1)
+			}
 		},
 	}
 	logsCmd.Flags().BoolVar(&follow, "follow", false, "stream logs")
@@ -225,47 +207,10 @@ func main() {
 
 	rootCmd.AddCommand(runCmd, statusCmd, logsCmd, tokenCmd, versionCmd)
 
-	if err := rootCmd.Execute(); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		os.Exit(1)
-	}
-}
-
-func streamLogs(runID string) {
-	if token == "" {
-		token = os.Getenv("DREV_TOKEN")
-	}
-
-	req, _ := http.NewRequest("GET", serverURL+"/api/v1/runs/"+runID+"/logs", nil)
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	req.Header.Set("Accept", "text/event-stream")
-
-	streamClient := &http.Client{} // no timeout for streams
-	res, err := streamClient.Do(req)
-	if err != nil {
-		fmt.Printf("Error streaming logs: %v\n", err)
-		return
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode >= 400 {
-		body, _ := io.ReadAll(res.Body)
-		fmt.Printf("HTTP Error %d: %s\n", res.StatusCode, string(body))
-		os.Exit(1)
-	}
-
-	reader := bufio.NewReader(res.Body)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("\nStream error: %v\n", err)
-			}
-			break
-		}
-		if strings.HasPrefix(line, "data: ") {
-			fmt.Print(strings.TrimPrefix(line, "data: "))
-		}
 	}
 }

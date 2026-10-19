@@ -263,18 +263,40 @@ func (s *PostgresStore) GetRunJobs(ctx context.Context, runID string) ([]*drevty
 	return jobs, rows.Err()
 }
 
-func (s *PostgresStore) ResetGhostRuns(ctx context.Context) error {
+func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM runs WHERE status IN ('running', 'pending')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		UPDATE runs SET status = 'failed', finished_at = $1
 		WHERE status IN ('running', 'pending')`, now)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE run_jobs SET status = 'failed', finished_at = $1
 		WHERE status IN ('running', 'pending')`, now)
-	return err
+	return ids, err
 }
 
 // ─── Org management ───────────────────────────────────────────────────────────

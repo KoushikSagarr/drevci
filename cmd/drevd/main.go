@@ -46,8 +46,9 @@ func main() {
 	var dockerHost string
 
 	var rootCmd = &cobra.Command{
-		Use:   "drevd",
-		Short: "Drev CI server daemon",
+		Use:     "drevd",
+		Version: "0.1.0",
+		Short:   "Drev CI server daemon",
 		Run: func(cmd *cobra.Command, args []string) {
 			if dockerHost == "" {
 				dockerHost = os.Getenv("DOCKER_HOST")
@@ -141,17 +142,21 @@ func main() {
 				fmt.Printf("Database: SQLite (%s)\n", dbPath)
 			}
 
-			// Cleanup stuck pipelines from previous session
-			if err := s.ResetGhostRuns(context.Background()); err != nil {
+			// 1. Recover interrupted runs in database from previous session
+			interruptedRunIDs, err := s.ResetGhostRuns(context.Background())
+			if err != nil {
 				log.Printf("Warning: failed to reset ghost runs: %v", err)
+			} else if len(interruptedRunIDs) > 0 {
+				log.Printf("Recovered %d interrupted pipeline run(s) from previous session: %v", len(interruptedRunIDs), interruptedRunIDs)
 			}
 
+			// 2. Initialize runner
 			r, err := runner.New(s)
 			if err != nil {
 				log.Fatalf("failed to create runner: %v", err)
 			}
 
-			// Validate Docker daemon connectivity on startup
+			// 3. Validate Docker daemon connectivity and reconcile orphaned containers
 			if cli, err := runner.NewDockerClient(); err == nil {
 				pingCtx, pingCancel := context.WithTimeout(context.Background(), 3*time.Second)
 				if _, err := cli.Ping(pingCtx); err != nil {
@@ -159,6 +164,12 @@ func main() {
 					if os.Getenv("DOCKER_HOST") == "" && runtime.GOOS == "darwin" {
 						log.Println("Hint: If using Docker Desktop on macOS, ensure it is running or set DOCKER_HOST=\"unix://$HOME/.docker/run/docker.sock\".")
 					}
+				} else {
+					// Docker daemon reachable: safely reconcile leftover/orphaned Drev CI containers
+					recCtx, recCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					summary, recErr := r.ReconcileOrphans(recCtx, interruptedRunIDs)
+					recCancel()
+					runner.LogReconciliationSummary(log.Printf, summary, recErr)
 				}
 				pingCancel()
 				cli.Close()
@@ -265,6 +276,17 @@ func main() {
 	rootCmd.Flags().StringVar(&dbType, "db-type", "", "Database type: sqlite (default) or postgres (or DREV_DB_TYPE env)")
 	rootCmd.Flags().StringVar(&dbURL, "db-url", "", "PostgreSQL connection string (or DREV_DB_URL env)")
 	rootCmd.Flags().StringVar(&dockerHost, "docker-host", "", "Docker daemon host/socket endpoint (or DOCKER_HOST env)")
+
+	rootCmd.SetVersionTemplate("Drev CI v{{.Version}}\n")
+
+	var versionCmd = &cobra.Command{
+		Use:   "version",
+		Short: "Print version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println("Drev CI v0.1.0")
+		},
+	}
+	rootCmd.AddCommand(versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

@@ -34,6 +34,12 @@ type Handler struct {
 	workers              int
 	webhookHandler       *webhook.GitHubHandler
 	notificationsEnabled bool
+	logger               *log.Logger
+}
+
+// SetLogger sets a custom logger for request logging (e.g. for testing).
+func (h *Handler) SetLogger(l *log.Logger) {
+	h.logger = l
 }
 
 func New(
@@ -76,7 +82,11 @@ func (h *Handler) Routes() http.Handler {
 		})
 	})
 
-	r.Use(middleware.Logger)
+	logger := h.logger
+	if logger == nil {
+		logger = log.New(os.Stdout, "", log.LstdFlags)
+	}
+	r.Use(middleware.RequestLogger(&SanitizedLogFormatter{Logger: logger}))
 	r.Use(middleware.Recoverer)
 
 	r.Get("/api/v1/health", h.health)

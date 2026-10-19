@@ -1,0 +1,16 @@
+name: drev-ci-pipeline
+
+source:
+  type: git
+  url: https://github.com/KoushikSagarr/drevci.git
+  ref: main
+
+triggers:
+  - push
+
+jobs:
+  - name: test
+    image: golang:alpine
+    steps:
+      - name: intentional test failure
+        run: echo "[drev] running smoke test assertions..." && exit 1

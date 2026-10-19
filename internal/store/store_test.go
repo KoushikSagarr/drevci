@@ -295,3 +295,96 @@ func TestOpen_LegacyDatabasePartialColumns(t *testing.T) {
 		t.Errorf("r.TriggeredBy = %q, want 'api' (default)", r.TriggeredBy)
 	}
 }
+
+func TestResetGhostRuns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ghost.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Seed runs in various states
+	runs := []*drevtypes.Run{
+		{ID: "run-running", PipelineName: "pipe", Status: drevtypes.StatusRunning, StartedAt: time.Now()},
+		{ID: "run-pending", PipelineName: "pipe", Status: drevtypes.StatusPending, StartedAt: time.Now()},
+		{ID: "run-success", PipelineName: "pipe", Status: drevtypes.StatusSuccess, StartedAt: time.Now(), FinishedAt: time.Now()},
+		{ID: "run-failed", PipelineName: "pipe", Status: drevtypes.StatusFailed, StartedAt: time.Now(), FinishedAt: time.Now()},
+	}
+	for _, r := range runs {
+		if err := s.CreateRun(ctx, r); err != nil {
+			t.Fatalf("CreateRun(%s) error = %v", r.ID, err)
+		}
+	}
+
+	// Seed jobs
+	jobs := []*drevtypes.RunJob{
+		{ID: "j-running", RunID: "run-running", JobName: "test", Status: drevtypes.StatusRunning, StartedAt: time.Now()},
+		{ID: "j-pending", RunID: "run-pending", JobName: "build", Status: drevtypes.StatusPending, StartedAt: time.Now()},
+		{ID: "j-success", RunID: "run-success", JobName: "deploy", Status: drevtypes.StatusSuccess, StartedAt: time.Now(), FinishedAt: time.Now()},
+	}
+	for _, j := range jobs {
+		if err := s.CreateRunJob(ctx, j); err != nil {
+			t.Fatalf("CreateRunJob(%s) error = %v", j.ID, err)
+		}
+	}
+
+	// First call to ResetGhostRuns: should identify and reset run-running and run-pending
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns() error = %v", err)
+	}
+
+	if len(interrupted) != 2 {
+		t.Fatalf("expected 2 interrupted runs, got %d (%v)", len(interrupted), interrupted)
+	}
+
+	interruptedMap := make(map[string]bool)
+	for _, id := range interrupted {
+		interruptedMap[id] = true
+	}
+	if !interruptedMap["run-running"] || !interruptedMap["run-pending"] {
+		t.Errorf("expected run-running and run-pending to be returned, got: %v", interrupted)
+	}
+
+	// Verify states in store
+	rRunning, _ := s.GetRun(ctx, "run-running")
+	if rRunning.Status != drevtypes.StatusFailed {
+		t.Errorf("run-running status = %s, want failed", rRunning.Status)
+	}
+	if rRunning.FinishedAt.IsZero() {
+		t.Errorf("run-running finished_at was not set")
+	}
+
+	rPending, _ := s.GetRun(ctx, "run-pending")
+	if rPending.Status != drevtypes.StatusFailed {
+		t.Errorf("run-pending status = %s, want failed", rPending.Status)
+	}
+
+	// Verify success and failed runs were NOT mutated
+	rSuccess, _ := s.GetRun(ctx, "run-success")
+	if rSuccess.Status != drevtypes.StatusSuccess {
+		t.Errorf("run-success status unexpectedly changed to %s", rSuccess.Status)
+	}
+	rFailed, _ := s.GetRun(ctx, "run-failed")
+	if rFailed.Status != drevtypes.StatusFailed {
+		t.Errorf("run-failed status unexpectedly changed to %s", rFailed.Status)
+	}
+
+	// Verify jobs were also updated
+	runningJobs, _ := s.GetRunJobs(ctx, "run-running")
+	if len(runningJobs) == 0 || runningJobs[0].Status != drevtypes.StatusFailed {
+		t.Errorf("job j-running was not updated to failed")
+	}
+
+	// Second call to ResetGhostRuns: idempotent, should return nil
+	interrupted2, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("second ResetGhostRuns() error = %v", err)
+	}
+	if len(interrupted2) != 0 {
+		t.Errorf("expected 0 interrupted runs on repeated call, got: %v", interrupted2)
+	}
+}

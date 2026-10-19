@@ -33,6 +33,8 @@ type DockerClient interface {
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
+	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
+	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
 	ContainerLogs(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error)
 	ContainerWait(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error)
 }
@@ -41,6 +43,7 @@ type DockerClient interface {
 type Runner struct {
 	docker DockerClient
 	store  store.Store
+	limits ResourceLimits
 }
 
 type JobResult struct {
@@ -71,21 +74,40 @@ func NewDockerClient() (*client.Client, error) {
 	return client.NewClientWithOpts(opts...)
 }
 
-// New creates a Runner using standard Docker client environment configuration.
+// New creates a Runner using standard Docker client environment configuration and validated resource limits.
 func New(store store.Store) (*Runner, error) {
 	cli, err := NewDockerClient()
 	if err != nil {
 		return nil, fmt.Errorf("creating docker client: %w", err)
 	}
-	return NewWithClient(cli, store), nil
+	limits, err := LoadResourceLimitsFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("loading resource limits: %w", err)
+	}
+	return NewWithLimits(cli, store, limits), nil
 }
 
-// NewWithClient creates a Runner with a provided DockerClient implementation (for testing or custom endpoints).
+// NewWithClient creates a Runner with a provided DockerClient implementation and environment/default limits.
 func NewWithClient(docker DockerClient, store store.Store) *Runner {
+	limits, err := LoadResourceLimitsFromEnv()
+	if err != nil {
+		limits = DefaultResourceLimits()
+	}
+	return NewWithLimits(docker, store, limits)
+}
+
+// NewWithLimits creates a Runner with an explicit DockerClient, store, and resource limits.
+func NewWithLimits(docker DockerClient, store store.Store, limits ResourceLimits) *Runner {
 	return &Runner{
 		docker: docker,
 		store:  store,
+		limits: limits,
 	}
+}
+
+// Limits returns the active ResourceLimits enforced by this runner.
+func (r *Runner) Limits() ResourceLimits {
+	return r.limits
 }
 
 // processPullStream reads Docker's JSON message stream from the pull response,
@@ -166,13 +188,35 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 		envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 	}
 
+	pidsLimit := r.limits.PidsLimit
+
+	fmt.Fprintf(logWriter, "[drev] enforcing container limits: %.1f CPUs, %dMB RAM, %s swap, %d PIDs\n",
+		float64(r.limits.NanoCPUs)/1e9,
+		r.limits.Memory/(1024*1024),
+		formatSwapLimit(r.limits),
+		r.limits.PidsLimit,
+	)
+
+	labels := map[string]string{
+		LabelManagedBy: "true",
+		LabelRunID:     run.ID,
+		LabelJobName:   job.Name,
+	}
+
 	resp, err := r.docker.ContainerCreate(ctx, &container.Config{
 		Image:      job.Image,
 		Cmd:        []string{"sh", "-c", shCmd},
 		WorkingDir: "/workspace",
 		Env:        envVars,
+		Labels:     labels,
 	}, &container.HostConfig{
 		Binds: []string{w.Dir + ":/workspace"},
+		Resources: container.Resources{
+			NanoCPUs:   r.limits.NanoCPUs,
+			Memory:     r.limits.Memory,
+			MemorySwap: r.limits.MemorySwap,
+			PidsLimit:  &pidsLimit,
+		},
 	}, nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("creating container: %w", err)
