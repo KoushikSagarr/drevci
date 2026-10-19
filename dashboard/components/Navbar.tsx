@@ -10,7 +10,13 @@ export default function Navbar() {
     <nav className="fixed top-0 left-0 right-0 z-50 flex h-14 items-center justify-between border-b border-border bg-surface/80 backdrop-blur-md px-6">
       <div className="flex items-center gap-6">
         <Link href="/runs" className="flex items-center gap-2 font-bold text-white transition-opacity hover:opacity-80">
-          <span className="text-lg">⚡</span>
+          <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4 text-[#F97316]" aria-hidden="true">
+            <line x1="5" y1="6" x2="19" y2="12" stroke="#F97316" strokeWidth="2" strokeLinecap="round" />
+            <line x1="5" y1="18" x2="19" y2="12" stroke="#F97316" strokeWidth="2" strokeLinecap="round" />
+            <circle cx="5" cy="6" r="3" fill="#F97316" />
+            <circle cx="5" cy="18" r="3" fill="#F97316" />
+            <circle cx="19" cy="12" r="3" fill="#F97316" />
+          </svg>
           <span className="text-base tracking-tight">Drev CI</span>
         </Link>
         <div className="h-5 w-px bg-border" />
