@@ -50,6 +50,8 @@ services:
     environment:
       - DREV_BACKEND_URL=http://drevd:9090
       - DREV_TOKEN=${DREV_TOKEN}
+      - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
+      - DASHBOARD_SESSION_SECRET=${DASHBOARD_SESSION_SECRET}
       - DREV_NO_ENV_FILE=true
       - PORT=3000
     ports:

@@ -39,15 +39,25 @@ async function extractErrorMessage(res: Response): Promise<string> {
   return `Request failed with status ${res.status}`;
 }
 
+async function handleApiResponse(res: Response): Promise<Response> {
+  if (!res.ok) {
+    if (res.status === 401 && typeof window !== 'undefined' && !window.location.pathname.startsWith('/login')) {
+      const from = encodeURIComponent(window.location.pathname + window.location.search);
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.href = `/login?from=${from}`;
+    }
+    const errorMsg = await extractErrorMessage(res);
+    throw new ApiError(errorMsg, res.status);
+  }
+  return res;
+}
+
 export async function getRuns(limit = 20): Promise<Run[]> {
   const res = await fetch(`${getBaseUrl()}/api/v1/runs?limit=${limit}`, {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });
-  if (!res.ok) {
-    const errorMsg = await extractErrorMessage(res);
-    throw new ApiError(errorMsg, res.status);
-  }
+  await handleApiResponse(res);
   return res.json();
 }
 
@@ -56,10 +66,7 @@ export async function getRun(id: string): Promise<Run> {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });
-  if (!res.ok) {
-    const errorMsg = await extractErrorMessage(res);
-    throw new ApiError(errorMsg, res.status);
-  }
+  await handleApiResponse(res);
   return res.json();
 }
 
@@ -68,10 +75,7 @@ export async function getRunJobs(id: string): Promise<RunJob[]> {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });
-  if (!res.ok) {
-    const errorMsg = await extractErrorMessage(res);
-    throw new ApiError(errorMsg, res.status);
-  }
+  await handleApiResponse(res);
   return res.json();
 }
 
@@ -80,10 +84,7 @@ export async function getQueueStatus(): Promise<QueueStatus> {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });
-  if (!res.ok) {
-    const errorMsg = await extractErrorMessage(res);
-    throw new ApiError(errorMsg, res.status);
-  }
+  await handleApiResponse(res);
   return res.json();
 }
 

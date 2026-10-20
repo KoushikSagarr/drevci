@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-function readTokenFromFile(filePath: string): string | null {
+function readKeyFromFile(filePath: string, keys: string[]): string | null {
   try {
     if (!fs.existsSync(filePath)) return null;
     const content = fs.readFileSync(filePath, 'utf-8');
@@ -19,8 +19,8 @@ function readTokenFromFile(filePath: string): string | null {
       ) {
         value = value.slice(1, -1);
       }
-      if (key === 'DREV_TOKEN' || key === 'DREV_API_TOKEN' || key === 'DREV_API_TOKENS') {
-        if (value) return value;
+      if (keys.includes(key) && value) {
+        return value;
       }
     }
   } catch {
@@ -29,16 +29,13 @@ function readTokenFromFile(filePath: string): string | null {
   return null;
 }
 
-export function getBackendToken(): string | null {
-  if (process.env.DREV_TOKEN) return process.env.DREV_TOKEN;
-  if (process.env.DREV_API_TOKEN) return process.env.DREV_API_TOKEN;
-  if (process.env.DREV_API_TOKENS) return process.env.DREV_API_TOKENS;
+function resolveEnvKey(envKey: string, fileKeys: string[]): string | null {
+  if (process.env[envKey]) return process.env[envKey] as string;
 
   if (process.env.DREV_NO_ENV_FILE === 'true') {
     return null;
   }
 
-  // Search candidate paths for .env
   const candidates = [
     path.resolve(process.cwd(), '.env.local'),
     path.resolve(process.cwd(), '.env'),
@@ -47,11 +44,30 @@ export function getBackendToken(): string | null {
   ];
 
   for (const candidate of candidates) {
-    const token = readTokenFromFile(candidate);
-    if (token) return token;
+    const val = readKeyFromFile(candidate, fileKeys);
+    if (val) {
+      process.env[envKey] = val;
+      return val;
+    }
   }
 
   return null;
+}
+
+export function getBackendToken(): string | null {
+  if (process.env.DREV_TOKEN) return process.env.DREV_TOKEN;
+  if (process.env.DREV_API_TOKEN) return process.env.DREV_API_TOKEN;
+  if (process.env.DREV_API_TOKENS) return process.env.DREV_API_TOKENS;
+
+  return resolveEnvKey('DREV_TOKEN', ['DREV_TOKEN', 'DREV_API_TOKEN', 'DREV_API_TOKENS']);
+}
+
+export function getDashboardPassword(): string | null {
+  return resolveEnvKey('DASHBOARD_PASSWORD', ['DASHBOARD_PASSWORD']);
+}
+
+export function getDashboardSessionSecret(): string | null {
+  return resolveEnvKey('DASHBOARD_SESSION_SECRET', ['DASHBOARD_SESSION_SECRET']);
 }
 
 export function getBackendUrl(): string {
@@ -62,3 +78,4 @@ export function getBackendUrl(): string {
     'http://localhost:9090';
   return url.replace(/\/+$/, '');
 }
+

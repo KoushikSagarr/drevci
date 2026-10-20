@@ -69,21 +69,33 @@ Drev CI self-hosted consists of two tightly coupled services running on an isola
 > - **Public PRs / Untrusted Code**: Do **NOT** allow unvetted public pull requests or untrusted third parties to trigger pipeline jobs without manual approval gates and external microVM isolation controls.
 > - Multi-tenant isolation and secure execution of untrusted workloads require isolated microVM runtimes (such as Firecracker or gVisor), which are planned for future roadmap phases.
 
-### Dashboard Authorization & Access Control Warning
+### Dashboard Authentication & Access Control (Phase 3.1)
 
-> [!WARNING]
-> **Dashboard API Proxy & Missing Client Authentication**
->
-> The Next.js dashboard acts as an operator console. Its server-side API proxy (`dashboard/app/api/v1/[[...path]]/route.ts`) injects the configured `DREV_TOKEN` into forwarded requests to `drevd`. However, **the dashboard proxy currently does not authenticate incoming browser requests**.
->
-> **Implications**:
-> - Anyone who can reach the dashboard HTTP port can trigger arbitrary pipeline runs (`POST /api/v1/pipelines/trigger`), query run status and queue depth, and inspect full build execution logs (`GET /api/v1/runs/{runID}/logs`).
-> - The central authorization issue is the **complete absence of incoming client authentication** at the dashboard layer, not wildcard CORS headers. Direct HTTP requests (such as curl, automated scripts, or network peers) bypass any browser-level CORS enforcement entirely.
->
-> **Deployment Controls**:
-> - By default, `docker-compose.yml` binds the dashboard strictly to the loopback interface (`127.0.0.1:${DASHBOARD_PORT:-3000}:3000` via `DASHBOARD_BIND_IP=127.0.0.1`).
-> - **Loopback binding is a network exposure mitigation, NOT application-level authentication.** Any local process or user on the host can interact with the dashboard without credentials.
-> - **Mandatory requirement for remote exposure**: If you expose the dashboard beyond `127.0.0.1` (e.g. across a LAN, VPN, or public IP), you **MUST** place it behind an authenticating reverse proxy (e.g., Caddy, Nginx, or Traefik with HTTP Basic Auth, Cloudflare Access, Authelia, or OAuth2-Proxy) or within a secured private network/VPN (such as Tailscale or WireGuard). Never expose the dashboard port directly to untrusted networks.
+The Next.js dashboard enforces a self-hosted authentication boundary around all operator views and upstream proxy requests.
+
+#### Authentication Architecture
+
+1. **Password Authentication & Stateless Sessions**:
+   - Authentication is self-hosted with no external SaaS dependency (no Supabase, Auth0, or third-party OAuth required).
+   - Configured via `DASHBOARD_PASSWORD` and an independent `DASHBOARD_SESSION_SECRET` (minimum 32 characters).
+   - Tokens use a cryptographically secure HMAC-SHA256 signature with an expiration timestamp (`drev_session`).
+   - Cookie attributes: `HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age=86400` (24h). `Secure` flag is enforced in production HTTPS environments.
+
+2. **Upstream Proxy Protection**:
+   - The Next.js proxy (`/api/v1/*`) verifies the session cookie **before** injecting `DREV_TOKEN` or contacting the daemon.
+   - Unauthenticated requests to `/api/v1/*` are rejected immediately with `401 Unauthorized` JSON. The daemon engine is never contacted for unauthenticated requests.
+   - Unauthenticated page navigations (`/`, `/runs`, `/runs/[runId]`) redirect to `/login?from=...` with open-redirect protection.
+   - `GET /api/v1/health` remains unauthenticated as a minimal public health check for Docker Compose container monitoring.
+   - Wildcard CORS headers are disabled. State-changing requests (`POST`, `PUT`, `DELETE`) require Origin/Referer header validation to defend against CSRF.
+
+3. **Rate Limiting & Fail-Closed Policy**:
+   - Process-local login rate limiting enforces a maximum of 5 failed attempts per client per 5-minute window (`429 Too Many Requests`).
+   - Timing-safe password comparison prevents timing side-channel attacks.
+   - **Fail-Closed Configuration**: In production, missing or invalid authentication credentials (`DASHBOARD_PASSWORD` or `DASHBOARD_SESSION_SECRET`), secret lengths under 32 characters, or credential reuse (`DASHBOARD_PASSWORD == DREV_TOKEN`) cause the authentication service to fail closed (500 Internal Error) rather than running unauthenticated.
+
+4. **Network Exposure Mitigation**:
+   - By default, `docker-compose.yml` binds the dashboard to loopback (`127.0.0.1:3000`).
+   - When exposed across external networks or public domains, use HTTPS termination (e.g., Caddy, Nginx, or Traefik) and ensure `DASHBOARD_COOKIE_SECURE=true` (or `NODE_ENV=production`).
 
 ---
 

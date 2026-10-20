@@ -6,11 +6,3 @@ logs/
 .env.saas.example
 coverage.out
 drev-workspace-*
-workspaces/
-
-# macOS metadata
-.DS_Store
-
-# SQLite runtime sidecar files
-*.db-shm
-*.db-wal

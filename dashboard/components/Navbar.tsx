@@ -1,10 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 
 export default function Navbar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const isLoginPage = pathname === '/login';
+
+  async function handleLogout() {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } finally {
+      router.push('/login');
+      router.refresh();
+    }
+  }
   
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 flex h-14 items-center justify-between border-b border-border bg-surface/80 backdrop-blur-md px-6">
@@ -41,7 +52,30 @@ export default function Navbar() {
         <span className="rounded-md border border-border bg-background px-2 py-1 text-xs font-mono text-text-muted">
           v0.1.0
         </span>
+        {!isLoginPage && (
+          <button
+            onClick={handleLogout}
+            title="Sign out of dashboard"
+            className="flex items-center gap-1.5 rounded-md border border-border/80 bg-background px-2.5 py-1 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-border transition-colors cursor-pointer"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="w-3.5 h-3.5 text-text-muted"
+            >
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <polyline points="16 17 21 12 16 7" />
+              <line x1="21" y1="12" x2="9" y2="12" />
+            </svg>
+            <span>Sign out</span>
+          </button>
+        )}
       </div>
     </nav>
   );
 }
+
