@@ -744,6 +744,7 @@ describe('Dashboard API Proxy & Authentication Integration', () => {
   // 13. Redirect handling rejects external destinations
   it('13. Redirect handling rejects external destinations and control characters', async () => {
     // Safe destinations
+    assert.equal(isSafeRedirect('/'), true);
     assert.equal(isSafeRedirect('/runs'), true);
     assert.equal(isSafeRedirect('/runs/test-run-123'), true);
     assert.equal(isSafeRedirect('/runs?status=failed'), true);
@@ -763,6 +764,16 @@ describe('Dashboard API Proxy & Authentication Integration', () => {
     assert.equal(proxyRes1.status, 307);
     const location1 = proxyRes1.headers.get('location');
     assert.ok(location1?.includes('/login?from=%2Fruns%2Frun-99'));
+
+    // Authenticated on /login with safe ?from=%2F redirects to / (Overview landing page)
+    const overviewRedirectReq = new NextRequest('http://localhost:3000/login?from=%2F', {
+      headers: {
+        Cookie: authCookieHeader,
+      },
+    });
+    const proxyResOverview = await proxy(overviewRedirectReq);
+    assert.equal(proxyResOverview.status, 307);
+    assert.equal(proxyResOverview.headers.get('location'), 'http://localhost:3000/');
 
     // Authenticated on /login with malicious ?from=https://evil.com
     const evilRedirectReq = new NextRequest('http://localhost:3000/login?from=https://evil.com', {
@@ -951,18 +962,19 @@ describe('Dashboard API Proxy & Authentication Integration', () => {
     const authedPageRes = await proxy(authedPageReq);
     assert.equal(authedPageRes.status, 200);
 
-    // 18f. Root path / redirects to /runs if authenticated, or /login if not
+    // 18f. Root path / is a protected route: redirects to /login?from=%2F when unauthenticated
     const rootUnauthed = new NextRequest('http://localhost:3000/');
     const rootUnauthedRes = await proxy(rootUnauthed);
     assert.equal(rootUnauthedRes.status, 307);
-    assert.ok(rootUnauthedRes.headers.get('location')?.includes('/login?from='));
+    assert.ok(rootUnauthedRes.headers.get('location')?.includes('/login?from=%2F'));
 
+    // Authenticated request to / is served directly (Overview landing page, not redirected to /runs)
     const rootAuthed = new NextRequest('http://localhost:3000/', {
       headers: { Cookie: authCookieHeader },
     });
     const rootAuthedRes = await proxy(rootAuthed);
-    assert.equal(rootAuthedRes.status, 307);
-    assert.equal(rootAuthedRes.headers.get('location'), 'http://localhost:3000/runs');
+    assert.equal(rootAuthedRes.status, 200);
+    assert.equal(rootAuthedRes.headers.get('location'), null);
 
     // 18g. Framework assets pass through
     const staticReq = new NextRequest('http://localhost:3000/_next/static/chunks/app.js');

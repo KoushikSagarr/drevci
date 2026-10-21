@@ -48,15 +48,7 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // 6. Root page handling
-  if (pathname === '/') {
-    if (authenticated) {
-      return NextResponse.redirect(new URL('/runs', request.url));
-    }
-    return NextResponse.redirect(new URL('/login?from=/runs', request.url));
-  }
-
-  // 7. Protected pages (/runs, /runs/[runId], etc.)
+  // 6. Protected pages (/, /runs, /runs/[runId], etc.)
   if (!authenticated) {
     const fromPath = pathname + (search || '');
     const redirectTarget = `/login?from=${encodeURIComponent(fromPath)}`;

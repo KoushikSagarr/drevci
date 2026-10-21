@@ -58,7 +58,7 @@ export default function Navbar() {
   return (
     <nav className="fixed top-0 left-0 right-0 z-50 flex h-14 items-center justify-between border-b border-border bg-surface/80 backdrop-blur-md px-6">
       <div className="flex items-center gap-6">
-        <Link href="/runs" className="flex items-center gap-2 font-bold text-white transition-opacity hover:opacity-80">
+        <Link href="/" className="flex items-center gap-2 font-bold text-white transition-opacity hover:opacity-80">
           <svg viewBox="0 0 24 24" fill="none" className="w-4 h-4 text-[#F97316]" aria-hidden="true">
             <line x1="5" y1="6" x2="19" y2="12" stroke="#F97316" strokeWidth="2" strokeLinecap="round" />
             <line x1="5" y1="18" x2="19" y2="12" stroke="#F97316" strokeWidth="2" strokeLinecap="round" />
@@ -70,6 +70,16 @@ export default function Navbar() {
         </Link>
         <div className="h-5 w-px bg-border" />
         <div className="flex items-center gap-1">
+          <Link
+            href="/"
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+              pathname === '/'
+                ? 'bg-border/50 text-text-primary'
+                : 'text-text-secondary hover:text-text-primary hover:bg-border/30'
+            }`}
+          >
+            Overview
+          </Link>
           <Link
             href="/runs"
             className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
