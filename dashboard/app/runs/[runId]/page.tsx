@@ -1,38 +1,39 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, use } from 'react';
+import Link from 'next/link';
 import { getRun, getRunJobs } from '../../../lib/api';
 import { Run, RunJob } from '../../../lib/types';
 import StatusBadge from '../../../components/StatusBadge';
 import LogViewer from '../../../components/LogViewer';
-import Link from 'next/link';
-import { use } from 'react';
+import LiveDuration from '../../../components/LiveDuration';
 
-function formatDuration(started: string, finished?: string) {
-  if (!started || started === '0001-01-01T00:00:00Z') return 'Pending...';
-  const start = new Date(started).getTime();
-  const end = (finished && finished !== '0001-01-01T00:00:00Z') ? new Date(finished).getTime() : Date.now();
-  const diff = Math.max(0, Math.floor((end - start) / 1000));
-  if (diff < 60) return `${diff}s`;
-  const m = Math.floor(diff / 60);
-  const s = diff % 60;
-  if (m < 60) return `${m}m ${s}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-function formatTimestamp(ts: string) {
-  if (!ts || ts === '0001-01-01T00:00:00Z') return '-';
+function formatTimestamp(ts?: string) {
+  if (!ts || ts === '0001-01-01T00:00:00Z') return '—';
   const d = new Date(ts);
-  return d.toLocaleString('en-US', { 
-    month: 'short', day: 'numeric', 
-    hour: '2-digit', minute: '2-digit', second: '2-digit', 
-    hour12: false 
+  if (isNaN(d.getTime())) return '—';
+  return d.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
   });
 }
 
 // --- Detail Card ---
-function DetailCard({ label, value, sub, color }: { label: string; value: string | number; sub?: string; color?: string }) {
+function DetailCard({
+  label,
+  value,
+  sub,
+  color,
+}: {
+  label: string;
+  value: React.ReactNode;
+  sub?: string;
+  color?: string;
+}) {
   return (
     <div className="flex flex-col rounded-lg border border-border bg-surface p-4">
       <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest mb-1">{label}</span>
@@ -44,6 +45,8 @@ function DetailCard({ label, value, sub, color }: { label: string; value: string
 
 // --- Job Timeline Item ---
 function JobItem({ job, index }: { job: RunJob; index: number }) {
+  const isLive = job.status === 'running';
+
   const statusIcon = {
     pending: '○',
     running: '◉',
@@ -63,28 +66,34 @@ function JobItem({ job, index }: { job: RunJob; index: number }) {
   return (
     <div className="flex gap-4">
       <div className="flex flex-col items-center w-8">
-        <div className={`w-8 h-8 rounded-full border-2 flex items-center justify-center font-bold shrink-0 transition-all ${colorClass}`}>
+        <div className={`w-8 h-8 rounded-full border-2 flex items-center justify-center font-bold shrink-0 transition-colors ${colorClass}`}>
           {statusIcon}
         </div>
         <div className="w-0.5 flex-1 bg-border/30 my-1" />
       </div>
 
-      <div className={`flex-1 rounded-lg border p-4 mb-4 transition-all ${
-        job.status === 'running' ? 'border-status-running/30 bg-status-running/5' : 'border-border bg-surface'
-      }`}>
+      <div
+        className={`flex-1 rounded-lg border p-4 mb-4 transition-colors ${
+          job.status === 'running' ? 'border-status-running/30 bg-status-running/5' : 'border-border bg-surface'
+        }`}
+      >
         <div className="flex items-center justify-between gap-4 mb-2">
           <div className="flex items-center gap-3">
             <span className="font-bold text-text-primary text-sm">{job.job_name}</span>
             <StatusBadge status={job.status} pulse={job.status === 'running'} />
           </div>
           <span className="font-mono text-xs text-text-muted bg-background px-2 py-1 rounded">
-            {formatDuration(job.started_at, job.finished_at)}
+            <LiveDuration startedAt={job.started_at} finishedAt={job.finished_at} isLive={isLive} />
           </span>
         </div>
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-text-muted font-mono uppercase tracking-tight">
-          <span>Step {index + 1}</span>
-          {job.started_at && <span>Started: {formatTimestamp(job.started_at)}</span>}
-          {job.finished_at && <span>Ended: {formatTimestamp(job.finished_at)}</span>}
+          <span>Job {index + 1}</span>
+          {job.started_at && job.started_at !== '0001-01-01T00:00:00Z' && (
+            <span>Started: {formatTimestamp(job.started_at)}</span>
+          )}
+          {job.finished_at && job.finished_at !== '0001-01-01T00:00:00Z' && (
+            <span>Ended: {formatTimestamp(job.finished_at)}</span>
+          )}
         </div>
       </div>
     </div>
@@ -97,7 +106,7 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   const [jobs, setJobs] = useState<RunJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
-  const [, setNow] = useState(0);
+  const [copiedSha, setCopiedSha] = useState(false);
 
   const status = run?.status;
 
@@ -131,10 +140,11 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
     };
   }, [runId, status, reloadKey]);
 
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
+  const copyCommitSha = (sha: string) => {
+    navigator.clipboard.writeText(sha);
+    setCopiedSha(true);
+    setTimeout(() => setCopiedSha(false), 2000);
+  };
 
   if (error && !run) {
     return (
@@ -173,22 +183,36 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   }
 
   const isLive = run.status === 'pending' || run.status === 'running';
-  const succeededCount = jobs.filter(j => j.status === 'success').length;
-  const failedCount = jobs.filter(j => j.status === 'failed').length;
+  const succeededCount = jobs.filter((j) => j.status === 'success').length;
+  const failedCount = jobs.filter((j) => j.status === 'failed').length;
 
   return (
     <div className="mx-auto max-w-6xl px-6 py-8 space-y-8">
-
       {/* Top Nav / Breadcrumbs */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-sm">
-          <Link href="/runs" className="text-text-muted hover:text-accent font-medium">Pipelines</Link>
+          <Link href="/runs" className="text-text-muted hover:text-accent font-medium transition-colors">
+            Pipelines
+          </Link>
           <span className="text-text-muted">/</span>
-          <span className="text-text-primary font-mono bg-surface px-2 py-0.5 rounded border border-border">{run.id.substring(0, 8)}</span>
+          <span className="text-text-primary font-mono bg-surface px-2 py-0.5 rounded border border-border">
+            {run.id.substring(0, 8)}
+          </span>
         </div>
         <div className="flex items-center gap-3">
-          <button className="text-xs font-medium text-text-muted hover:text-text-primary border border-border bg-surface px-3 py-1.5 rounded-md transition-colors">
-            ↻ Restart Run
+          {/* Restart Run button clearly disabled with explanatory state */}
+          <button
+            type="button"
+            disabled
+            aria-disabled="true"
+            title="Pipeline re-runs are not yet supported in this version"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-text-muted border border-border/60 bg-surface/40 px-3 py-1.5 rounded-md opacity-50 cursor-not-allowed select-none"
+          >
+            <span>↻</span>
+            <span>Restart Run</span>
+            <span className="text-[10px] text-text-muted/70 bg-background/50 px-1 rounded border border-border/40">
+              Not yet supported
+            </span>
           </button>
         </div>
       </div>
@@ -199,62 +223,136 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-8">
             <div className="space-y-4">
               <div className="flex items-center gap-4">
-                <h1 className="text-3xl font-black text-text-primary tracking-tight uppercase">{run.pipeline_id}</h1>
+                <h1 className="text-3xl font-black text-text-primary tracking-tight uppercase">
+                  {run.pipeline_id}
+                </h1>
                 <StatusBadge status={run.status} pulse={isLive} />
               </div>
-              <div className="flex items-center gap-6">
+
+              {/* Real Run Metadata — no fabricated fields */}
+              <div className="flex flex-wrap items-center gap-6">
                 <div className="flex flex-col">
-                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">Triggered</span>
-                  <span className="text-sm font-medium text-text-secondary">{formatTimestamp(run.started_at)}</span>
+                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
+                    Triggered
+                  </span>
+                  <span className="text-sm font-medium text-text-secondary">
+                    {formatTimestamp(run.started_at)}
+                  </span>
                 </div>
-                <div className="h-8 w-px bg-border" />
+
+                <div className="h-8 w-px bg-border hidden sm:block" />
+
                 <div className="flex flex-col">
-                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">Environment</span>
-                  <span className="text-sm font-medium text-text-secondary">Production</span>
+                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
+                    Trigger Source
+                  </span>
+                  <span className="text-sm font-medium text-text-secondary">
+                    {run.triggered_by || 'Not specified'}
+                  </span>
                 </div>
-                <div className="h-8 w-px bg-border" />
+
+                <div className="h-8 w-px bg-border hidden sm:block" />
+
                 <div className="flex flex-col">
-                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">Branch</span>
-                  <span className="text-sm font-mono text-text-secondary">main</span>
+                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
+                    Branch
+                  </span>
+                  <span className="text-sm font-mono text-text-secondary">
+                    {run.branch || 'Unknown branch'}
+                  </span>
+                </div>
+
+                <div className="h-8 w-px bg-border hidden sm:block" />
+
+                <div className="flex flex-col">
+                  <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest">
+                    Commit
+                  </span>
+                  {run.commit_sha ? (
+                    <div className="flex items-center gap-1.5" title={run.commit_msg || run.commit_sha}>
+                      <span className="text-sm font-mono text-text-secondary">
+                        {run.commit_sha.substring(0, 7)}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => copyCommitSha(run.commit_sha!)}
+                        title="Copy full commit SHA"
+                        className="text-[11px] text-text-muted hover:text-text-primary px-1 py-0.5 rounded bg-background border border-border/60 transition-colors"
+                      >
+                        {copiedSha ? '✓' : '⎘'}
+                      </button>
+                    </div>
+                  ) : (
+                    <span className="text-sm font-mono text-text-muted">Not available</span>
+                  )}
                 </div>
               </div>
             </div>
-            
+
             <div className="grid grid-cols-2 gap-4 shrink-0">
-              <DetailCard label="Run Duration" value={formatDuration(run.started_at, run.finished_at)} color="text-accent" />
-              <DetailCard label="Job Success" value={`${succeededCount}/${jobs.length}`} color={failedCount > 0 ? 'text-status-failed' : 'text-status-success'} sub="jobs passed" />
+              <DetailCard
+                label="Run Duration"
+                value={
+                  <LiveDuration
+                    startedAt={run.started_at}
+                    finishedAt={run.finished_at}
+                    isLive={isLive}
+                    className="text-accent"
+                  />
+                }
+              />
+              <DetailCard
+                label="Job Success"
+                value={`${succeededCount}/${jobs.length}`}
+                color={failedCount > 0 ? 'text-status-failed' : 'text-status-success'}
+                sub="jobs passed"
+              />
             </div>
           </div>
         </div>
       </div>
 
+      {/* Failure Callout Banner when pipeline failed */}
+      {run.status === 'failed' && (
+        <div className="rounded-lg border border-status-failed/40 bg-status-failed/10 p-4 text-sm text-text-primary flex items-start gap-3">
+          <span className="text-status-failed text-lg leading-none font-bold">⚠</span>
+          <div>
+            <h4 className="font-semibold text-status-failed">Pipeline run failed</h4>
+            <p className="text-xs text-text-muted mt-0.5">
+              {failedCount > 0
+                ? `${failedCount} of ${jobs.length} jobs failed. Check console output below for error details.`
+                : 'Execution failed. Check console output below for failure details.'}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Content Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: Job Timeline */}
         <div className="lg:col-span-1 space-y-4">
-          <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">Pipeline Execution</h3>
+          <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">
+            Pipeline Jobs ({jobs.length})
+          </h3>
           <div className="space-y-0">
             {jobs.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-48 border border-dashed border-border rounded-lg text-text-muted text-sm italic">
                 No jobs registered for this run.
               </div>
             ) : (
-              jobs.map((job, i) => (
-                <JobItem key={job.id} job={job} index={i} />
-              ))
+              jobs.map((job, i) => <JobItem key={job.id} job={job} index={i} />)
             )}
           </div>
         </div>
 
-        {/* Right: Build Output / Logs */}
+        {/* Right: Console Logs */}
         <div className="lg:col-span-2 space-y-4">
-          <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">Console Output</h3>
+          <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">
+            Console Output
+          </h3>
           <LogViewer runId={runId} isLive={isLive} />
-          
-
         </div>
       </div>
-
     </div>
   );
 }

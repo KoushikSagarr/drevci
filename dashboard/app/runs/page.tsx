@@ -6,19 +6,8 @@ import { useRouter } from 'next/navigation';
 import { getRuns, getQueueStatus, QueueStatus } from '../../lib/api';
 import { Run, RunStatus } from '../../lib/types';
 import StatusBadge from '../../components/StatusBadge';
+import LiveDuration from '../../components/LiveDuration';
 
-function formatDuration(started: string, finished?: string) {
-  if (!started || started === '0001-01-01T00:00:00Z') return 'Pending...';
-  const start = new Date(started).getTime();
-  const end = (finished && finished !== '0001-01-01T00:00:00Z') ? new Date(finished).getTime() : Date.now();
-  const diff = Math.max(0, Math.floor((end - start) / 1000));
-  if (diff < 60) return `${diff}s`;
-  const m = Math.floor(diff / 60);
-  const s = diff % 60;
-  if (m < 60) return `${m}m ${s}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
 
 function timeAgo(dateStr: string) {
   if (!dateStr || dateStr === '0001-01-01T00:00:00Z') return '-';
@@ -65,7 +54,6 @@ export default function RunsPage() {
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<RunStatus | 'all'>('all');
   const [reloadKey, setReloadKey] = useState(0);
-  const [, setNow] = useState(0);
 
   useEffect(() => {
     let isCancelled = false;
@@ -112,11 +100,6 @@ export default function RunsPage() {
       clearInterval(q);
     };
   }, [reloadKey]);
-
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
 
   // --- Filtering ---
   const filteredRuns = useMemo(() => {
@@ -306,7 +289,11 @@ export default function RunsPage() {
                       {timeAgo(run.started_at)}
                     </td>
                     <td className="px-5 py-3.5 font-mono text-xs text-text-secondary">
-                      {formatDuration(run.started_at, run.finished_at)}
+                      <LiveDuration
+                        startedAt={run.started_at}
+                        finishedAt={run.finished_at}
+                        isLive={run.status === 'running' || run.status === 'pending'}
+                      />
                     </td>
                     <td className="px-5 py-3.5 text-right" onClick={(e) => e.stopPropagation()}>
                       <Link

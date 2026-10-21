@@ -15,6 +15,12 @@ export interface QueueStatus {
   status: string;
 }
 
+export interface HealthStatus {
+  status: 'ok' | string;
+  version: string;
+  notifications_enabled?: boolean;
+}
+
 function getBaseUrl(): string {
   if (typeof window !== 'undefined') {
     return '';
@@ -81,6 +87,15 @@ export async function getRunJobs(id: string): Promise<RunJob[]> {
 
 export async function getQueueStatus(): Promise<QueueStatus> {
   const res = await fetch(`${getBaseUrl()}/api/v1/queue`, {
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+  });
+  await handleApiResponse(res);
+  return res.json();
+}
+
+export async function getHealth(): Promise<HealthStatus> {
+  const res = await fetch(`${getBaseUrl()}/api/v1/health`, {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });

@@ -1,12 +1,50 @@
 'use client';
 
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
+import { getHealth } from '../lib/api';
+
+type EngineHealth = 'loading' | 'healthy' | 'unavailable';
 
 export default function Navbar() {
   const pathname = usePathname();
   const router = useRouter();
   const isLoginPage = pathname === '/login';
+
+  const [healthStatus, setHealthStatus] = useState<EngineHealth>('loading');
+  const [engineVersion, setEngineVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function checkHealth() {
+      try {
+        const data = await getHealth();
+        if (isMounted) {
+          if (data && data.status === 'ok') {
+            setHealthStatus('healthy');
+            setEngineVersion(data.version || null);
+          } else {
+            setHealthStatus('unavailable');
+          }
+        }
+      } catch {
+        if (isMounted) {
+          setHealthStatus('unavailable');
+        }
+      }
+    }
+
+    checkHealth();
+    // Poll conservatively every 20 seconds
+    const interval = setInterval(checkHealth, 20000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   async function handleLogout() {
     try {
@@ -45,12 +83,38 @@ export default function Navbar() {
         </div>
       </div>
       <div className="flex items-center gap-3">
-        <div className="flex items-center gap-1.5 rounded-full border border-border bg-background px-2.5 py-1">
-          <span className="inline-block h-2 w-2 rounded-full bg-status-success" />
-          <span className="text-xs font-medium text-text-secondary">Online</span>
+        <div
+          className="flex items-center gap-1.5 rounded-full border border-border bg-background px-2.5 py-1"
+          title={
+            healthStatus === 'healthy'
+              ? 'Drev engine is healthy and reachable'
+              : healthStatus === 'unavailable'
+              ? 'Drev engine is unreachable or unhealthy'
+              : 'Checking engine health...'
+          }
+        >
+          <span
+            className={`inline-block h-2 w-2 rounded-full ${
+              healthStatus === 'healthy'
+                ? 'bg-status-success'
+                : healthStatus === 'unavailable'
+                ? 'bg-status-failed'
+                : 'bg-status-pending animate-pulse'
+            }`}
+          />
+          <span className="text-xs font-medium text-text-secondary">
+            {healthStatus === 'healthy'
+              ? 'Online'
+              : healthStatus === 'unavailable'
+              ? 'Offline'
+              : 'Checking...'}
+          </span>
         </div>
-        <span className="rounded-md border border-border bg-background px-2 py-1 text-xs font-mono text-text-muted">
-          v0.1.0
+        <span
+          className="rounded-md border border-border bg-background px-2 py-1 text-xs font-mono text-text-muted"
+          title="Drev Engine Version"
+        >
+          {engineVersion ? `v${engineVersion}` : '—'}
         </span>
         {!isLoginPage && (
           <button
