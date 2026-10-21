@@ -93,9 +93,18 @@ The Next.js dashboard enforces a self-hosted authentication boundary around all 
    - Timing-safe password comparison prevents timing side-channel attacks.
    - **Fail-Closed Configuration**: In production, missing or invalid authentication credentials (`DASHBOARD_PASSWORD` or `DASHBOARD_SESSION_SECRET`), secret lengths under 32 characters, or credential reuse (`DASHBOARD_PASSWORD == DREV_TOKEN`) cause the authentication service to fail closed (500 Internal Error) rather than running unauthenticated.
 
-4. **Network Exposure Mitigation**:
-   - By default, `docker-compose.yml` binds the dashboard to loopback (`127.0.0.1:3000`).
-   - When exposed across external networks or public domains, use HTTPS termination (e.g., Caddy, Nginx, or Traefik) and ensure `DASHBOARD_COOKIE_SECURE=true` (or `NODE_ENV=production`).
+4. **Network Exposure, Cookie Security, & Rate Limiting**:
+   - **Production Cookie Security Defaults**: In production (`NODE_ENV=production`), session cookies default to `Secure=true` whenever `DASHBOARD_COOKIE_SECURE` is absent, empty, or set to `true`. Production HTTPS deployments cannot silently inherit `Secure=false`.
+   - **Local HTTP Development Flow**: To allow local loopback HTTP testing on `http://127.0.0.1:3000` without browsers rejecting cookies, `.env.example` documents a deliberate, explicit opt-out (`# DASHBOARD_COOKIE_SECURE=false`). Uncomment this setting only for local non-HTTPS development. When omitted or commented out, production HTTPS deployments safely default to `Secure=true`.
+   - **Trusted Proxy Rate Limiting (`DASHBOARD_TRUST_PROXY`)**:
+     - By default (`false`), the rate limiter strictly ignores client-supplied `X-Forwarded-For` and `X-Real-IP` headers to prevent spoofed brute-force bypasses, grouping direct connections into a process-local `'direct-operator'` bucket.
+     - *Operational consequence*: If an attacker triggers 5 failed login attempts directly against the container, the login endpoint locks for 5 minutes for that process. This provides fail-safe brute-force protection for single-operator deployments.
+     - To isolate rate-limiting buckets per remote client IP without shared lockout risk, place the dashboard behind an authenticating or TLS-terminating reverse proxy configured to strip untrusted headers, and set `DASHBOARD_TRUST_PROXY=true`.
+
+5. **Stateless Session Token Revocation Boundary**:
+   - Dashboard sessions are fully self-hosted and stateless; they are validated via HMAC-SHA256 signatures containing an embedded expiration timestamp (`exp`).
+   - **Notice on Copied Tokens**: Logging out clears the `drev_session` cookie in the user's browser with `Max-Age=0` and `Expires=Thu, 01 Jan 1970 00:00:00 GMT`. However, because no server-side revocation database is maintained, a token that was previously copied or exfiltrated remains cryptographically valid until its 24-hour expiration timestamp expires.
+   - **Emergency Global Revocation**: In the event of suspected session secret or token compromise, rotating `DASHBOARD_SESSION_SECRET` immediately and globally invalidates all previously issued session tokens across all clients.
 
 ---
 

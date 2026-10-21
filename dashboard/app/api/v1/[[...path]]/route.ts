@@ -121,6 +121,34 @@ export async function POST(
   return proxyRequest(request, context);
 }
 
+export async function PUT(
+  request: Request,
+  context: { params: Promise<{ path?: string[] }> }
+) {
+  return proxyRequest(request, context);
+}
+
+export async function DELETE(
+  request: Request,
+  context: { params: Promise<{ path?: string[] }> }
+) {
+  return proxyRequest(request, context);
+}
+
+export async function PATCH(
+  request: Request,
+  context: { params: Promise<{ path?: string[] }> }
+) {
+  return proxyRequest(request, context);
+}
+
+export async function HEAD(
+  request: Request,
+  context: { params: Promise<{ path?: string[] }> }
+) {
+  return proxyRequest(request, context);
+}
+
 export async function OPTIONS(
   request: Request,
   context: { params: Promise<{ path?: string[] }> }
@@ -141,7 +169,7 @@ export async function OPTIONS(
   const host = request.headers.get('host');
   const origin = request.headers.get('origin');
   const headers = new Headers();
-  headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS');
   headers.set('Access-Control-Allow-Headers', 'Content-Type');
 
   if (origin && host) {

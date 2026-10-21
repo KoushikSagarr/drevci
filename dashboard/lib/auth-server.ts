@@ -49,12 +49,22 @@ export function getAuthConfigStatus(): AuthConfigStatus {
   if (secret.length < MIN_SECRET_LENGTH) {
     return { ok: false, reason: `DASHBOARD_SESSION_SECRET must be at least ${MIN_SECRET_LENGTH} characters long` };
   }
+
+  // Reject secret reuse between password and session secret
+  if (password === secret) {
+    return { ok: false, reason: 'DASHBOARD_PASSWORD and DASHBOARD_SESSION_SECRET must not be identical' };
+  }
+
+  // Reject secret reuse with any daemon tokens
   if (daemonToken) {
-    if (password === daemonToken) {
-      return { ok: false, reason: 'DASHBOARD_PASSWORD must not be identical to DREV_TOKEN' };
-    }
-    if (secret === daemonToken) {
-      return { ok: false, reason: 'DASHBOARD_SESSION_SECRET must not be identical to DREV_TOKEN' };
+    const daemonTokens = daemonToken.split(',').map((t) => t.trim()).filter(Boolean);
+    for (const dt of daemonTokens) {
+      if (password === dt) {
+        return { ok: false, reason: 'DASHBOARD_PASSWORD must not be identical to DREV_TOKEN' };
+      }
+      if (secret === dt) {
+        return { ok: false, reason: 'DASHBOARD_SESSION_SECRET must not be identical to DREV_TOKEN' };
+      }
     }
   }
 
@@ -62,9 +72,15 @@ export function getAuthConfigStatus(): AuthConfigStatus {
 }
 
 export function isCookieSecure(): boolean {
-  if (process.env.DASHBOARD_COOKIE_SECURE !== undefined) {
-    return process.env.DASHBOARD_COOKIE_SECURE === 'true';
+  const raw = process.env.DASHBOARD_COOKIE_SECURE?.trim().toLowerCase();
+  if (raw === 'true') {
+    return true;
   }
+  if (raw === 'false') {
+    return false;
+  }
+  // When absent, undefined, or empty string, default strictly based on environment:
+  // Production defaults to true (Secure=true). Development defaults to false.
   return process.env.NODE_ENV === 'production';
 }
 
@@ -250,12 +266,16 @@ export function createSessionCookieHeader(token: string): string {
 
 export function clearSessionCookieHeader(): string {
   const secure = isCookieSecure() ? '; Secure' : '';
-  return `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`;
+  return `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure}`;
 }
 
 // --- Safe Redirect Validation ---
 export function isSafeRedirect(target: unknown): boolean {
   if (typeof target !== 'string' || !target) return false;
+  // Prevent control characters, line breaks, or null bytes
+  if (/[\r\n\0\t]/.test(target)) {
+    return false;
+  }
   // Must start with a single /
   if (!target.startsWith('/') || target.startsWith('//') || target.startsWith('/\\')) {
     return false;
@@ -279,13 +299,22 @@ export function validateStateChangingOrigin(req: Request): boolean {
     return true;
   }
 
+  // Check Sec-Fetch-Site: if browser explicitly declares request is cross-site, reject
+  const secFetchSite = req.headers.get('sec-fetch-site');
+  if (secFetchSite === 'cross-site') {
+    return false;
+  }
+
   const host = req.headers.get('host');
-  if (!host) {
+  if (!host || /[\r\n\0]/.test(host)) {
     return false;
   }
 
   const origin = req.headers.get('origin');
   if (origin) {
+    if (origin === 'null' || /[\r\n\0]/.test(origin)) {
+      return false;
+    }
     try {
       const originUrl = new URL(origin);
       return originUrl.host.toLowerCase() === host.toLowerCase();
@@ -296,6 +325,9 @@ export function validateStateChangingOrigin(req: Request): boolean {
 
   const referer = req.headers.get('referer');
   if (referer) {
+    if (/[\r\n\0]/.test(referer)) {
+      return false;
+    }
     try {
       const refererUrl = new URL(referer);
       return refererUrl.host.toLowerCase() === host.toLowerCase();
@@ -304,8 +336,8 @@ export function validateStateChangingOrigin(req: Request): boolean {
     }
   }
 
-  // If both Origin and Referer are absent on a state-changing browser request,
-  // allow non-browser API clients only if Origin wasn't sent, but reject if header was tampered.
+  // If neither Origin nor Referer is present, permit non-browser / direct API clients,
+  // provided Sec-Fetch-Site was not cross-site.
   return true;
 }
 
@@ -332,12 +364,21 @@ function pruneExpiredEntries(): void {
 }
 
 export function getClientIdentifier(req: Request): string {
-  // Never trust arbitrary X-Forwarded-For unless explicitly configured
+  // Never trust arbitrary client-supplied headers without explicit trusted-proxy configuration
   if (process.env.DASHBOARD_TRUST_PROXY === 'true') {
+    // 1. Prefer X-Real-IP if established by trusted reverse proxy
+    const realIp = req.headers.get('x-real-ip')?.trim();
+    if (realIp && !realIp.includes(',')) {
+      return realIp;
+    }
+
+    // 2. In X-Forwarded-For behind a trusted proxy, take the rightmost hop (added by the nearest trusted proxy)
     const forwarded = req.headers.get('x-forwarded-for');
     if (forwarded) {
       const ips = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
-      if (ips.length > 0) return ips[0];
+      if (ips.length > 0) {
+        return ips[ips.length - 1];
+      }
     }
   }
   return 'direct-operator';
