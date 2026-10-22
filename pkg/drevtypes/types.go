@@ -71,6 +71,21 @@ type RunJob struct {
 	FinishedAt time.Time `json:"finished_at"`
 }
 
+// RunStats contains aggregated operational metrics over a recent sample of runs.
+type RunStats struct {
+	SampleLimit          int       `json:"sample_limit"`
+	CompletedSampleCount int       `json:"completed_sample_count"`
+	DurationSampleCount  int       `json:"duration_sample_count"`
+	SucceededCount       int       `json:"succeeded_count"`
+	FailedCount          int       `json:"failed_count"`
+	CancelledCount       int       `json:"cancelled_count"`
+	PassRate             *int      `json:"pass_rate"`         // 0-100 percentage, or nil if completed_sample_count == 0
+	MeanDurationSec      *int      `json:"mean_duration_sec"` // mean duration in seconds, or nil if duration_sample_count == 0
+	RecentFailures       []*Run    `json:"recent_failures"`
+	ActiveRunsCount      int       `json:"active_runs_count"`
+	TotalRunsCount       int       `json:"total_runs_count"`
+}
+
 // ─── Multi-tenant SaaS types ─────────────────────────────────────────────────
 
 // Org represents a tenant (customer organization).

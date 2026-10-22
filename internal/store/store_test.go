@@ -3,7 +3,9 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -386,5 +388,296 @@ func TestResetGhostRuns(t *testing.T) {
 	}
 	if len(interrupted2) != 0 {
 		t.Errorf("expected 0 interrupted runs on repeated call, got: %v", interrupted2)
+	}
+}
+
+func TestSQLiteStore_Indexes(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "indexes.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Verify required indexes exist in sqlite_master
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("re-opening sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	expectedIndexes := []string{
+		"idx_runs_created_at",
+		"idx_runs_status_created_at",
+		"idx_run_jobs_run_id",
+	}
+
+	for _, idx := range expectedIndexes {
+		var name string
+		err := db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", idx).Scan(&name)
+		if err != nil {
+			t.Errorf("expected index %s to exist in sqlite_master, got err: %v", idx, err)
+		}
+	}
+
+	// Verify query plan uses index for run_jobs by run_id
+	var qpSelectID, qpOrder, qpFrom int
+	var qpDetail string
+	err = db.QueryRowContext(ctx, "EXPLAIN QUERY PLAN SELECT * FROM run_jobs WHERE run_id = ?", "test-run").Scan(&qpSelectID, &qpOrder, &qpFrom, &qpDetail)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN failed: %v", err)
+	}
+	if !strings.Contains(qpDetail, "idx_run_jobs_run_id") {
+		t.Errorf("expected query plan to use idx_run_jobs_run_id, got: %s", qpDetail)
+	}
+}
+
+func TestSQLiteStore_GetRunStats_Empty(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty_stats.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	stats, err := s.GetRunStats(context.Background(), "", 25)
+	if err != nil {
+		t.Fatalf("GetRunStats() error = %v", err)
+	}
+
+	if stats.CompletedSampleCount != 0 {
+		t.Errorf("CompletedSampleCount = %d, want 0", stats.CompletedSampleCount)
+	}
+	if stats.DurationSampleCount != 0 {
+		t.Errorf("DurationSampleCount = %d, want 0", stats.DurationSampleCount)
+	}
+	if stats.PassRate != nil {
+		t.Errorf("PassRate = %v, want nil", *stats.PassRate)
+	}
+	if stats.MeanDurationSec != nil {
+		t.Errorf("MeanDurationSec = %v, want nil", *stats.MeanDurationSec)
+	}
+	if stats.ActiveRunsCount != 0 {
+		t.Errorf("ActiveRunsCount = %d, want 0", stats.ActiveRunsCount)
+	}
+	if stats.TotalRunsCount != 0 {
+		t.Errorf("TotalRunsCount = %d, want 0", stats.TotalRunsCount)
+	}
+	if len(stats.RecentFailures) != 0 {
+		t.Errorf("RecentFailures = %v, want empty", stats.RecentFailures)
+	}
+}
+
+func TestSQLiteStore_GetRunStats_Mixed(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "mixed_stats.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	baseTime := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+
+	// 1. Success, 30s
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r1",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusSuccess,
+		StartedAt:  baseTime,
+		FinishedAt: baseTime.Add(30 * time.Second),
+	})
+	// 2. Success, 60s
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r2",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusSuccess,
+		StartedAt:  baseTime.Add(1 * time.Minute),
+		FinishedAt: baseTime.Add(2 * time.Minute),
+	})
+	// 3. Failed, 20s
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r3",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusFailed,
+		StartedAt:  baseTime.Add(3 * time.Minute),
+		FinishedAt: baseTime.Add(3*time.Minute + 20*time.Second),
+	})
+	// 4. Cancelled, 10s
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r4",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusCancelled,
+		StartedAt:  baseTime.Add(4 * time.Minute),
+		FinishedAt: baseTime.Add(4*time.Minute + 10*time.Second),
+	})
+	// 5. Running
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r5",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusRunning,
+		StartedAt:  baseTime.Add(5 * time.Minute),
+	})
+	// 6. Pending
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "r6",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	})
+
+	stats, err := s.GetRunStats(ctx, "", 25)
+	if err != nil {
+		t.Fatalf("GetRunStats() error = %v", err)
+	}
+
+	if stats.TotalRunsCount != 6 {
+		t.Errorf("TotalRunsCount = %d, want 6", stats.TotalRunsCount)
+	}
+	if stats.ActiveRunsCount != 2 {
+		t.Errorf("ActiveRunsCount = %d, want 2", stats.ActiveRunsCount)
+	}
+	if stats.CompletedSampleCount != 4 {
+		t.Errorf("CompletedSampleCount = %d, want 4", stats.CompletedSampleCount)
+	}
+	if stats.SucceededCount != 2 {
+		t.Errorf("SucceededCount = %d, want 2", stats.SucceededCount)
+	}
+	if stats.FailedCount != 1 {
+		t.Errorf("FailedCount = %d, want 1", stats.FailedCount)
+	}
+	if stats.CancelledCount != 1 {
+		t.Errorf("CancelledCount = %d, want 1", stats.CancelledCount)
+	}
+	if stats.PassRate == nil || *stats.PassRate != 50 {
+		t.Errorf("PassRate = %v, want 50", stats.PassRate)
+	}
+	// Total duration: 30 + 60 + 20 + 10 = 120s / 4 = 30s
+	if stats.DurationSampleCount != 4 {
+		t.Errorf("DurationSampleCount = %d, want 4", stats.DurationSampleCount)
+	}
+	if stats.MeanDurationSec == nil || *stats.MeanDurationSec != 30 {
+		t.Errorf("MeanDurationSec = %v, want 30", stats.MeanDurationSec)
+	}
+	if len(stats.RecentFailures) != 1 || stats.RecentFailures[0].ID != "r3" {
+		t.Errorf("RecentFailures = %+v, want r3", stats.RecentFailures)
+	}
+}
+
+func TestSQLiteStore_GetRunStats_InvalidTimestamps(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "invalid_timestamps.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	baseTime := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+
+	// 1. Valid success: 40s
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "valid-s",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusSuccess,
+		StartedAt:  baseTime,
+		FinishedAt: baseTime.Add(40 * time.Second),
+	})
+	// 2. Failed with missing finish timestamp (e.g. runner crash)
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "crashed-f",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusFailed,
+		StartedAt:  baseTime.Add(1 * time.Minute),
+	})
+	// 3. Failed with inverted timestamp (finished before started)
+	_ = s.CreateRun(ctx, &drevtypes.Run{
+		ID:         "inverted-f",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusFailed,
+		StartedAt:  baseTime.Add(2 * time.Minute),
+		FinishedAt: baseTime.Add(1 * time.Minute),
+	})
+
+	stats, err := s.GetRunStats(ctx, "", 25)
+	if err != nil {
+		t.Fatalf("GetRunStats() error = %v", err)
+	}
+
+	// Pass-rate denominator must include all 3 terminal runs
+	if stats.CompletedSampleCount != 3 {
+		t.Errorf("CompletedSampleCount = %d, want 3", stats.CompletedSampleCount)
+	}
+	if stats.SucceededCount != 1 || stats.FailedCount != 2 {
+		t.Errorf("SucceededCount = %d, FailedCount = %d, want 1 and 2", stats.SucceededCount, stats.FailedCount)
+	}
+	// 1 / 3 = 33%
+	if stats.PassRate == nil || *stats.PassRate != 33 {
+		t.Errorf("PassRate = %v, want 33", stats.PassRate)
+	}
+
+	// Duration calculation must only average the 1 valid timed run
+	if stats.DurationSampleCount != 1 {
+		t.Errorf("DurationSampleCount = %d, want 1", stats.DurationSampleCount)
+	}
+	if stats.MeanDurationSec == nil || *stats.MeanDurationSec != 40 {
+		t.Errorf("MeanDurationSec = %v, want 40", stats.MeanDurationSec)
+	}
+
+	// Recent failures must include both crashed and inverted failures
+	if len(stats.RecentFailures) != 2 {
+		t.Errorf("len(RecentFailures) = %d, want 2", len(stats.RecentFailures))
+	}
+}
+
+func TestSQLiteStore_GetRunStats_SampleLimit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sample_limit.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	baseTime := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+
+	// Create 40 runs: oldest 10 failed, newest 30 success
+	for i := 0; i < 40; i++ {
+		st := drevtypes.StatusSuccess
+		if i < 10 {
+			st = drevtypes.StatusFailed
+		}
+		_ = s.CreateRun(ctx, &drevtypes.Run{
+			ID:         fmt.Sprintf("run-%02d", i),
+			PipelineID: "batch",
+			Status:     st,
+			StartedAt:  baseTime.Add(time.Duration(i) * time.Minute),
+			FinishedAt: baseTime.Add(time.Duration(i)*time.Minute + 30*time.Second),
+		})
+	}
+
+	// Default sample limit 25 evaluates the last 25 created runs (all success)
+	stats25, err := s.GetRunStats(ctx, "", 25)
+	if err != nil {
+		t.Fatalf("GetRunStats(25) error = %v", err)
+	}
+	if stats25.CompletedSampleCount != 25 {
+		t.Errorf("CompletedSampleCount = %d, want 25", stats25.CompletedSampleCount)
+	}
+	if stats25.PassRate == nil || *stats25.PassRate != 100 {
+		t.Errorf("PassRate = %v, want 100", stats25.PassRate)
+	}
+
+	// Sample limit 35 takes the last 35 (30 success, 5 failed) -> 30/35 = 86%
+	stats35, err := s.GetRunStats(ctx, "", 35)
+	if err != nil {
+		t.Fatalf("GetRunStats(35) error = %v", err)
+	}
+	if stats35.CompletedSampleCount != 35 {
+		t.Errorf("CompletedSampleCount = %d, want 35", stats35.CompletedSampleCount)
+	}
+	if stats35.PassRate == nil || *stats35.PassRate != 86 {
+		t.Errorf("PassRate = %v, want 86", stats35.PassRate)
 	}
 }

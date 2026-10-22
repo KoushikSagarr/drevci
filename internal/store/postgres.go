@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
@@ -407,4 +408,161 @@ func (s *PostgresStore) GetMonthlyUsage(ctx context.Context, orgID string) (int,
 		orgID,
 	).Scan(&count)
 	return count, err
+}
+
+func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error) {
+	if sampleLimit <= 0 {
+		sampleLimit = 25
+	}
+	if sampleLimit > 100 {
+		sampleLimit = 100
+	}
+
+	var (
+		termRows *sql.Rows
+		err      error
+	)
+	if orgID != "" {
+		termRows, err = s.db.QueryContext(ctx, `
+			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
+			       commit_sha, commit_msg, branch, started_at, finished_at
+			FROM runs
+			WHERE org_id = $1 AND status IN ('success', 'failed', 'cancelled')
+			ORDER BY created_at DESC
+			LIMIT $2`, orgID, sampleLimit)
+	} else {
+		termRows, err = s.db.QueryContext(ctx, `
+			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
+			       commit_sha, commit_msg, branch, started_at, finished_at
+			FROM runs
+			WHERE status IN ('success', 'failed', 'cancelled')
+			ORDER BY created_at DESC
+			LIMIT $1`, sampleLimit)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying terminal runs: %w", err)
+	}
+	defer termRows.Close()
+
+	var (
+		succeededCount      int
+		failedCount         int
+		cancelledCount      int
+		durationSampleCount int
+		totalDurationSec    float64
+	)
+
+	for termRows.Next() {
+		r, err := scanPgRun(termRows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning terminal run: %w", err)
+		}
+		switch r.Status {
+		case drevtypes.StatusSuccess:
+			succeededCount++
+		case drevtypes.StatusFailed:
+			failedCount++
+		case drevtypes.StatusCancelled:
+			cancelledCount++
+		}
+		if !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
+			durationSampleCount++
+			totalDurationSec += r.FinishedAt.Sub(r.StartedAt).Seconds()
+		}
+	}
+	if err := termRows.Err(); err != nil {
+		return nil, fmt.Errorf("reading terminal runs: %w", err)
+	}
+
+	completedSampleCount := succeededCount + failedCount + cancelledCount
+
+	var passRate *int
+	if completedSampleCount > 0 {
+		pr := int(math.Round(float64(succeededCount) / float64(completedSampleCount) * 100.0))
+		passRate = &pr
+	}
+
+	var meanDurationSec *int
+	if durationSampleCount > 0 {
+		avg := int(math.Round(totalDurationSec / float64(durationSampleCount)))
+		meanDurationSec = &avg
+	}
+
+	// Recent failures
+	var failRows *sql.Rows
+	if orgID != "" {
+		failRows, err = s.db.QueryContext(ctx, `
+			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
+			       commit_sha, commit_msg, branch, started_at, finished_at
+			FROM runs
+			WHERE org_id = $1 AND status = 'failed'
+			ORDER BY created_at DESC
+			LIMIT 5`, orgID)
+	} else {
+		failRows, err = s.db.QueryContext(ctx, `
+			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
+			       commit_sha, commit_msg, branch, started_at, finished_at
+			FROM runs
+			WHERE status = 'failed'
+			ORDER BY created_at DESC
+			LIMIT 5`)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying recent failures: %w", err)
+	}
+	defer failRows.Close()
+
+	recentFailures := make([]*drevtypes.Run, 0)
+	for failRows.Next() {
+		r, err := scanPgRun(failRows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning recent failure: %w", err)
+		}
+		recentFailures = append(recentFailures, r)
+	}
+	if err := failRows.Err(); err != nil {
+		return nil, fmt.Errorf("reading recent failures: %w", err)
+	}
+
+	// Active runs
+	var activeQuery string
+	var activeArgs []interface{}
+	if orgID != "" {
+		activeQuery = `SELECT COUNT(*) FROM runs WHERE org_id = $1 AND status IN ('running', 'pending')`
+		activeArgs = []interface{}{orgID}
+	} else {
+		activeQuery = `SELECT COUNT(*) FROM runs WHERE status IN ('running', 'pending')`
+	}
+	var activeRunsCount int
+	if err := s.db.QueryRowContext(ctx, activeQuery, activeArgs...).Scan(&activeRunsCount); err != nil {
+		return nil, fmt.Errorf("counting active runs: %w", err)
+	}
+
+	// Total runs
+	var totalQuery string
+	var totalArgs []interface{}
+	if orgID != "" {
+		totalQuery = `SELECT COUNT(*) FROM runs WHERE org_id = $1`
+		totalArgs = []interface{}{orgID}
+	} else {
+		totalQuery = `SELECT COUNT(*) FROM runs`
+	}
+	var totalRunsCount int
+	if err := s.db.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(&totalRunsCount); err != nil {
+		return nil, fmt.Errorf("counting total runs: %w", err)
+	}
+
+	return &drevtypes.RunStats{
+		SampleLimit:          sampleLimit,
+		CompletedSampleCount: completedSampleCount,
+		DurationSampleCount:  durationSampleCount,
+		SucceededCount:       succeededCount,
+		FailedCount:          failedCount,
+		CancelledCount:       cancelledCount,
+		PassRate:             passRate,
+		MeanDurationSec:      meanDurationSec,
+		RecentFailures:       recentFailures,
+		ActiveRunsCount:      activeRunsCount,
+		TotalRunsCount:       totalRunsCount,
+	}, nil
 }

@@ -120,6 +120,7 @@ func (h *Handler) Routes() http.Handler {
 		r.Get("/api/v1/runs/{runID}/jobs", h.getRunJobs)
 		r.Get("/api/v1/runs/{runID}/logs", h.getRunLogs)
 		r.Get("/api/v1/org", h.getOrg)
+		r.Get("/api/v1/stats", h.getStats)
 	})
 
 	return r
@@ -348,6 +349,78 @@ func (h *Handler) getOrg(w http.ResponseWriter, r *http.Request) {
 			"runs_this_month": runsThisMonth,
 		},
 	})
+}
+
+// OverviewStatsResponse represents the consolidated operational metrics response.
+type OverviewStatsResponse struct {
+	QueueDepth           int              `json:"queue_depth"`
+	WorkerCapacity       int              `json:"worker_capacity"`
+	QueueStatus          string           `json:"queue_status"`
+	SampleLimit          int              `json:"sample_limit"`
+	CompletedSampleCount int              `json:"completed_sample_count"`
+	DurationSampleCount  int              `json:"duration_sample_count"`
+	SucceededCount       int              `json:"succeeded_count"`
+	FailedCount          int              `json:"failed_count"`
+	CancelledCount       int              `json:"cancelled_count"`
+	PassRate             *int             `json:"pass_rate"`
+	MeanDurationSec      *int             `json:"mean_duration_sec"`
+	RecentFailures       []*drevtypes.Run `json:"recent_failures"`
+	ActiveRunsCount      int              `json:"active_runs_count"`
+	TotalRunsCount       int              `json:"total_runs_count"`
+}
+
+func (h *Handler) getStats(w http.ResponseWriter, r *http.Request) {
+	limit := 25
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil {
+		if l > 100 {
+			l = 100
+		} else if l < 1 {
+			l = 1
+		}
+		limit = l
+	}
+
+	orgID := ""
+	org := auth.GetOrgContext(r)
+	if org != nil {
+		orgID = org.OrgID
+	}
+
+	stats, err := h.store.GetRunStats(r.Context(), orgID, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	queueDepth := 0
+	if h.queue != nil {
+		queueDepth = h.queue.Depth()
+	}
+
+	failures := stats.RecentFailures
+	if failures == nil {
+		failures = make([]*drevtypes.Run, 0)
+	}
+
+	resp := OverviewStatsResponse{
+		QueueDepth:           queueDepth,
+		WorkerCapacity:       h.workers,
+		QueueStatus:          "healthy",
+		SampleLimit:          stats.SampleLimit,
+		CompletedSampleCount: stats.CompletedSampleCount,
+		DurationSampleCount:  stats.DurationSampleCount,
+		SucceededCount:       stats.SucceededCount,
+		FailedCount:          stats.FailedCount,
+		CancelledCount:       stats.CancelledCount,
+		PassRate:             stats.PassRate,
+		MeanDurationSec:      stats.MeanDurationSec,
+		RecentFailures:       failures,
+		ActiveRunsCount:      stats.ActiveRunsCount,
+		TotalRunsCount:       stats.TotalRunsCount,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ─── SSE log streaming ────────────────────────────────────────────────────────

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
@@ -36,7 +37,11 @@ CREATE TABLE IF NOT EXISTS run_jobs (
 	status      TEXT NOT NULL,
 	started_at  DATETIME,
 	finished_at DATETIME
-);`
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_status_created_at ON runs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_run_jobs_run_id ON run_jobs(run_id);`
 
 // Store defines the persistence interface for pipeline runs and SaaS tenancy.
 type Store interface {
@@ -50,6 +55,7 @@ type Store interface {
 	UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
+	GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error)
 
 	// ── Org management (PostgreSQL / SaaS only) ───────────────────────────
 	CreateOrg(ctx context.Context, org *drevtypes.Org) error
@@ -78,6 +84,10 @@ type SQLiteStore struct {
 	stmtCreateRunJob       *sql.Stmt
 	stmtUpdateRunJobStatus *sql.Stmt
 	stmtGetRunJobs         *sql.Stmt
+	stmtGetTerminalRuns    *sql.Stmt
+	stmtGetRecentFailures  *sql.Stmt
+	stmtCountActiveRuns    *sql.Stmt
+	stmtCountTotalRuns     *sql.Stmt
 }
 
 type columnDef struct {
@@ -174,6 +184,17 @@ func migrateSQLite(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("migrating run_jobs table: %w", err)
 	}
 
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_status_created_at ON runs(status, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_jobs_run_id ON run_jobs(run_id)`,
+	}
+	for _, idx := range indexes {
+		if _, err := db.ExecContext(ctx, idx); err != nil {
+			return fmt.Errorf("creating index: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -209,7 +230,8 @@ func (s *SQLiteStore) Close() error {
 	for _, stmt := range []*sql.Stmt{
 		s.stmtCreateRun, s.stmtGetRun, s.stmtUpdateRunStatus,
 		s.stmtListRuns, s.stmtCreateRunJob, s.stmtUpdateRunJobStatus,
-		s.stmtGetRunJobs,
+		s.stmtGetRunJobs, s.stmtGetTerminalRuns, s.stmtGetRecentFailures,
+		s.stmtCountActiveRuns, s.stmtCountTotalRuns,
 	} {
 		if stmt != nil {
 			stmt.Close()
@@ -246,7 +268,7 @@ func (s *SQLiteStore) prepare() error {
 
 	s.stmtListRuns, err = s.db.Prepare(
 		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
-		 FROM runs ORDER BY created_at DESC LIMIT ?`)
+		 FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?`)
 	if err != nil {
 		return err
 	}
@@ -268,6 +290,38 @@ func (s *SQLiteStore) prepare() error {
 
 	s.stmtGetRunJobs, err = s.db.Prepare(
 		`SELECT id, run_id, job_name, status, started_at, finished_at FROM run_jobs WHERE run_id = ?`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtGetTerminalRuns, err = s.db.Prepare(
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		 FROM runs
+		 WHERE status IN ('success', 'failed', 'cancelled')
+		 ORDER BY created_at DESC, rowid DESC
+		 LIMIT ?`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtGetRecentFailures, err = s.db.Prepare(
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		 FROM runs
+		 WHERE status = 'failed'
+		 ORDER BY created_at DESC, rowid DESC
+		 LIMIT 5`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtCountActiveRuns, err = s.db.Prepare(
+		`SELECT COUNT(*) FROM runs WHERE status IN ('running', 'pending')`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtCountTotalRuns, err = s.db.Prepare(
+		`SELECT COUNT(*) FROM runs`)
 	if err != nil {
 		return err
 	}
@@ -484,6 +538,114 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 		UPDATE run_jobs SET status = 'failed', finished_at = ?
 		WHERE status IN ('running', 'pending')`, now)
 	return ids, err
+}
+
+func (s *SQLiteStore) GetRunStats(ctx context.Context, _ string, sampleLimit int) (*drevtypes.RunStats, error) {
+	if sampleLimit <= 0 {
+		sampleLimit = 25
+	}
+	if sampleLimit > 100 {
+		sampleLimit = 100
+	}
+
+	// 1. Terminal runs for the sample
+	rows, err := s.stmtGetTerminalRuns.QueryContext(ctx, sampleLimit)
+	if err != nil {
+		return nil, fmt.Errorf("querying terminal runs: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		succeededCount      int
+		failedCount         int
+		cancelledCount      int
+		durationSampleCount int
+		totalDurationSec    float64
+	)
+
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning terminal run: %w", err)
+		}
+
+		switch r.Status {
+		case drevtypes.StatusSuccess:
+			succeededCount++
+		case drevtypes.StatusFailed:
+			failedCount++
+		case drevtypes.StatusCancelled:
+			cancelledCount++
+		}
+
+		// Valid non-negative duration check
+		if !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
+			durationSampleCount++
+			totalDurationSec += r.FinishedAt.Sub(r.StartedAt).Seconds()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading terminal runs: %w", err)
+	}
+
+	completedSampleCount := succeededCount + failedCount + cancelledCount
+
+	var passRate *int
+	if completedSampleCount > 0 {
+		pr := int(math.Round(float64(succeededCount) / float64(completedSampleCount) * 100.0))
+		passRate = &pr
+	}
+
+	var meanDurationSec *int
+	if durationSampleCount > 0 {
+		avg := int(math.Round(totalDurationSec / float64(durationSampleCount)))
+		meanDurationSec = &avg
+	}
+
+	// 2. Recent failures across recent history (up to 5)
+	failRows, err := s.stmtGetRecentFailures.QueryContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("querying recent failures: %w", err)
+	}
+	defer failRows.Close()
+
+	recentFailures := make([]*drevtypes.Run, 0)
+	for failRows.Next() {
+		r, err := scanRun(failRows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning recent failure: %w", err)
+		}
+		recentFailures = append(recentFailures, r)
+	}
+	if err := failRows.Err(); err != nil {
+		return nil, fmt.Errorf("reading recent failures: %w", err)
+	}
+
+	// 3. Active runs count (running or pending)
+	var activeRunsCount int
+	if err := s.stmtCountActiveRuns.QueryRowContext(ctx).Scan(&activeRunsCount); err != nil {
+		return nil, fmt.Errorf("counting active runs: %w", err)
+	}
+
+	// 4. Total runs count
+	var totalRunsCount int
+	if err := s.stmtCountTotalRuns.QueryRowContext(ctx).Scan(&totalRunsCount); err != nil {
+		return nil, fmt.Errorf("counting total runs: %w", err)
+	}
+
+	return &drevtypes.RunStats{
+		SampleLimit:          sampleLimit,
+		CompletedSampleCount: completedSampleCount,
+		DurationSampleCount:  durationSampleCount,
+		SucceededCount:       succeededCount,
+		FailedCount:          failedCount,
+		CancelledCount:       cancelledCount,
+		PassRate:             passRate,
+		MeanDurationSec:      meanDurationSec,
+		RecentFailures:       recentFailures,
+		ActiveRunsCount:      activeRunsCount,
+		TotalRunsCount:       totalRunsCount,
+	}, nil
 }
 
 // ─── SaaS stubs (not supported in SQLite mode) ───────────────────────────────

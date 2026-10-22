@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateRecentMetrics } from '../lib/overview-metrics.ts';
-import type { Run } from '../lib/types.ts';
+import { calculateRecentMetrics, formatSeconds, formatDurationSec } from '../lib/overview-metrics.ts';
+import type { Run, OverviewStats } from '../lib/types.ts';
 
 describe('Overview Metrics: calculateRecentMetrics', () => {
   it('handles empty and null runs cleanly without division by zero', () => {
@@ -315,5 +315,179 @@ describe('StatCard & Metric state transitions', () => {
     assert.equal(resolveMetricDisplay(false, false, null, '%'), '—');
     assert.equal(resolveMetricDisplay(false, false, 95, '%'), '95%');
     assert.equal(resolveMetricDisplay(false, false, 0, ' jobs waiting'), '0 jobs waiting');
+  });
+});
+
+describe('Duration formatting: formatSeconds & formatDurationSec', () => {
+  it('formats seconds correctly', () => {
+    assert.equal(formatSeconds(0), '0s');
+    assert.equal(formatSeconds(45), '45s');
+    assert.equal(formatSeconds(59), '59s');
+  });
+
+  it('formats minutes and seconds correctly', () => {
+    assert.equal(formatSeconds(60), '1m 0s');
+    assert.equal(formatSeconds(125), '2m 5s');
+    assert.equal(formatSeconds(3599), '59m 59s');
+  });
+
+  it('formats hours and minutes correctly', () => {
+    assert.equal(formatSeconds(3600), '1h 0m');
+    assert.equal(formatSeconds(3665), '1h 1m');
+    assert.equal(formatSeconds(7320), '2h 2m');
+  });
+
+  it('handles null, undefined, and NaN safely in formatDurationSec', () => {
+    assert.equal(formatDurationSec(null), '—');
+    assert.equal(formatDurationSec(undefined), '—');
+    assert.equal(formatDurationSec(NaN), '—');
+    assert.equal(formatDurationSec(42), '42s');
+    assert.equal(formatDurationSec(150), '2m 30s');
+  });
+});
+
+describe('Overview Stats: API response resolution and fallback mechanics', () => {
+  it('resolves metrics directly from backend stats when available', () => {
+    const stats: OverviewStats = {
+      queue_depth: 3,
+      worker_capacity: 8,
+      queue_status: 'healthy',
+      sample_limit: 25,
+      completed_sample_count: 20,
+      duration_sample_count: 18,
+      succeeded_count: 16,
+      failed_count: 3,
+      cancelled_count: 1,
+      pass_rate: 80,
+      mean_duration_sec: 45,
+      recent_failures: [
+        {
+          id: 'fail-1',
+          pipeline_id: 'deploy-prod',
+          status: 'failed',
+          started_at: '2026-10-22T10:00:00Z',
+          finished_at: '2026-10-22T10:01:00Z',
+        },
+      ],
+      active_runs_count: 2,
+      total_runs_count: 25,
+    };
+
+    const queueDepth = stats ? stats.queue_depth : 0;
+    const workerCapacity = stats ? stats.worker_capacity : 0;
+    const passRate = stats ? stats.pass_rate : null;
+    const durationFormatted = stats ? formatDurationSec(stats.mean_duration_sec) : '—';
+    const recentFailures = stats ? stats.recent_failures : [];
+
+    assert.equal(queueDepth, 3);
+    assert.equal(workerCapacity, 8);
+    assert.equal(passRate, 80);
+    assert.equal(durationFormatted, '45s');
+    assert.equal(recentFailures.length, 1);
+    assert.equal(recentFailures[0].id, 'fail-1');
+  });
+
+  it('honestly handles zero and empty stats without fabricating metrics', () => {
+    const stats: OverviewStats = {
+      queue_depth: 0,
+      worker_capacity: 4,
+      queue_status: 'healthy',
+      sample_limit: 25,
+      completed_sample_count: 0,
+      duration_sample_count: 0,
+      succeeded_count: 0,
+      failed_count: 0,
+      cancelled_count: 0,
+      pass_rate: null,
+      mean_duration_sec: null,
+      recent_failures: [],
+      active_runs_count: 0,
+      total_runs_count: 0,
+    };
+
+    assert.equal(stats.pass_rate, null);
+    assert.equal(stats.mean_duration_sec, null);
+    assert.equal(formatDurationSec(stats.mean_duration_sec), '—');
+    assert.equal(stats.recent_failures.length, 0);
+    assert.equal(stats.total_runs_count, 0);
+  });
+
+  it('falls back to client calculation when stats is null', () => {
+    const runs: Run[] = [
+      {
+        id: 'run-1',
+        pipeline_id: 'test-pipe',
+        status: 'success',
+        started_at: '2026-10-22T10:00:00Z',
+        finished_at: '2026-10-22T10:00:50Z',
+      },
+    ];
+
+    const stats: OverviewStats | null = null;
+    const fallbackMetrics = calculateRecentMetrics(runs, 25);
+
+    const passRate = stats ? (stats as OverviewStats).pass_rate : fallbackMetrics.passRate;
+    const durationFormatted = stats
+      ? formatDurationSec((stats as OverviewStats).mean_duration_sec)
+      : fallbackMetrics.meanDurationFormatted;
+
+    assert.equal(passRate, 100);
+    assert.equal(durationFormatted, '50s');
+  });
+
+  it('uses 25-run fallback batch instead of 10-run activity slice when stats fails', () => {
+    // 25 runs in history: newest 10 are successes, oldest 15 have 5 failures and 10 successes
+    const fullFallbackRuns: Run[] = [];
+    for (let i = 0; i < 25; i++) {
+      fullFallbackRuns.push({
+        id: `run-${i}`,
+        pipeline_id: 'ci',
+        status: i < 20 ? 'success' : 'failed', // 20 success, 5 failed -> 80%
+        started_at: '2026-10-22T10:00:00Z',
+        finished_at: '2026-10-22T10:01:00Z',
+      });
+    }
+
+    // The activity slice only contains the top 10 runs (all success)
+    const activitySlice = fullFallbackRuns.slice(0, 10);
+
+    // If misleadingly evaluated only from the 10-run activity slice:
+    const flawedMetrics = calculateRecentMetrics(activitySlice, 25);
+    assert.equal(flawedMetrics.completedSampleCount, 10);
+    assert.equal(flawedMetrics.passRate, 100); // Misleading 100% over only 10 runs
+
+    // With dedicated fallback batch:
+    const stats: OverviewStats | null = null;
+    const source = fullFallbackRuns.length > 0 ? fullFallbackRuns : activitySlice;
+    const accurateMetrics = calculateRecentMetrics(source, 25);
+
+    const effectivePassRate = stats ? (stats as OverviewStats).pass_rate : accurateMetrics.passRate;
+    const effectiveCompletedCount = stats ? (stats as OverviewStats).completed_sample_count : accurateMetrics.completedSampleCount;
+
+    assert.equal(effectiveCompletedCount, 25);
+    assert.equal(effectivePassRate, 80); // Accurately reflects 20/25 = 80%
+
+    // Recent activity table remains strictly capped at 10 runs
+    const recentRuns = (activitySlice.length > 0 ? activitySlice : fullFallbackRuns).slice(0, 10);
+    assert.equal(recentRuns.length, 10);
+  });
+
+  it('generates truthful sample size labels without claiming misleading scopes', () => {
+    function getPassRateSubtitle(completedCount: number, activeCount: number): string {
+      if (completedCount > 0) {
+        return completedCount === 1 ? 'Last 1 completed run' : `Last ${completedCount} completed runs`;
+      }
+      if (activeCount > 0) {
+        return `${activeCount} ${activeCount === 1 ? 'run' : 'runs'} in progress`;
+      }
+      return 'No completed runs in sample';
+    }
+
+    assert.equal(getPassRateSubtitle(25, 0), 'Last 25 completed runs');
+    assert.equal(getPassRateSubtitle(10, 0), 'Last 10 completed runs');
+    assert.equal(getPassRateSubtitle(1, 0), 'Last 1 completed run');
+    assert.equal(getPassRateSubtitle(0, 2), '2 runs in progress');
+    assert.equal(getPassRateSubtitle(0, 1), '1 run in progress');
+    assert.equal(getPassRateSubtitle(0, 0), 'No completed runs in sample');
   });
 });

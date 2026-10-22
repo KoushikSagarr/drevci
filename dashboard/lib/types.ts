@@ -22,3 +22,20 @@ export interface RunJob {
   started_at: string;
   finished_at: string;
 }
+
+export interface OverviewStats {
+  queue_depth: number;
+  worker_capacity: number;
+  queue_status: string;
+  sample_limit: number;
+  completed_sample_count: number;
+  duration_sample_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  pass_rate: number | null;
+  mean_duration_sec: number | null;
+  recent_failures: Run[];
+  active_runs_count: number;
+  total_runs_count: number;
+}

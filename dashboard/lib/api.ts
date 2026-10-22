@@ -1,4 +1,5 @@
-import type { Run, RunJob } from './types.ts';
+import type { Run, RunJob, OverviewStats } from './types.ts';
+export type { Run, RunJob, OverviewStats };
 
 export class ApiError extends Error {
   status: number;
@@ -87,6 +88,15 @@ export async function getRunJobs(id: string): Promise<RunJob[]> {
 
 export async function getQueueStatus(): Promise<QueueStatus> {
   const res = await fetch(`${getBaseUrl()}/api/v1/queue`, {
+    headers: { 'Content-Type': 'application/json' },
+    cache: 'no-store',
+  });
+  await handleApiResponse(res);
+  return res.json();
+}
+
+export async function getStats(limit = 25): Promise<OverviewStats> {
+  const res = await fetch(`${getBaseUrl()}/api/v1/stats?limit=${limit}`, {
     headers: { 'Content-Type': 'application/json' },
     cache: 'no-store',
   });

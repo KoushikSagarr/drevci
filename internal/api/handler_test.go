@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/queue"
@@ -79,6 +80,108 @@ func TestHealth(t *testing.T) {
 
 	if res.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 OK, got %v", res.StatusCode)
+	}
+}
+
+func TestStats_Unauthorized(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	res, err := http.Get(srv.URL + "/api/v1/stats")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized, got %v", res.StatusCode)
+	}
+}
+
+func TestStats_Authorized(t *testing.T) {
+	srv, h := setupTestServer(t)
+	ctx := context.Background()
+
+	// 1. Initial empty stats check
+	req, _ := http.NewRequest("GET", srv.URL+"/api/v1/stats", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %v", res.StatusCode)
+	}
+
+	var emptyStats OverviewStatsResponse
+	if err := json.NewDecoder(res.Body).Decode(&emptyStats); err != nil {
+		t.Fatalf("decoding empty stats: %v", err)
+	}
+	if emptyStats.CompletedSampleCount != 0 || emptyStats.PassRate != nil || emptyStats.MeanDurationSec != nil {
+		t.Errorf("expected empty stats with nil pass_rate and mean_duration, got: %+v", emptyStats)
+	}
+	if emptyStats.WorkerCapacity != 1 || emptyStats.QueueStatus != "healthy" {
+		t.Errorf("worker_capacity = %d, queue_status = %s", emptyStats.WorkerCapacity, emptyStats.QueueStatus)
+	}
+	if len(emptyStats.RecentFailures) != 0 {
+		t.Errorf("expected empty recent_failures, got %v", emptyStats.RecentFailures)
+	}
+
+	// 2. Populate mixed runs
+	baseTime := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+	// Success run: took 30s
+	_ = h.store.CreateRun(ctx, &drevtypes.Run{
+		ID:         "run-success",
+		PipelineID: "deploy",
+		Status:     drevtypes.StatusSuccess,
+		StartedAt:  baseTime,
+		FinishedAt: baseTime.Add(30 * time.Second),
+	})
+	// Failed run: crashed without finished_at
+	_ = h.store.CreateRun(ctx, &drevtypes.Run{
+		ID:         "run-failed-crash",
+		PipelineID: "deploy",
+		Status:     drevtypes.StatusFailed,
+		StartedAt:  baseTime.Add(1 * time.Minute),
+	})
+
+	req2, _ := http.NewRequest("GET", srv.URL+"/api/v1/stats?limit=25", nil)
+	req2.Header.Set("Authorization", "Bearer test-token")
+
+	res2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res2.Body.Close()
+
+	if res2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %v", res2.StatusCode)
+	}
+
+	var populatedStats OverviewStatsResponse
+	if err := json.NewDecoder(res2.Body).Decode(&populatedStats); err != nil {
+		t.Fatalf("decoding populated stats: %v", err)
+	}
+
+	if populatedStats.CompletedSampleCount != 2 {
+		t.Errorf("CompletedSampleCount = %d, want 2", populatedStats.CompletedSampleCount)
+	}
+	if populatedStats.SucceededCount != 1 || populatedStats.FailedCount != 1 {
+		t.Errorf("SucceededCount = %d, FailedCount = %d, want 1 and 1", populatedStats.SucceededCount, populatedStats.FailedCount)
+	}
+	if populatedStats.PassRate == nil || *populatedStats.PassRate != 50 {
+		t.Errorf("PassRate = %v, want 50", populatedStats.PassRate)
+	}
+	if populatedStats.DurationSampleCount != 1 {
+		t.Errorf("DurationSampleCount = %d, want 1", populatedStats.DurationSampleCount)
+	}
+	if populatedStats.MeanDurationSec == nil || *populatedStats.MeanDurationSec != 30 {
+		t.Errorf("MeanDurationSec = %v, want 30", populatedStats.MeanDurationSec)
+	}
+	if len(populatedStats.RecentFailures) != 1 || populatedStats.RecentFailures[0].ID != "run-failed-crash" {
+		t.Errorf("RecentFailures = %+v, want run-failed-crash", populatedStats.RecentFailures)
 	}
 }
 

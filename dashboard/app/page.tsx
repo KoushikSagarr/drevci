@@ -2,11 +2,12 @@
 
 import { useEffect, useState, useMemo } from 'react';
 import Link from 'next/link';
-import { getRuns, getQueueStatus, QueueStatus } from '../lib/api';
-import { Run } from '../lib/types';
+import { getRuns, getStats, getQueueStatus } from '../lib/api';
+import type { OverviewStats, QueueStatus } from '../lib/api';
+import type { Run } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import LiveDuration from '../components/LiveDuration';
-import { calculateRecentMetrics } from '../lib/overview-metrics';
+import { calculateRecentMetrics, formatDurationSec } from '../lib/overview-metrics';
 
 function timeAgo(dateStr?: string) {
   if (!dateStr || dateStr === '0001-01-01T00:00:00Z') return '—';
@@ -53,41 +54,58 @@ function StatCard({
 }
 
 export default function OverviewPage() {
+  const [stats, setStats] = useState<OverviewStats | null>(null);
+  const [statsLoading, setStatsLoading] = useState(true);
+  const [statsError, setStatsError] = useState<string | null>(null);
+
   const [runs, setRuns] = useState<Run[] | null>(null);
   const [runsLoading, setRunsLoading] = useState(true);
   const [runsError, setRunsError] = useState<string | null>(null);
 
-  const [queueStatus, setQueueStatus] = useState<QueueStatus | null>(null);
-  const [queueLoading, setQueueLoading] = useState(true);
-  const [queueError, setQueueError] = useState<string | null>(null);
-
+  const [queueFallback, setQueueFallback] = useState<QueueStatus | null>(null);
+  const [fallbackRuns, setFallbackRuns] = useState<Run[] | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
   // Independent fetch logic: failure in one endpoint does not break the other
   useEffect(() => {
     let isCancelled = false;
 
-    const fetchQueue = async () => {
+    const fetchStats = async () => {
       try {
-        const qs = await getQueueStatus();
+        const s = await getStats(25);
         if (!isCancelled) {
-          setQueueStatus(qs);
-          setQueueError(null);
+          setStats(s);
+          setStatsError(null);
+          setQueueFallback(null);
+          setFallbackRuns(null);
         }
       } catch (err) {
         if (!isCancelled) {
-          setQueueError(err instanceof Error ? err.message : 'Queue unavailable');
+          setStatsError(err instanceof Error ? err.message : 'Stats unavailable');
+          try {
+            const qs = await getQueueStatus();
+            if (!isCancelled) setQueueFallback(qs);
+          } catch {
+            // Ignore secondary fallback error
+          }
+          // Fetch bounded 25-run sample specifically for fallback metrics only when stats is unavailable
+          try {
+            const fr = await getRuns(25);
+            if (!isCancelled) setFallbackRuns(fr || []);
+          } catch {
+            // Ignore secondary fallback error
+          }
         }
       } finally {
         if (!isCancelled) {
-          setQueueLoading(false);
+          setStatsLoading(false);
         }
       }
     };
 
     const fetchRuns = async () => {
       try {
-        const data = await getRuns(25);
+        const data = await getRuns(10);
         if (!isCancelled) {
           setRuns(data || []);
           setRunsError(null);
@@ -103,29 +121,50 @@ export default function OverviewPage() {
       }
     };
 
-    fetchQueue();
+    fetchStats();
     fetchRuns();
 
-    const qInterval = setInterval(fetchQueue, 15000);
+    const sInterval = setInterval(fetchStats, 15000);
     const rInterval = setInterval(fetchRuns, 15000);
 
     return () => {
       isCancelled = true;
-      clearInterval(qInterval);
+      clearInterval(sInterval);
       clearInterval(rInterval);
     };
   }, [reloadKey]);
 
-  const metrics = useMemo(() => {
-    return calculateRecentMetrics(runs || [], 25);
-  }, [runs]);
+  const fallbackMetrics = useMemo(() => {
+    // When stats is unavailable, prefer the dedicated 25-run fallback batch if loaded; otherwise fall back to runs
+    const source = fallbackRuns && fallbackRuns.length > 0 ? fallbackRuns : (runs || []);
+    return calculateRecentMetrics(source, 25);
+  }, [fallbackRuns, runs]);
+
+  // Sourced from dedicated backend stats API when available; falls back to client calculations
+  const effectiveQueueDepth = stats ? stats.queue_depth : (queueFallback?.depth ?? 0);
+  const effectiveWorkers = stats ? stats.worker_capacity : (queueFallback?.workers ?? '—');
+  const effectivePassRate = stats ? stats.pass_rate : fallbackMetrics.passRate;
+  const effectiveCompletedSampleCount = stats ? stats.completed_sample_count : fallbackMetrics.completedSampleCount;
+  const effectiveDurationSampleCount = stats ? stats.duration_sample_count : fallbackMetrics.durationSampleCount;
+  const effectiveMeanDurationFormatted = stats
+    ? formatDurationSec(stats.mean_duration_sec)
+    : fallbackMetrics.meanDurationFormatted;
+  const effectiveActiveCount = stats ? stats.active_runs_count : fallbackMetrics.activeInBatch;
+  const effectiveRecentFailures: Run[] = stats ? stats.recent_failures : fallbackMetrics.recentFailures;
 
   const recentRuns = useMemo(() => {
-    return (runs || []).slice(0, 10);
-  }, [runs]);
+    // Recent Activity always displays at most 10 runs
+    const source = (runs && runs.length > 0) ? runs : (fallbackRuns || []);
+    return source.slice(0, 10);
+  }, [runs, fallbackRuns]);
 
-  const hasAnyData = runs !== null && runs.length > 0;
-  const isFreshZeroRuns = !runsLoading && runs !== null && runs.length === 0 && !runsError;
+  const hasAnyData = stats
+    ? stats.total_runs_count > 0
+    : ((runs !== null && runs.length > 0) || (fallbackRuns !== null && fallbackRuns.length > 0));
+
+  const isFreshZeroRuns = stats
+    ? (!statsLoading && stats.total_runs_count === 0 && !statsError)
+    : (!runsLoading && runs !== null && runs.length === 0 && (!fallbackRuns || fallbackRuns.length === 0) && !runsError);
 
   return (
     <main className="min-h-screen bg-background">
@@ -150,7 +189,7 @@ export default function OverviewPage() {
         </div>
 
         {/* Partial Error Notification Banner */}
-        {(runsError || queueError) && (
+        {(statsError || runsError) && (
           <div
             role="alert"
             className="flex items-center justify-between rounded-lg border border-status-failed/30 bg-status-failed/10 px-4 py-3 text-sm text-text-primary"
@@ -158,17 +197,17 @@ export default function OverviewPage() {
             <div className="flex items-center gap-2">
               <span className="text-status-failed font-bold">⚠</span>
               <span>
-                {runsError && queueError
-                  ? `Failed to load dashboard data: ${runsError}`
-                  : runsError
-                  ? `Unable to refresh runs: ${runsError}`
-                  : `Unable to refresh queue status: ${queueError}`}
+                {statsError && runsError
+                  ? `Failed to load dashboard data: ${statsError}`
+                  : statsError
+                  ? `Unable to refresh system statistics: ${statsError}`
+                  : `Unable to refresh recent runs: ${runsError}`}
               </span>
             </div>
             <button
               onClick={() => {
+                setStatsLoading(true);
                 setRunsLoading(true);
-                setQueueLoading(true);
                 setReloadKey((k) => k + 1);
               }}
               className="text-xs font-semibold text-text-primary hover:underline ml-4 cursor-pointer"
@@ -185,61 +224,61 @@ export default function OverviewPage() {
             {/* 1. Queue Depth */}
             <StatCard
               label="Queue Depth"
-              value={queueStatus ? queueStatus.depth : 0}
-              sub={queueStatus?.depth === 1 ? '1 job waiting' : `${queueStatus?.depth ?? 0} jobs waiting`}
-              color={queueStatus && queueStatus.depth > 10 ? 'text-[#d29922]' : 'text-text-primary'}
-              loading={queueLoading}
-              error={!!queueError && !queueStatus}
+              value={effectiveQueueDepth}
+              sub={effectiveQueueDepth === 1 ? '1 job waiting' : `${effectiveQueueDepth} jobs waiting`}
+              color={effectiveQueueDepth > 10 ? 'text-[#d29922]' : 'text-text-primary'}
+              loading={statsLoading && !stats && !queueFallback}
+              error={!!statsError && !stats && !queueFallback}
             />
 
             {/* 2. Configured Workers (Capacity) */}
             <StatCard
               label="Worker Capacity"
-              value={queueStatus ? queueStatus.workers : '—'}
+              value={effectiveWorkers}
               sub="Configured concurrency"
-              loading={queueLoading}
-              error={!!queueError && !queueStatus}
+              loading={statsLoading && !stats && !queueFallback}
+              error={!!statsError && !stats && !queueFallback}
             />
 
             {/* 3. Recent Pass Rate (Explicit sample scope) */}
             <StatCard
               label="Recent Pass Rate"
-              value={metrics.passRate !== null ? `${metrics.passRate}%` : '—'}
+              value={effectivePassRate !== null ? `${effectivePassRate}%` : '—'}
               sub={
-                metrics.completedSampleCount > 0
-                  ? metrics.completedSampleCount === 1
+                effectiveCompletedSampleCount > 0
+                  ? effectiveCompletedSampleCount === 1
                     ? 'Last 1 completed run'
-                    : `Last ${metrics.completedSampleCount} completed runs`
-                  : metrics.activeInBatch > 0
-                  ? `${metrics.activeInBatch} ${metrics.activeInBatch === 1 ? 'run' : 'runs'} in progress`
+                    : `Last ${effectiveCompletedSampleCount} completed runs`
+                  : effectiveActiveCount > 0
+                  ? `${effectiveActiveCount} ${effectiveActiveCount === 1 ? 'run' : 'runs'} in progress`
                   : 'No completed runs in sample'
               }
               color={
-                metrics.passRate === null
+                effectivePassRate === null
                   ? 'text-text-muted'
-                  : metrics.passRate >= 80
+                  : effectivePassRate >= 80
                   ? 'text-status-success'
-                  : metrics.passRate >= 50
+                  : effectivePassRate >= 50
                   ? 'text-[#d29922]'
                   : 'text-status-failed'
               }
-              loading={runsLoading}
-              error={!!runsError && runs === null}
+              loading={statsLoading && !stats && runsLoading}
+              error={!!statsError && !stats && !!runsError && !runs}
             />
 
             {/* 4. Mean Duration (Explicit sample scope) */}
             <StatCard
               label="Mean Duration"
-              value={metrics.meanDurationFormatted}
+              value={effectiveMeanDurationFormatted}
               sub={
-                metrics.durationSampleCount > 0
-                  ? metrics.durationSampleCount === 1
+                effectiveDurationSampleCount > 0
+                  ? effectiveDurationSampleCount === 1
                     ? 'From 1 timed completed run'
-                    : `Avg of ${metrics.durationSampleCount} timed runs`
+                    : `Avg of ${effectiveDurationSampleCount} timed runs`
                   : 'No timed runs in sample'
               }
-              loading={runsLoading}
-              error={!!runsError && runs === null}
+              loading={statsLoading && !stats && runsLoading}
+              error={!!statsError && !stats && !!runsError && !runs}
             />
           </div>
         </section>
@@ -272,28 +311,28 @@ export default function OverviewPage() {
                 <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest">
                   Recent Failures
                 </h3>
-                {metrics.recentFailures.length > 0 && (
+                {effectiveRecentFailures.length > 0 && (
                   <span className="rounded-full bg-status-failed/20 px-2 py-0.5 text-[11px] font-semibold text-status-failed">
-                    {metrics.recentFailures.length} attention needed
+                    {effectiveRecentFailures.length} attention needed
                   </span>
                 )}
               </div>
 
-              {metrics.recentFailures.length === 0 ? (
+              {effectiveRecentFailures.length === 0 ? (
                 <div className="rounded-lg border border-border bg-surface p-6 text-center space-y-2">
-                  {metrics.completedSampleCount > 0 ? (
+                  {effectiveCompletedSampleCount > 0 ? (
                     <>
                       <span className="inline-block text-xl text-status-success">✓</span>
                       <h4 className="text-sm font-semibold text-text-primary">
                         Zero pipeline failures
                       </h4>
                       <p className="text-xs text-text-muted">
-                        {metrics.completedSampleCount === 1
+                        {effectiveCompletedSampleCount === 1
                           ? 'Zero failures across the last completed run in this sample.'
-                          : `Zero failures across the last ${metrics.completedSampleCount} completed runs in this sample.`}
+                          : `Zero failures across the last ${effectiveCompletedSampleCount} completed runs in this sample.`}
                       </p>
                     </>
-                  ) : metrics.activeInBatch > 0 ? (
+                  ) : effectiveActiveCount > 0 ? (
                     <>
                       <div className="flex justify-center items-center py-1">
                         <span className="relative flex h-3 w-3">
@@ -305,9 +344,9 @@ export default function OverviewPage() {
                         Pipelines in progress
                       </h4>
                       <p className="text-xs text-text-muted">
-                        {metrics.activeInBatch === 1
+                        {effectiveActiveCount === 1
                           ? '1 pipeline run currently executing. Results will update upon completion.'
-                          : `${metrics.activeInBatch} pipeline runs currently executing. Results will update upon completion.`}
+                          : `${effectiveActiveCount} pipeline runs currently executing. Results will update upon completion.`}
                       </p>
                     </>
                   ) : (
@@ -324,7 +363,7 @@ export default function OverviewPage() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {metrics.recentFailures.map((failure) => (
+                  {effectiveRecentFailures.map((failure: Run) => (
                     <div
                       key={failure.id}
                       className="rounded-lg border border-status-failed/30 bg-surface p-4 space-y-2 transition-colors hover:border-status-failed/60"
