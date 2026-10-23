@@ -19,11 +19,57 @@ function timeAgo(dateStr?: string) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+/* ─── Stat Card Icons (inline SVG for zero-dep rendering) ─── */
+
+function QueueIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <rect x="3" y="4" width="18" height="4" rx="1" />
+      <rect x="3" y="10" width="18" height="4" rx="1" />
+      <rect x="3" y="16" width="18" height="4" rx="1" />
+    </svg>
+  );
+}
+
+function WorkersIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <rect x="4" y="4" width="16" height="16" rx="2" />
+      <line x1="9" y1="4" x2="9" y2="20" />
+      <line x1="15" y1="4" x2="15" y2="20" />
+      <line x1="4" y1="9" x2="20" y2="9" />
+      <line x1="4" y1="15" x2="20" y2="15" />
+    </svg>
+  );
+}
+
+function PassRateIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+      <polyline points="22 4 12 14.01 9 11.01" />
+    </svg>
+  );
+}
+
+function DurationIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className={className}>
+      <circle cx="12" cy="12" r="10" />
+      <polyline points="12 6 12 12 16 14" />
+    </svg>
+  );
+}
+
+/* ─── Stat Card ─── */
+
 function StatCard({
   label,
   value,
   sub,
   color,
+  glowColor,
+  icon,
   loading = false,
   error = false,
 }: {
@@ -31,27 +77,43 @@ function StatCard({
   value: React.ReactNode;
   sub?: string;
   color?: string;
+  glowColor?: string;
+  icon?: React.ReactNode;
   loading?: boolean;
   error?: boolean;
 }) {
   return (
-    <div className="flex flex-col rounded-lg border border-border bg-surface p-4 min-w-0">
-      <span className="text-xs font-medium text-text-muted uppercase tracking-wider mb-1">
-        {label}
-      </span>
+    <div
+      className="stat-card-glow flex flex-col rounded-xl border border-border/80 bg-surface p-3.5 sm:p-5 min-w-0 transition-colors hover:border-border"
+      style={{ '--glow-color': glowColor || '#F97316' } as React.CSSProperties}
+    >
+      <div className="flex items-center justify-between mb-2 sm:mb-3">
+        <span className="text-[10px] sm:text-[11px] font-semibold text-text-muted uppercase tracking-wider">
+          {label}
+        </span>
+        {icon && (
+          <span className="text-text-muted/50">
+            {icon}
+          </span>
+        )}
+      </div>
       {loading ? (
-        <div className="skeleton h-8 w-24 my-0.5" />
+        <div className="skeleton h-7 sm:h-8 w-20 sm:w-24 my-0.5" />
       ) : error ? (
-        <span className="text-xl font-bold text-text-muted">Unavailable</span>
+        <span className="text-base sm:text-lg font-bold text-text-muted">Unavailable</span>
       ) : (
-        <span className={`text-2xl font-bold tabular-nums ${color || 'text-text-primary'}`}>
+        <span className={`text-xl sm:text-2xl font-bold tabular-nums tracking-tight ${color || 'text-text-primary'}`}>
           {value}
         </span>
       )}
-      {sub && <span className="text-xs text-text-muted mt-0.5">{sub}</span>}
+      {sub && (
+        <span className="text-[10px] sm:text-[11px] text-text-muted mt-1 sm:mt-1.5 leading-tight">{sub}</span>
+      )}
     </div>
   );
 }
+
+/* ─── Overview Page ─── */
 
 export default function OverviewPage() {
   const [stats, setStats] = useState<OverviewStats | null>(null);
@@ -64,7 +126,11 @@ export default function OverviewPage() {
 
   const [queueFallback, setQueueFallback] = useState<QueueStatus | null>(null);
   const [fallbackRuns, setFallbackRuns] = useState<Run[] | null>(null);
+  const [fallbackActive, setFallbackActive] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+
+  const [statsUpdatedAt, setStatsUpdatedAt] = useState<Date | null>(null);
+  const [runsUpdatedAt, setRunsUpdatedAt] = useState<Date | null>(null);
 
   // Independent fetch logic: failure in one endpoint does not break the other
   useEffect(() => {
@@ -78,22 +144,35 @@ export default function OverviewPage() {
           setStatsError(null);
           setQueueFallback(null);
           setFallbackRuns(null);
+          setFallbackActive(false);
+          setStatsUpdatedAt(new Date());
         }
       } catch (err) {
         if (!isCancelled) {
           setStatsError(err instanceof Error ? err.message : 'Stats unavailable');
+          let hasFallbackData = false;
           try {
             const qs = await getQueueStatus();
-            if (!isCancelled) setQueueFallback(qs);
+            if (!isCancelled && qs) {
+              setQueueFallback(qs);
+              hasFallbackData = true;
+            }
           } catch {
             // Ignore secondary fallback error
           }
           // Fetch bounded 25-run sample specifically for fallback metrics only when stats is unavailable
           try {
             const fr = await getRuns(25);
-            if (!isCancelled) setFallbackRuns(fr || []);
+            if (!isCancelled && fr) {
+              setFallbackRuns(fr);
+              hasFallbackData = true;
+            }
           } catch {
             // Ignore secondary fallback error
+          }
+          if (!isCancelled && hasFallbackData) {
+            setFallbackActive(true);
+            setStatsUpdatedAt(new Date());
           }
         }
       } finally {
@@ -109,6 +188,7 @@ export default function OverviewPage() {
         if (!isCancelled) {
           setRuns(data || []);
           setRunsError(null);
+          setRunsUpdatedAt(new Date());
         }
       } catch (err) {
         if (!isCancelled) {
@@ -166,24 +246,101 @@ export default function OverviewPage() {
     ? (!statsLoading && stats.total_runs_count === 0 && !statsError)
     : (!runsLoading && runs !== null && runs.length === 0 && (!fallbackRuns || fallbackRuns.length === 0) && !runsError);
 
+  const isInitialLoading = (statsLoading && !stats && !queueFallback) && (runsLoading && !runs);
+
+  const refreshStatus = useMemo(() => {
+    function formatTime(d: Date) {
+      return d.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+    }
+
+    if (isInitialLoading) {
+      return { label: 'Connecting…', color: 'bg-status-pending', type: 'loading' };
+    }
+
+    // Both failed with no fallback data
+    if (statsError && runsError && !fallbackActive && !queueFallback && !fallbackRuns) {
+      return { label: 'Sync paused', color: 'bg-status-failed', type: 'error' };
+    }
+
+    // Runs failed: Recent Activity is stale or unavailable
+    if (runsError) {
+      const timeStr = runsUpdatedAt ? ` (${formatTime(runsUpdatedAt)})` : '';
+      return {
+        label: runsUpdatedAt ? `Partial sync • Stale activity${timeStr}` : 'Partial sync • Activity unavailable',
+        color: 'bg-[#d29922]',
+        type: 'partial',
+      };
+    }
+
+    // Stats failed, but fallback is actively supplying queue/run metrics
+    if (statsError && (fallbackActive || queueFallback || fallbackRuns)) {
+      const timeStr = statsUpdatedAt ? ` (${formatTime(statsUpdatedAt)})` : '';
+      return {
+        label: `Fallback active${timeStr}`,
+        color: 'bg-[#d29922]',
+        type: 'fallback',
+      };
+    }
+
+    // Both stats and runs healthy
+    if (statsUpdatedAt && runsUpdatedAt) {
+      const earliest = statsUpdatedAt < runsUpdatedAt ? statsUpdatedAt : runsUpdatedAt;
+      return {
+        label: `Updated ${formatTime(earliest)}`,
+        color: 'bg-status-success',
+        type: 'healthy',
+      };
+    }
+
+    if (statsUpdatedAt || runsUpdatedAt) {
+      const latest = (statsUpdatedAt || runsUpdatedAt)!;
+      return {
+        label: `Updated ${formatTime(latest)}`,
+        color: 'bg-status-success',
+        type: 'healthy',
+      };
+    }
+
+    return { label: 'Live', color: 'bg-status-success', type: 'healthy' };
+  }, [isInitialLoading, statsError, runsError, fallbackActive, queueFallback, fallbackRuns, statsUpdatedAt, runsUpdatedAt]);
+
   return (
     <main className="min-h-screen bg-background">
-      <div className="mx-auto max-w-6xl px-6 py-8 space-y-8">
+      <div className="mx-auto max-w-6xl px-4 sm:px-6 py-8 space-y-8">
         {/* Page Header */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold text-text-primary tracking-tight">System Overview</h1>
+            <h1 className="text-2xl font-bold text-text-primary tracking-tight">
+              System Overview
+            </h1>
             <p className="text-sm text-text-muted mt-1">
               Operational pulse, runner queue, and recent execution health
             </p>
           </div>
           <div className="flex items-center gap-3">
+            {/* Truthful live polling & status indicator */}
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex items-center gap-1.5 text-[11px] font-mono text-text-secondary"
+            >
+              <span className="relative flex h-1.5 w-1.5">
+                <span className={`inline-flex h-1.5 w-1.5 rounded-full ${refreshStatus.color}`} />
+              </span>
+              <span>{refreshStatus.label}</span>
+            </div>
+
             <Link
               href="/runs"
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-4 py-2 text-xs font-semibold text-text-primary hover:bg-surface-hover hover:border-accent/40 transition-colors"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-surface px-4 py-2 text-xs font-semibold text-text-primary hover:bg-surface-hover hover:border-accent/40 transition-all focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
             >
               <span>Explore All Pipelines</span>
-              <span>→</span>
+              <span className="text-text-muted">→</span>
             </Link>
           </div>
         </div>
@@ -192,7 +349,7 @@ export default function OverviewPage() {
         {(statsError || runsError) && (
           <div
             role="alert"
-            className="flex items-center justify-between rounded-lg border border-status-failed/30 bg-status-failed/10 px-4 py-3 text-sm text-text-primary"
+            className="flex items-center justify-between rounded-lg border border-status-failed/30 bg-status-failed/10 px-4 py-3 text-sm text-text-primary animate-fade-in-up"
           >
             <div className="flex items-center gap-2">
               <span className="text-status-failed font-bold">⚠</span>
@@ -210,7 +367,7 @@ export default function OverviewPage() {
                 setRunsLoading(true);
                 setReloadKey((k) => k + 1);
               }}
-              className="text-xs font-semibold text-text-primary hover:underline ml-4 cursor-pointer"
+              className="text-xs font-semibold text-text-primary hover:underline ml-4 cursor-pointer focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent rounded px-1"
             >
               Retry
             </button>
@@ -220,13 +377,15 @@ export default function OverviewPage() {
         {/* Operational Pulse: 4 Key Metric Cards */}
         <section aria-labelledby="pulse-heading">
           <h2 id="pulse-heading" className="sr-only">Operational Metrics</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 stagger-children">
             {/* 1. Queue Depth */}
             <StatCard
               label="Queue Depth"
               value={effectiveQueueDepth}
               sub={effectiveQueueDepth === 1 ? '1 job waiting' : `${effectiveQueueDepth} jobs waiting`}
               color={effectiveQueueDepth > 10 ? 'text-[#d29922]' : 'text-text-primary'}
+              glowColor={effectiveQueueDepth > 10 ? '#d29922' : '#3fb950'}
+              icon={<QueueIcon className="w-4 h-4" />}
               loading={statsLoading && !stats && !queueFallback}
               error={!!statsError && !stats && !queueFallback}
             />
@@ -236,6 +395,8 @@ export default function OverviewPage() {
               label="Worker Capacity"
               value={effectiveWorkers}
               sub="Configured concurrency"
+              glowColor="#388bfd"
+              icon={<WorkersIcon className="w-4 h-4" />}
               loading={statsLoading && !stats && !queueFallback}
               error={!!statsError && !stats && !queueFallback}
             />
@@ -262,6 +423,16 @@ export default function OverviewPage() {
                   ? 'text-[#d29922]'
                   : 'text-status-failed'
               }
+              glowColor={
+                effectivePassRate === null
+                  ? '#71717A'
+                  : effectivePassRate >= 80
+                  ? '#3fb950'
+                  : effectivePassRate >= 50
+                  ? '#d29922'
+                  : '#f85149'
+              }
+              icon={<PassRateIcon className="w-4 h-4" />}
               loading={statsLoading && !stats && runsLoading}
               error={!!statsError && !stats && !!runsError && !runs}
             />
@@ -277,6 +448,8 @@ export default function OverviewPage() {
                     : `Avg of ${effectiveDurationSampleCount} timed runs`
                   : 'No timed runs in sample'
               }
+              glowColor="#F97316"
+              icon={<DurationIcon className="w-4 h-4" />}
               loading={statsLoading && !stats && runsLoading}
               error={!!statsError && !stats && !!runsError && !runs}
             />
@@ -285,8 +458,8 @@ export default function OverviewPage() {
 
         {/* Zero-Data / Onboarding State for Fresh Installation */}
         {isFreshZeroRuns && (
-          <div className="rounded-xl border border-dashed border-border bg-surface/50 p-10 text-center">
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl border border-border bg-background text-2xl text-accent mb-4">
+          <div className="rounded-xl border border-dashed border-border bg-surface/50 p-10 text-center animate-fade-in-up">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-accent/30 bg-accent/10 text-2xl text-accent mb-4">
               ⚡
             </div>
             <h3 className="text-lg font-bold text-text-primary">No pipeline runs recorded yet</h3>
@@ -295,7 +468,7 @@ export default function OverviewPage() {
               using the CLI or push a commit with a configured webhook.
             </p>
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-              <code className="rounded bg-background border border-border px-3 py-1.5 text-xs font-mono text-text-secondary select-all">
+              <code className="rounded-lg bg-background border border-border px-4 py-2 text-xs font-mono text-text-secondary select-all">
                 ./bin/drev trigger --pipeline configs/webhooks/example/.drev.yml
               </code>
             </div>
@@ -306,23 +479,27 @@ export default function OverviewPage() {
         {hasAnyData && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
             {/* Left: Recent Failures Panel */}
-            <div className="lg:col-span-1 space-y-4">
+            <div className="lg:col-span-1 space-y-4 animate-fade-in-up" style={{ animationDelay: '100ms' }}>
               <div className="flex items-center justify-between px-1">
                 <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest">
                   Recent Failures
                 </h3>
                 {effectiveRecentFailures.length > 0 && (
-                  <span className="rounded-full bg-status-failed/20 px-2 py-0.5 text-[11px] font-semibold text-status-failed">
+                  <span className="rounded-full bg-status-failed/15 border border-status-failed/20 px-2.5 py-0.5 text-[11px] font-semibold text-status-failed">
                     {effectiveRecentFailures.length} attention needed
                   </span>
                 )}
               </div>
 
               {effectiveRecentFailures.length === 0 ? (
-                <div className="rounded-lg border border-border bg-surface p-6 text-center space-y-2">
+                <div className="rounded-xl border border-border bg-surface p-6 text-center space-y-2">
                   {effectiveCompletedSampleCount > 0 ? (
                     <>
-                      <span className="inline-block text-xl text-status-success">✓</span>
+                      <div className="mx-auto flex h-10 w-10 items-center justify-center rounded-full bg-status-success/10 border border-status-success/20 text-status-success mb-2">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5">
+                          <polyline points="20 6 9 17 4 12" />
+                        </svg>
+                      </div>
                       <h4 className="text-sm font-semibold text-text-primary">
                         Zero pipeline failures
                       </h4>
@@ -366,7 +543,7 @@ export default function OverviewPage() {
                   {effectiveRecentFailures.map((failure: Run) => (
                     <div
                       key={failure.id}
-                      className="rounded-lg border border-status-failed/30 bg-surface p-4 space-y-2 transition-colors hover:border-status-failed/60"
+                      className="group rounded-xl border border-status-failed/20 bg-surface p-4 space-y-2 transition-all hover:border-status-failed/50 hover:bg-status-failed/[0.03] row-hover-lift"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="font-bold text-text-primary text-sm truncate">
@@ -380,7 +557,7 @@ export default function OverviewPage() {
                         <span>{failure.branch || 'Unknown branch'}</span>
                         {failure.commit_sha && (
                           <>
-                            <span>•</span>
+                            <span className="text-border">·</span>
                             <span>{failure.commit_sha.substring(0, 7)}</span>
                           </>
                         )}
@@ -388,10 +565,10 @@ export default function OverviewPage() {
                       <div className="pt-1">
                         <Link
                           href={`/runs/${failure.id}`}
-                          className="inline-flex items-center gap-1 text-xs font-semibold text-status-failed hover:underline"
+                          className="inline-flex items-center gap-1 text-xs font-semibold text-status-failed hover:underline group-hover:text-status-failed/80"
                         >
                           <span>Inspect failure in log</span>
-                          <span>→</span>
+                          <span className="transition-transform group-hover:translate-x-0.5">→</span>
                         </Link>
                       </div>
                     </div>
@@ -401,7 +578,7 @@ export default function OverviewPage() {
             </div>
 
             {/* Right: Recent Pipeline Activity */}
-            <div className="lg:col-span-2 space-y-4">
+            <div className="lg:col-span-2 space-y-4 animate-fade-in-up" style={{ animationDelay: '150ms' }}>
               <div className="flex items-center justify-between px-1">
                 <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest">
                   Recent Activity (Last {recentRuns.length})
@@ -414,10 +591,10 @@ export default function OverviewPage() {
                 </Link>
               </div>
 
-              <div className="overflow-hidden rounded-lg border border-border bg-surface">
+              <div className="overflow-x-auto rounded-xl border border-border bg-surface">
                 <table className="w-full text-left text-sm" aria-label="Recent Pipeline Runs">
                   <thead>
-                    <tr className="border-b border-border bg-background/50 text-xs font-medium text-text-muted uppercase tracking-wider">
+                    <tr className="border-b border-border bg-background/50 text-[11px] font-semibold text-text-muted uppercase tracking-wider">
                       <th scope="col" className="px-4 py-3">Run</th>
                       <th scope="col" className="px-4 py-3">Pipeline</th>
                       <th scope="col" className="px-4 py-3">Status</th>
@@ -430,12 +607,12 @@ export default function OverviewPage() {
                     {recentRuns.map((run) => (
                       <tr
                         key={run.id}
-                        className="border-b border-border/60 hover:bg-surface-hover transition-colors"
+                        className="group border-b border-border/50 hover:bg-surface-hover/50 transition-colors"
                       >
                         <td className="px-4 py-3 font-mono text-xs text-text-secondary">
                           <Link
                             href={`/runs/${run.id}`}
-                            className="hover:text-accent font-semibold"
+                            className="hover:text-accent font-semibold transition-colors"
                           >
                             {run.id.substring(0, 8)}
                           </Link>
@@ -459,9 +636,9 @@ export default function OverviewPage() {
                         <td className="px-4 py-3 text-right">
                           <Link
                             href={`/runs/${run.id}`}
-                            className="inline-flex items-center gap-1 rounded border border-border bg-background px-2.5 py-1 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-accent/30 transition-colors"
+                            className="inline-flex items-center gap-1 rounded-md border border-border/70 bg-background px-2.5 py-1 text-xs font-medium text-text-secondary hover:text-text-primary hover:border-accent/30 transition-all"
                           >
-                            View →
+                            View <span className="text-text-muted/60 transition-transform group-hover:translate-x-0.5">→</span>
                           </Link>
                         </td>
                       </tr>
@@ -472,6 +649,14 @@ export default function OverviewPage() {
             </div>
           </div>
         )}
+
+        {/* Footer */}
+        <footer className="border-t border-border/40 pt-6 pb-4">
+          <div className="flex items-center justify-between text-[11px] text-text-muted">
+            <span>Drev CI Dashboard</span>
+            <span>Auto-refresh every 15s</span>
+          </div>
+        </footer>
       </div>
     </main>
   );

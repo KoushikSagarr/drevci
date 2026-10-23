@@ -11,7 +11,7 @@
   --color-text-muted: #71717A;
   --color-accent: #F97316;
   --color-accent-hover: #EA580C;
-  
+
   --color-status-pending: #8b949e;
   --color-status-running: #388bfd;
   --color-status-success: #3fb950;
@@ -78,4 +78,100 @@ body {
 /* Log line hover */
 .log-line:hover {
   background-color: rgba(56, 139, 253, 0.06);
+}
+
+/* ─── Phase 3: Shell & Overview polish ─── */
+
+/* Entrance animation for page content */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Staggered entrance for child elements */
+.stagger-children > * {
+  animation: fade-in-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.stagger-children > *:nth-child(1) { animation-delay: 0ms; }
+.stagger-children > *:nth-child(2) { animation-delay: 50ms; }
+.stagger-children > *:nth-child(3) { animation-delay: 100ms; }
+.stagger-children > *:nth-child(4) { animation-delay: 150ms; }
+.stagger-children > *:nth-child(5) { animation-delay: 200ms; }
+.stagger-children > *:nth-child(6) { animation-delay: 250ms; }
+
+/* Stat card top border accent (restrained static accent, elevated on hover) */
+.stat-card-glow {
+  position: relative;
+  overflow: hidden;
+}
+
+.stat-card-glow::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent 0%, var(--glow-color, #F97316) 50%, transparent 100%);
+  opacity: 0.4;
+  transition: opacity 0.2s ease-in-out;
+}
+
+.stat-card-glow:hover::before {
+  opacity: 0.85;
+}
+
+/* Navbar bottom edge glow */
+.navbar-glow {
+  box-shadow:
+    0 1px 0 0 rgba(63, 63, 70, 0.5),
+    0 4px 16px -4px rgba(0, 0, 0, 0.5);
+}
+
+/* Row hover lift effect */
+.row-hover-lift {
+  transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.row-hover-lift:hover {
+  transform: translateX(2px);
+}
+
+/* Accessible reduced-motion support */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-fade-in-up,
+  .stagger-children > *,
+  .row-hover-lift,
+  .glow-running,
+  .skeleton {
+    animation: none !important;
+    transform: none !important;
+    transition: none !important;
+  }
+
+  .stat-card-glow::before {
+    opacity: 0.5 !important;
+    transition: none !important;
+  }
 }
