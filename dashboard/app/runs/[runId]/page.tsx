@@ -7,6 +7,7 @@ import { Run, RunJob } from '../../../lib/types';
 import StatusBadge from '../../../components/StatusBadge';
 import LogViewer, { LogViewerRef } from '../../../components/LogViewer';
 import LiveDuration from '../../../components/LiveDuration';
+import JobTimeline from '../../../components/JobTimeline';
 
 function formatTimestamp(ts?: string) {
   if (!ts || ts === '0001-01-01T00:00:00Z') return '—';
@@ -39,81 +40,6 @@ function DetailCard({
       <span className="text-[10px] font-bold text-text-muted uppercase tracking-widest mb-1">{label}</span>
       <span className={`text-lg font-bold tabular-nums ${color || 'text-text-primary'}`}>{value}</span>
       {sub && <span className="text-[10px] text-text-muted mt-0.5">{sub}</span>}
-    </div>
-  );
-}
-
-// --- Job Timeline Item ---
-function JobItem({
-  job,
-  index,
-  onJumpToError,
-}: {
-  job: RunJob;
-  index: number;
-  onJumpToError?: () => void;
-}) {
-  const isLive = job.status === 'running';
-
-  const statusIcon = {
-    pending: '○',
-    running: '◉',
-    success: '✓',
-    failed: '✗',
-    cancelled: '⊘',
-  }[job.status] || '○';
-
-  const colorClass = {
-    pending: 'border-status-pending text-status-pending bg-status-pending/5',
-    running: 'border-status-running text-status-running bg-status-running/10 shadow-[0_0_10px_rgba(56,139,253,0.1)]',
-    success: 'border-status-success text-status-success bg-status-success/5',
-    failed: 'border-status-failed text-status-failed bg-status-failed/5',
-    cancelled: 'border-status-cancelled text-status-cancelled bg-status-cancelled/5',
-  }[job.status] || 'border-border text-text-muted bg-surface';
-
-  return (
-    <div className="flex gap-4">
-      <div className="flex flex-col items-center w-8">
-        <div className={`w-8 h-8 rounded-full border-2 flex items-center justify-center font-bold shrink-0 transition-colors ${colorClass}`}>
-          {statusIcon}
-        </div>
-        <div className="w-0.5 flex-1 bg-border/30 my-1" />
-      </div>
-
-      <div
-        className={`flex-1 rounded-lg border p-4 mb-4 transition-colors ${
-          job.status === 'running' ? 'border-status-running/30 bg-status-running/5' : 'border-border bg-surface'
-        }`}
-      >
-        <div className="flex items-center justify-between gap-4 mb-2">
-          <div className="flex items-center gap-3">
-            <span className="font-bold text-text-primary text-sm">{job.job_name}</span>
-            <StatusBadge status={job.status} pulse={job.status === 'running'} />
-          </div>
-          <span className="font-mono text-xs text-text-muted bg-background px-2 py-1 rounded">
-            <LiveDuration startedAt={job.started_at} finishedAt={job.finished_at} isLive={isLive} />
-          </span>
-        </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-text-muted font-mono uppercase tracking-tight">
-          <span>Job {index + 1}</span>
-          {job.started_at && job.started_at !== '0001-01-01T00:00:00Z' && (
-            <span>Started: {formatTimestamp(job.started_at)}</span>
-          )}
-          {job.finished_at && job.finished_at !== '0001-01-01T00:00:00Z' && (
-            <span>Ended: {formatTimestamp(job.finished_at)}</span>
-          )}
-        </div>
-        {job.status === 'failed' && onJumpToError && (
-          <button
-            type="button"
-            onClick={onJumpToError}
-            className="mt-2 inline-flex items-center gap-1 text-[11px] font-mono text-status-failed hover:underline focus:outline-none focus:ring-1 focus:ring-status-failed rounded px-1 cursor-pointer"
-          >
-            <span>Jump to error in log</span>
-            <span aria-hidden="true">↓</span>
-          </button>
-        )}
-      </div>
     </div>
   );
 }
@@ -388,26 +314,13 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
       {/* Content Layout */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: Job Timeline */}
-        <div className="lg:col-span-1 space-y-4">
-          <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">
-            Pipeline Jobs ({jobs.length})
-          </h3>
-          <div className="space-y-0">
-            {jobs.length === 0 ? (
-              <div className="flex flex-col items-center justify-center h-48 border border-dashed border-border rounded-lg text-text-muted text-sm italic">
-                No jobs registered for this run.
-              </div>
-            ) : (
-              jobs.map((job, i) => (
-                <JobItem
-                  key={job.id}
-                  job={job}
-                  index={i}
-                  onJumpToError={firstError ? () => logViewerRef.current?.jumpToError() : undefined}
-                />
-              ))
-            )}
-          </div>
+        <div className="lg:col-span-1">
+          <JobTimeline
+            run={run}
+            jobs={jobs}
+            isLive={isLive}
+            onJumpToError={firstError ? () => logViewerRef.current?.jumpToError() : undefined}
+          />
         </div>
 
         {/* Right: Console Logs */}
