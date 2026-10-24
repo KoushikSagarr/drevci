@@ -170,3 +170,83 @@ export function classifyLogLine(cleanText: string): LogLineKind {
 
   return 'normal';
 }
+
+/**
+ * Extracts the step name from a step log line.
+ * Matches lines formatted as `[drev] --- step: <name> ---`.
+ */
+export function extractStepName(cleanText: string): string | null {
+  const match = cleanText.trim().match(/^\[drev\]\s+---\s+step:\s*(.*?)\s*---$/i);
+  return match ? match[1] : null;
+}
+
+/**
+ * Finds the first line classified as an error in an array of raw log lines.
+ * Returns original 0-indexed index, 1-indexed lineNum, and stripped snippet.
+ */
+export function extractFirstError(lines: string[]): { index: number; lineNum: number; snippet: string } | null {
+  for (let i = 0; i < lines.length; i++) {
+    const clean = stripAnsi(lines[i]).trim();
+    if (classifyLogLine(clean) === 'error') {
+      return {
+        index: i,
+        lineNum: i + 1,
+        snippet: clean,
+      };
+    }
+  }
+  return null;
+}
+
+export type LogFilterMode = 'all' | 'errors' | 'warnings' | 'steps';
+
+export interface ClassifiedLogLine {
+  line: string;
+  originalIndex: number;
+  kind: LogLineKind;
+  cleanText: string;
+}
+
+/**
+ * Filters an array of raw log lines by severity / step filter, preserving original line indices.
+ */
+export function filterLogLines(lines: string[], filter: LogFilterMode): ClassifiedLogLine[] {
+  const result: ClassifiedLogLine[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const cleanText = stripAnsi(lines[i]);
+    const kind = classifyLogLine(cleanText);
+    if (
+      filter === 'all' ||
+      (filter === 'errors' && kind === 'error') ||
+      (filter === 'warnings' && kind === 'warning') ||
+      (filter === 'steps' && kind === 'step')
+    ) {
+      result.push({ line: lines[i], originalIndex: i, kind, cleanText });
+    }
+  }
+  return result;
+}
+
+/**
+ * Splits text into matching and non-matching segments for case-insensitive substring search.
+ */
+export function highlightMatchInSpan(text: string, query: string): { text: string; isMatch: boolean }[] {
+  if (!query || !text) return [{ text, isMatch: false }];
+  const lowerQuery = query.toLowerCase();
+  const lowerText = text.toLowerCase();
+  const parts: { text: string; isMatch: boolean }[] = [];
+  let start = 0;
+  let matchIdx = lowerText.indexOf(lowerQuery, start);
+  while (matchIdx !== -1) {
+    if (matchIdx > start) {
+      parts.push({ text: text.slice(start, matchIdx), isMatch: false });
+    }
+    parts.push({ text: text.slice(matchIdx, matchIdx + query.length), isMatch: true });
+    start = matchIdx + query.length;
+    matchIdx = lowerText.indexOf(lowerQuery, start);
+  }
+  if (start < text.length) {
+    parts.push({ text: text.slice(start), isMatch: false });
+  }
+  return parts;
+}

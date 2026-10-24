@@ -1,6 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { stripAnsi, parseAnsi, classifyLogLine } from '../lib/ansi.ts';
+import {
+  stripAnsi,
+  parseAnsi,
+  classifyLogLine,
+  extractStepName,
+  extractFirstError,
+  filterLogLines,
+  highlightMatchInSpan,
+} from '../lib/ansi.ts';
 import { formatDuration } from '../lib/duration.ts';
 import type { Run } from '../lib/types.ts';
 
@@ -167,5 +175,189 @@ describe('Restart Run control disabled state', () => {
     assert.equal(buttonAttrs.disabled, true);
     assert.equal(buttonAttrs['aria-disabled'], 'true');
     assert.match(buttonAttrs.title, /not yet supported/i);
+  });
+});
+
+describe('Step name extraction', () => {
+  it('extracts step names from standard drev runner step headers', () => {
+    assert.equal(extractStepName('[drev] --- step: Build Frontend ---'), 'Build Frontend');
+    assert.equal(extractStepName('[drev] --- step: test-integration ---'), 'test-integration');
+    assert.equal(extractStepName('[drev]   ---  step: Lint & Typecheck  ---'), 'Lint & Typecheck');
+  });
+
+  it('extracts step names from ANSI-styled step headers after stripping ANSI', () => {
+    const styled = '\u001b[36m[drev] --- step: Deploy to Staging ---\u001b[0m';
+    const clean = stripAnsi(styled);
+    assert.equal(extractStepName(clean), 'Deploy to Staging');
+  });
+
+  it('returns null for non-step lines', () => {
+    assert.equal(extractStepName('[drev] pulling container image alpine:latest'), null);
+    assert.equal(extractStepName('$ echo step 1'), null);
+    assert.equal(extractStepName('Step 1: run tests'), null);
+    assert.equal(extractStepName(''), null);
+  });
+});
+
+describe('First-error extraction and snippet generation', () => {
+  it('returns null when no error lines are present in logs', () => {
+    const cleanLogs = [
+      '[drev] pulling container image alpine:latest',
+      '[drev] --- step: Build ---',
+      '$ go build -v ./...',
+      'warning: deprecated flag used',
+      'PASS: TestAll (0.12s)',
+    ];
+    assert.equal(extractFirstError(cleanLogs), null);
+  });
+
+  it('identifies the exact first error and preserves 1-indexed line numbers', () => {
+    const logsWithErrors = [
+      '[drev] container initialized',                     // line 1
+      '[drev] --- step: Test ---',                        // line 2
+      '$ go test ./...',                                  // line 3
+      '\u001b[31merror: exit status 1\u001b[0m',          // line 4 (first error)
+      'job "test" failed with exit code 1',               // line 5 (second error)
+    ];
+
+    const result = extractFirstError(logsWithErrors);
+    assert.notEqual(result, null);
+    assert.equal(result?.index, 3);
+    assert.equal(result?.lineNum, 4);
+    assert.equal(result?.snippet, 'error: exit status 1');
+  });
+
+  it('strips ANSI codes cleanly from the extracted snippet', () => {
+    const logs = [
+      '\u001b[1;31mFATAL:\u001b[0m \u001b[33mcontainer killed due to OOM\u001b[0m',
+    ];
+    const result = extractFirstError(logs);
+    assert.notEqual(result, null);
+    assert.equal(result?.lineNum, 1);
+    assert.equal(result?.snippet, 'FATAL: container killed due to OOM');
+  });
+});
+
+describe('Log filtering with preserved line numbers', () => {
+  const sampleLogs = [
+    '[drev] initializing runner',                               // line 1: drev
+    '[drev] --- step: Dependencies ---',                        // line 2: step
+    '$ npm install',                                            // line 3: command
+    'warning: package rollup is deprecated',                    // line 4: warning
+    '[drev] --- step: Build ---',                               // line 5: step
+    '$ npm run build',                                          // line 6: command
+    '\u001b[31m[error] compilation failed: syntax error\u001b[0m', // line 7: error
+    'Command failed with exit code 1',                          // line 8: error
+  ];
+
+  it('preserves all lines and original line indices under filter "all"', () => {
+    const filtered = filterLogLines(sampleLogs, 'all');
+    assert.equal(filtered.length, 8);
+    for (let i = 0; i < filtered.length; i++) {
+      assert.equal(filtered[i].originalIndex, i);
+    }
+  });
+
+  it('filters to errors only while preserving exact original line indices', () => {
+    const filtered = filterLogLines(sampleLogs, 'errors');
+    assert.equal(filtered.length, 2);
+    // line 7 is index 6
+    assert.equal(filtered[0].originalIndex, 6);
+    assert.equal(filtered[0].kind, 'error');
+    // line 8 is index 7
+    assert.equal(filtered[1].originalIndex, 7);
+    assert.equal(filtered[1].kind, 'error');
+  });
+
+  it('filters to warnings only while preserving original line indices', () => {
+    const filtered = filterLogLines(sampleLogs, 'warnings');
+    assert.equal(filtered.length, 1);
+    // line 4 is index 3
+    assert.equal(filtered[0].originalIndex, 3);
+    assert.equal(filtered[0].kind, 'warning');
+  });
+
+  it('filters to steps only while preserving original line indices', () => {
+    const filtered = filterLogLines(sampleLogs, 'steps');
+    assert.equal(filtered.length, 2);
+    // line 2 is index 1
+    assert.equal(filtered[0].originalIndex, 1);
+    assert.equal(filtered[0].kind, 'step');
+    // line 5 is index 4
+    assert.equal(filtered[1].originalIndex, 4);
+    assert.equal(filtered[1].kind, 'step');
+  });
+
+  it('handles empty log arrays gracefully', () => {
+    assert.deepEqual(filterLogLines([], 'all'), []);
+    assert.deepEqual(filterLogLines([], 'errors'), []);
+  });
+});
+
+describe('In-log search match highlighting', () => {
+  it('performs case-insensitive matching while preserving original casing', () => {
+    const text = 'Failed with exit code 1 (FAILED)';
+    const parts = highlightMatchInSpan(text, 'failed');
+
+    assert.equal(parts.length, 4);
+    assert.equal(parts[0].text, 'Failed');
+    assert.equal(parts[0].isMatch, true);
+    assert.equal(parts[1].text, ' with exit code 1 (');
+    assert.equal(parts[1].isMatch, false);
+    assert.equal(parts[2].text, 'FAILED');
+    assert.equal(parts[2].isMatch, true);
+    assert.equal(parts[3].text, ')');
+    assert.equal(parts[3].isMatch, false);
+  });
+
+  it('safely handles search queries with regex special characters without throwing', () => {
+    const text = '[drev] container limits: (cpu: 2, mem: 1024MB)';
+    const parts = highlightMatchInSpan(text, '[drev]');
+
+    assert.equal(parts.length, 2);
+    assert.equal(parts[0].text, '[drev]');
+    assert.equal(parts[0].isMatch, true);
+    assert.equal(parts[1].text, ' container limits: (cpu: 2, mem: 1024MB)');
+    assert.equal(parts[1].isMatch, false);
+  });
+
+  it('returns single non-match part when search query is not found', () => {
+    const text = 'All test suites passed';
+    const parts = highlightMatchInSpan(text, 'error');
+
+    assert.equal(parts.length, 1);
+    assert.equal(parts[0].text, text);
+    assert.equal(parts[0].isMatch, false);
+  });
+
+  it('matches searches across ANSI-formatted output spans', () => {
+    const rawAnsi = '\u001b[31m[error]\u001b[0m Compilation failed in \u001b[1;34mmain.go\u001b[0m';
+    const spans = parseAnsi(rawAnsi);
+
+    // Verify spans structure
+    assert.equal(spans.length, 3);
+    assert.equal(spans[0].text, '[error]');
+    assert.equal(spans[1].text, ' Compilation failed in ');
+    assert.equal(spans[2].text, 'main.go');
+
+    // Searching for 'compilation' matches within the middle span
+    const middleSpanMatches = highlightMatchInSpan(spans[1].text, 'compilation');
+    assert.equal(middleSpanMatches.length, 3);
+    assert.equal(middleSpanMatches[0].text, ' ');
+    assert.equal(middleSpanMatches[0].isMatch, false);
+    assert.equal(middleSpanMatches[1].text, 'Compilation');
+    assert.equal(middleSpanMatches[1].isMatch, true);
+    assert.equal(middleSpanMatches[2].text, ' failed in ');
+    assert.equal(middleSpanMatches[2].isMatch, false);
+
+    // Searching for 'error' matches within the first styled span
+    const firstSpanMatches = highlightMatchInSpan(spans[0].text, 'error');
+    assert.equal(firstSpanMatches.length, 3);
+    assert.equal(firstSpanMatches[0].text, '[');
+    assert.equal(firstSpanMatches[0].isMatch, false);
+    assert.equal(firstSpanMatches[1].text, 'error');
+    assert.equal(firstSpanMatches[1].isMatch, true);
+    assert.equal(firstSpanMatches[2].text, ']');
+    assert.equal(firstSpanMatches[2].isMatch, false);
   });
 });

@@ -1,11 +1,11 @@
 'use client';
 
-import { useEffect, useState, use } from 'react';
+import { useEffect, useState, useRef, use } from 'react';
 import Link from 'next/link';
 import { getRun, getRunJobs } from '../../../lib/api';
 import { Run, RunJob } from '../../../lib/types';
 import StatusBadge from '../../../components/StatusBadge';
-import LogViewer from '../../../components/LogViewer';
+import LogViewer, { LogViewerRef } from '../../../components/LogViewer';
 import LiveDuration from '../../../components/LiveDuration';
 
 function formatTimestamp(ts?: string) {
@@ -44,7 +44,15 @@ function DetailCard({
 }
 
 // --- Job Timeline Item ---
-function JobItem({ job, index }: { job: RunJob; index: number }) {
+function JobItem({
+  job,
+  index,
+  onJumpToError,
+}: {
+  job: RunJob;
+  index: number;
+  onJumpToError?: () => void;
+}) {
   const isLive = job.status === 'running';
 
   const statusIcon = {
@@ -95,6 +103,16 @@ function JobItem({ job, index }: { job: RunJob; index: number }) {
             <span>Ended: {formatTimestamp(job.finished_at)}</span>
           )}
         </div>
+        {job.status === 'failed' && onJumpToError && (
+          <button
+            type="button"
+            onClick={onJumpToError}
+            className="mt-2 inline-flex items-center gap-1 text-[11px] font-mono text-status-failed hover:underline focus:outline-none focus:ring-1 focus:ring-status-failed rounded px-1 cursor-pointer"
+          >
+            <span>Jump to error in log</span>
+            <span aria-hidden="true">↓</span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -107,6 +125,8 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [copiedSha, setCopiedSha] = useState(false);
+  const [firstError, setFirstError] = useState<{ lineNum: number; snippet: string } | null>(null);
+  const logViewerRef = useRef<LogViewerRef>(null);
 
   const status = run?.status;
 
@@ -314,16 +334,54 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
 
       {/* Failure Callout Banner when pipeline failed */}
       {run.status === 'failed' && (
-        <div className="rounded-lg border border-status-failed/40 bg-status-failed/10 p-4 text-sm text-text-primary flex items-start gap-3">
-          <span className="text-status-failed text-lg leading-none font-bold">⚠</span>
-          <div>
-            <h4 className="font-semibold text-status-failed">Pipeline run failed</h4>
-            <p className="text-xs text-text-muted mt-0.5">
-              {failedCount > 0
-                ? `${failedCount} of ${jobs.length} jobs failed. Check console output below for error details.`
-                : 'Execution failed. Check console output below for failure details.'}
-            </p>
+        <div className="rounded-lg border border-status-failed/40 bg-status-failed/10 p-4 text-sm text-text-primary flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+          <div className="flex items-start gap-3 min-w-0 flex-1">
+            <span className="text-status-failed text-lg leading-none font-bold shrink-0 mt-0.5" aria-hidden="true">
+              ⚠
+            </span>
+            <div className="min-w-0 space-y-1.5 flex-1">
+              <div className="flex items-center gap-2">
+                <h4 className="font-semibold text-status-failed">Pipeline run failed</h4>
+                {failedCount > 0 && (
+                  <span className="text-[11px] font-mono text-status-failed/80 bg-status-failed/15 px-1.5 py-0.5 rounded">
+                    {failedCount} of {jobs.length} jobs failed
+                  </span>
+                )}
+              </div>
+              {firstError ? (
+                <div className="space-y-1">
+                  <div className="text-xs text-text-muted flex items-center gap-2">
+                    <span>First error in console log:</span>
+                    <span className="font-mono text-[11px] text-text-secondary bg-background/60 px-1 rounded border border-border/40">
+                      Line {firstError.lineNum}
+                    </span>
+                  </div>
+                  <pre className="font-mono text-xs text-status-failed bg-background/80 border border-status-failed/20 rounded px-2.5 py-1.5 overflow-x-auto whitespace-pre-wrap break-all max-h-20">
+                    {firstError.snippet}
+                  </pre>
+                </div>
+              ) : (
+                <p className="text-xs text-text-muted">
+                  {failedCount > 0
+                    ? `${failedCount} of ${jobs.length} jobs failed. Check console output below for error details.`
+                    : 'Execution failed. Check console output below for failure details.'}
+                </p>
+              )}
+            </div>
           </div>
+
+          {firstError && (
+            <button
+              type="button"
+              onClick={() => logViewerRef.current?.jumpToError()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-semibold bg-status-failed/20 text-status-failed hover:bg-status-failed/30 border border-status-failed/40 transition-colors shrink-0 self-start focus:outline-none focus:ring-1 focus:ring-status-failed cursor-pointer"
+              title={`Jump to line ${firstError.lineNum} in console logs`}
+            >
+              <span>Jump to Error</span>
+              <span className="font-mono text-[10px] opacity-75">(L{firstError.lineNum})</span>
+              <span aria-hidden="true">↓</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -340,7 +398,14 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
                 No jobs registered for this run.
               </div>
             ) : (
-              jobs.map((job, i) => <JobItem key={job.id} job={job} index={i} />)
+              jobs.map((job, i) => (
+                <JobItem
+                  key={job.id}
+                  job={job}
+                  index={i}
+                  onJumpToError={firstError ? () => logViewerRef.current?.jumpToError() : undefined}
+                />
+              ))
             )}
           </div>
         </div>
@@ -350,7 +415,12 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
           <h3 className="text-xs font-bold text-text-muted uppercase tracking-widest px-1">
             Console Output
           </h3>
-          <LogViewer runId={runId} isLive={isLive} />
+          <LogViewer
+            ref={logViewerRef}
+            runId={runId}
+            isLive={isLive}
+            onFirstErrorDetected={setFirstError}
+          />
         </div>
       </div>
     </div>
