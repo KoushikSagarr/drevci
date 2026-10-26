@@ -39,6 +39,8 @@ function resolveEnvKey(envKey: string, fileKeys: string[]): string | null {
   const candidates = [
     path.resolve(process.cwd(), '.env.local'),
     path.resolve(process.cwd(), '.env'),
+    path.resolve(process.cwd(), 'dashboard/.env.local'),
+    path.resolve(process.cwd(), 'dashboard/.env'),
     path.resolve(process.cwd(), '../.env.local'),
     path.resolve(process.cwd(), '../.env'),
   ];
@@ -71,11 +73,23 @@ export function getDashboardSessionSecret(): string | null {
 }
 
 export function getBackendUrl(): string {
-  const url =
+  const envVal =
     process.env.DREV_BACKEND_URL ||
     process.env.DREV_API_URL ||
-    process.env.NEXT_PUBLIC_API_URL ||
-    'http://localhost:9090';
-  return url.replace(/\/+$/, '');
+    process.env.NEXT_PUBLIC_API_URL;
+  if (envVal) {
+    return envVal.replace(/\/+$/, '');
+  }
+
+  const fileVal = resolveEnvKey('DREV_BACKEND_URL', [
+    'DREV_BACKEND_URL',
+    'DREV_API_URL',
+    'NEXT_PUBLIC_API_URL',
+  ]);
+  if (fileVal) {
+    return fileVal.replace(/\/+$/, '');
+  }
+
+  return 'http://localhost:9090';
 }
 

@@ -1,6 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateRecentMetrics, formatSeconds, formatDurationSec } from '../lib/overview-metrics.ts';
+import {
+  calculateRecentMetrics,
+  formatSeconds,
+  formatDurationSec,
+  resolveRefreshStatus,
+  resolveErrorBanner,
+} from '../lib/overview-metrics.ts';
 import type { Run, OverviewStats } from '../lib/types.ts';
 
 describe('Overview Metrics: calculateRecentMetrics', () => {
@@ -489,5 +495,280 @@ describe('Overview Stats: API response resolution and fallback mechanics', () =>
     assert.equal(getPassRateSubtitle(0, 2), '2 runs in progress');
     assert.equal(getPassRateSubtitle(0, 1), '1 run in progress');
     assert.equal(getPassRateSubtitle(0, 0), 'No completed runs in sample');
+  });
+
+  it('correctly handles 404 stats error banner visibility in fallback mode vs failure mode', () => {
+    // 1. Stats returns 404, but fallback is actively supplying queue/run metrics:
+    // Error banner MUST NOT show because fallback is active and header truthfully reflects fallback state
+    const fallbackActiveBanner = resolveErrorBanner({
+      statsError: 'Request failed with status 404',
+      runsError: null,
+      fallbackActive: true,
+    });
+    assert.equal(fallbackActiveBanner.visible, false);
+    assert.equal(fallbackActiveBanner.message, null);
+
+    // 2. Stats returns 404, AND fallback failed (cannot supply metrics):
+    // Error banner MUST show the truthful 404 error
+    const fallbackFailedBanner = resolveErrorBanner({
+      statsError: 'Request failed with status 404',
+      runsError: null,
+      fallbackActive: false,
+    });
+    assert.equal(fallbackFailedBanner.visible, true);
+    assert.equal(fallbackFailedBanner.message, 'Unable to refresh system statistics: Request failed with status 404');
+
+    // 3. Both stats and runs failed with no fallback:
+    const completeFailureBanner = resolveErrorBanner({
+      statsError: 'Request failed with status 404',
+      runsError: 'Failed to connect to backend server',
+      fallbackActive: false,
+    });
+    assert.equal(completeFailureBanner.visible, true);
+    assert.equal(completeFailureBanner.message, 'Failed to load dashboard data: Request failed with status 404');
+
+    // 4. Stats 404 with fallback active, but recent runs activity failed:
+    // Shows the specific runs error banner
+    const runsFailedWithFallbackBanner = resolveErrorBanner({
+      statsError: 'Request failed with status 404',
+      runsError: 'Recent runs timed out',
+      fallbackActive: true,
+    });
+    assert.equal(runsFailedWithFallbackBanner.visible, true);
+    assert.equal(runsFailedWithFallbackBanner.message, 'Unable to refresh recent runs: Recent runs timed out');
+
+    // 5. Both healthy:
+    const healthyBanner = resolveErrorBanner({
+      statsError: null,
+      runsError: null,
+      fallbackActive: false,
+    });
+    assert.equal(healthyBanner.visible, false);
+    assert.equal(healthyBanner.message, null);
+  });
+
+  it('correctly resolves header refresh status across all operational states', () => {
+    const fixedTime = new Date('2026-10-25T14:30:00Z');
+    const mockFormat = () => '14:30:00';
+
+    // 1. Initial loading
+    const loadingStatus = resolveRefreshStatus({
+      isInitialLoading: true,
+      statsError: null,
+      runsError: null,
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: null,
+      runsUpdatedAt: null,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(loadingStatus.type, 'loading');
+    assert.equal(loadingStatus.label, 'Connecting…');
+    assert.equal(loadingStatus.color, 'bg-status-pending');
+
+    // 2. Stats 404, fallback active (amber)
+    const fallbackStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: 'Request failed with status 404',
+      runsError: null,
+      fallbackActive: true,
+      queueFallback: { depth: 0, workers: 3, status: 'healthy' },
+      fallbackRuns: [],
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: fixedTime,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(fallbackStatus.type, 'fallback');
+    assert.equal(fallbackStatus.label, 'Fallback active (14:30:00)');
+    assert.equal(fallbackStatus.color, 'bg-[#d29922]');
+
+    // 3. Both failed with no fallback (red)
+    const errorStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: 'Request failed with status 404',
+      runsError: 'Network down',
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: null,
+      runsUpdatedAt: null,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(errorStatus.type, 'error');
+    assert.equal(errorStatus.label, 'Sync paused');
+    assert.equal(errorStatus.color, 'bg-status-failed');
+
+    // 4. Runs failed, but stats healthy (amber)
+    const partialStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: null,
+      runsError: 'Failed to fetch runs',
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: null,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(partialStatus.type, 'partial');
+    assert.equal(partialStatus.label, 'Partial sync • Activity unavailable');
+    assert.equal(partialStatus.color, 'bg-[#d29922]');
+
+    // 5. Both healthy (green)
+    const healthyStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: null,
+      runsError: null,
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: fixedTime,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(healthyStatus.type, 'healthy');
+    assert.equal(healthyStatus.label, 'Updated 14:30:00');
+    assert.equal(healthyStatus.color, 'bg-status-success');
+
+    // 6. Both failed with prior timestamp: reports stale data timestamp and red status
+    const staleFailedStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: 'Engine connection refused',
+      runsError: 'Failed to fetch runs',
+      fallbackActive: true,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: fixedTime,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(staleFailedStatus.type, 'error');
+    assert.equal(staleFailedStatus.label, 'Sync paused • Stale data (14:30:00)');
+    assert.equal(staleFailedStatus.color, 'bg-status-failed');
+
+    // 7. Stats failed without fallback data
+    const noFallbackStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: 'Stats unavailable',
+      runsError: null,
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: null,
+      runsUpdatedAt: fixedTime,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(noFallbackStatus.type, 'error');
+    assert.equal(noFallbackStatus.label, 'Sync paused • Stats unavailable');
+    assert.equal(noFallbackStatus.color, 'bg-status-failed');
+  });
+
+  it('clamps negative durations safely to 0s', () => {
+    assert.equal(formatSeconds(-15), '0s');
+    assert.equal(formatDurationSec(-1), '0s');
+  });
+
+  it('preserves 0% pass rate when all completed runs fail', () => {
+    const failedRuns: Run[] = [
+      {
+        id: 'run-f1',
+        pipeline_id: 'ci',
+        status: 'failed',
+        started_at: '2026-10-21T10:00:00Z',
+        finished_at: '2026-10-21T10:01:00Z',
+      },
+      {
+        id: 'run-f2',
+        pipeline_id: 'ci',
+        status: 'failed',
+        started_at: '2026-10-21T10:02:00Z',
+        finished_at: '2026-10-21T10:03:00Z',
+      },
+    ];
+    const metrics = calculateRecentMetrics(failedRuns);
+    assert.equal(metrics.completedSampleCount, 2);
+    assert.equal(metrics.passRate, 0);
+  });
+
+  it('treats zero-valued durations and metrics as valid values rather than missing data', () => {
+    // 1. Instantaneous run: 0 seconds duration is a valid completed duration
+    const zeroDurationRun: Run[] = [
+      {
+        id: 'run-zero-dur',
+        pipeline_id: 'fast-ci',
+        status: 'success',
+        started_at: '2026-10-21T10:00:00Z',
+        finished_at: '2026-10-21T10:00:00Z', // 0s duration
+      },
+    ];
+    const metrics = calculateRecentMetrics(zeroDurationRun);
+    assert.equal(metrics.completedSampleCount, 1);
+    assert.equal(metrics.durationSampleCount, 1);
+    assert.equal(metrics.meanDurationSec, 0);
+    assert.equal(metrics.meanDurationFormatted, '0s');
+    assert.equal(metrics.passRate, 100);
+
+    // 2. formatDurationSec(0) must return '0s' and not '—'
+    assert.equal(formatDurationSec(0), '0s');
+    assert.equal(formatSeconds(0), '0s');
+
+    // 3. Null and undefined must return '—'
+    assert.equal(formatDurationSec(null), '—');
+    assert.equal(formatDurationSec(undefined), '—');
+    assert.equal(formatDurationSec(NaN), '—');
+  });
+
+  it('handles independent endpoint failures cleanly in error banner and status resolution', () => {
+    const fixedTime = new Date('2026-10-25T14:30:00Z');
+    const mockFormat = () => '14:30:00';
+
+    // 1. Stats healthy, but runs failed:
+    const runsFailedBanner = resolveErrorBanner({
+      statsError: null,
+      runsError: 'Failed to fetch recent runs',
+      fallbackActive: false,
+    });
+    assert.equal(runsFailedBanner.visible, true);
+    assert.equal(runsFailedBanner.message, 'Unable to refresh recent runs: Failed to fetch recent runs');
+
+    const runsFailedStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: null,
+      runsError: 'Failed to fetch recent runs',
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: null,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(runsFailedStatus.type, 'partial');
+    assert.equal(runsFailedStatus.label, 'Partial sync • Activity unavailable');
+    assert.equal(runsFailedStatus.color, 'bg-[#d29922]');
+
+    // 2. Full outage: both stats and runs fail
+    const fullOutageBanner = resolveErrorBanner({
+      statsError: 'Connection refused',
+      runsError: 'Connection refused',
+      fallbackActive: false,
+    });
+    assert.equal(fullOutageBanner.visible, true);
+    assert.equal(fullOutageBanner.message, 'Failed to load dashboard data: Connection refused');
+
+    const fullOutageStatus = resolveRefreshStatus({
+      isInitialLoading: false,
+      statsError: 'Connection refused',
+      runsError: 'Connection refused',
+      fallbackActive: false,
+      queueFallback: null,
+      fallbackRuns: null,
+      statsUpdatedAt: fixedTime,
+      runsUpdatedAt: fixedTime,
+      formatTimeFn: mockFormat,
+    });
+    assert.equal(fullOutageStatus.type, 'error');
+    assert.equal(fullOutageStatus.label, 'Sync paused • Stale data (14:30:00)');
+    assert.equal(fullOutageStatus.color, 'bg-status-failed');
   });
 });

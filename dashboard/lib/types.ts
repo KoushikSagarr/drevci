@@ -11,6 +11,8 @@ export interface Run {
   branch?: string;
   started_at: string;
   finished_at: string;
+  created_at?: string;
+  author?: string;
   jobs?: RunJob[];
 }
 

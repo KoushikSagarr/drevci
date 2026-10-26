@@ -121,6 +121,7 @@ export function calculateRecentMetrics(runs: Run[], sampleLimit = 25): RecentMet
 }
 
 export function formatSeconds(sec: number): string {
+  if (sec < 0) sec = 0;
   if (sec < 60) return `${sec}s`;
   const m = Math.floor(sec / 60);
   const s = sec % 60;
@@ -132,4 +133,143 @@ export function formatSeconds(sec: number): string {
 export function formatDurationSec(sec: number | null | undefined): string {
   if (sec === null || sec === undefined || isNaN(sec)) return '—';
   return formatSeconds(sec);
+}
+
+export interface RefreshStatusResult {
+  label: string;
+  color: string;
+  type: 'loading' | 'error' | 'partial' | 'fallback' | 'healthy';
+}
+
+export interface ErrorBannerResult {
+  visible: boolean;
+  message: string | null;
+}
+
+export function resolveRefreshStatus({
+  isInitialLoading,
+  statsError,
+  runsError,
+  fallbackActive,
+  queueFallback,
+  fallbackRuns,
+  statsUpdatedAt,
+  runsUpdatedAt,
+  formatTimeFn = (d: Date) =>
+    d.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }),
+}: {
+  isInitialLoading: boolean;
+  statsError: string | null;
+  runsError: string | null;
+  fallbackActive: boolean;
+  queueFallback: unknown | null;
+  fallbackRuns: Run[] | null;
+  statsUpdatedAt: Date | null;
+  runsUpdatedAt: Date | null;
+  formatTimeFn?: (d: Date) => string;
+}): RefreshStatusResult {
+  if (isInitialLoading) {
+    return { label: 'Connecting…', color: 'bg-status-pending', type: 'loading' };
+  }
+
+  // Both failed: entire sync failed regardless of prior fallback state
+  if (statsError && runsError) {
+    const latestTime = statsUpdatedAt || runsUpdatedAt;
+    const timeStr = latestTime ? ` (${formatTimeFn(latestTime)})` : '';
+    return {
+      label: latestTime ? `Sync paused • Stale data${timeStr}` : 'Sync paused',
+      color: 'bg-status-failed',
+      type: 'error',
+    };
+  }
+
+  // Runs failed: Recent Activity is stale or unavailable
+  if (runsError) {
+    const timeStr = runsUpdatedAt ? ` (${formatTimeFn(runsUpdatedAt)})` : '';
+    return {
+      label: runsUpdatedAt ? `Partial sync • Stale activity${timeStr}` : 'Partial sync • Activity unavailable',
+      color: 'bg-[#d29922]',
+      type: 'partial',
+    };
+  }
+
+  // Stats failed, but fallback is actively supplying queue/run metrics (and runs is healthy)
+  if (statsError && (fallbackActive || queueFallback || fallbackRuns)) {
+    const timeStr = statsUpdatedAt ? ` (${formatTimeFn(statsUpdatedAt)})` : '';
+    return {
+      label: `Fallback active${timeStr}`,
+      color: 'bg-[#d29922]',
+      type: 'fallback',
+    };
+  }
+
+  // Stats failed with no fallback at all
+  if (statsError) {
+    return {
+      label: 'Sync paused • Stats unavailable',
+      color: 'bg-status-failed',
+      type: 'error',
+    };
+  }
+
+  // Both stats and runs healthy
+  if (statsUpdatedAt && runsUpdatedAt) {
+    const earliest = statsUpdatedAt < runsUpdatedAt ? statsUpdatedAt : runsUpdatedAt;
+    return {
+      label: `Updated ${formatTimeFn(earliest)}`,
+      color: 'bg-status-success',
+      type: 'healthy',
+    };
+  }
+
+  if (statsUpdatedAt || runsUpdatedAt) {
+    const latest = (statsUpdatedAt || runsUpdatedAt)!;
+    return {
+      label: `Updated ${formatTimeFn(latest)}`,
+      color: 'bg-status-success',
+      type: 'healthy',
+    };
+  }
+
+  return { label: 'Live', color: 'bg-status-success', type: 'healthy' };
+}
+
+export function resolveErrorBanner({
+  statsError,
+  runsError,
+  fallbackActive,
+}: {
+  statsError: string | null;
+  runsError: string | null;
+  fallbackActive: boolean;
+}): ErrorBannerResult {
+  // If stats failed but fallback is actively supplying queue and run metrics,
+  // the page is operating in declared fallback mode (indicated in the header badge)
+  // rather than a broken/failing state.
+  const effectiveStatsError = fallbackActive ? null : statsError;
+
+  if (effectiveStatsError && runsError) {
+    return {
+      visible: true,
+      message: `Failed to load dashboard data: ${effectiveStatsError}`,
+    };
+  }
+  if (effectiveStatsError) {
+    return {
+      visible: true,
+      message: `Unable to refresh system statistics: ${effectiveStatsError}`,
+    };
+  }
+  if (runsError) {
+    return {
+      visible: true,
+      message: `Unable to refresh recent runs: ${runsError}`,
+    };
+  }
+  return { visible: false, message: null };
 }

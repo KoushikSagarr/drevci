@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef, use } from 'react';
 import Link from 'next/link';
-import { getRun, getRunJobs } from '../../../lib/api';
+import { getRun, getRunJobs, isNotFoundError } from '../../../lib/api';
 import { Run, RunJob } from '../../../lib/types';
 import StatusBadge from '../../../components/StatusBadge';
 import LogViewer, { LogViewerRef } from '../../../components/LogViewer';
@@ -70,7 +70,11 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
         }
       } catch (err) {
         if (!isCancelled) {
-          console.error('Failed to fetch run data:', err);
+          if (isNotFoundError(err)) {
+            console.warn(`Run ${runId} not found (404)`);
+          } else {
+            console.error('Failed to fetch run data:', err);
+          }
           setError(err instanceof Error ? err.message : 'Failed to fetch run details');
         }
       }
@@ -93,24 +97,33 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   };
 
   if (error && !run) {
+    const isNotFound = isNotFoundError(error);
     return (
       <div className="mx-auto max-w-6xl px-6 py-16 text-center">
-        <div className="flex flex-col items-center gap-4 rounded-xl border border-border bg-surface p-8 max-w-lg mx-auto">
-          <div className="text-4xl text-status-failed">⚠</div>
-          <h2 className="text-lg font-bold text-text-primary">Unable to load run details</h2>
-          <p className="text-sm text-text-muted">{error}</p>
+        <div className="flex flex-col items-center gap-4 rounded-xl border border-border bg-surface p-8 max-w-lg mx-auto animate-fade-in-up">
+          <div className="text-4xl">{isNotFound ? '🔍' : '⚠'}</div>
+          <h2 className="text-lg font-bold text-text-primary">
+            {isNotFound ? 'Run Not Found' : 'Unable to load run details'}
+          </h2>
+          <p className="text-sm text-text-muted max-w-md">
+            {isNotFound
+              ? `The requested pipeline run "${runId}" does not exist or may have expired.`
+              : error}
+          </p>
           <div className="flex gap-3 mt-2">
-            <button
-              onClick={() => setReloadKey((k) => k + 1)}
-              className="rounded-md border border-border bg-background px-4 py-2 text-xs font-semibold text-text-primary hover:bg-surface-hover transition-colors"
-            >
-              ↻ Try Again
-            </button>
+            {!isNotFound && (
+              <button
+                onClick={() => setReloadKey((k) => k + 1)}
+                className="rounded-md border border-border bg-background px-4 py-2 text-xs font-semibold text-text-primary hover:bg-surface-hover transition-colors"
+              >
+                ↻ Try Again
+              </button>
+            )}
             <Link
               href="/runs"
               className="rounded-md bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent/90 transition-colors"
             >
-              ← Back to Runs
+              ← Back to Pipeline Runs
             </Link>
           </div>
         </div>
@@ -135,10 +148,18 @@ export default function RunDetailPage({ params }: { params: Promise<{ runId: str
   return (
     <div className="mx-auto max-w-6xl px-6 py-8 space-y-8">
       {/* Top Nav / Breadcrumbs */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-2 text-sm">
           <Link href="/runs" className="text-text-muted hover:text-accent font-medium transition-colors">
             Pipelines
+          </Link>
+          <span className="text-text-muted">/</span>
+          <Link
+            href={`/runs?pipeline=${encodeURIComponent(run.pipeline_id)}`}
+            className="text-text-muted hover:text-accent font-medium transition-colors"
+            title={`View all runs for ${run.pipeline_id}`}
+          >
+            {run.pipeline_id}
           </Link>
           <span className="text-text-muted">/</span>
           <span className="text-text-primary font-mono bg-surface px-2 py-0.5 rounded border border-border">

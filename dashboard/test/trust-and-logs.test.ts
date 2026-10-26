@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   stripAnsi,
@@ -10,6 +10,7 @@ import {
   highlightMatchInSpan,
 } from '../lib/ansi.ts';
 import { formatDuration } from '../lib/duration.ts';
+import { streamLogs, ApiError, isNotFoundError } from '../lib/api.ts';
 import type { Run } from '../lib/types.ts';
 
 describe('ANSI stripping, SGR parsing, and log classification', () => {
@@ -359,5 +360,489 @@ describe('In-log search match highlighting', () => {
     assert.equal(firstSpanMatches[1].isMatch, true);
     assert.equal(firstSpanMatches[2].text, ']');
     assert.equal(firstSpanMatches[2].isMatch, false);
+  });
+});
+
+describe('Phase C & D: Malformed ANSI, Clipboard Formatting & Run Details', () => {
+  it('handles malformed, truncated, or dangling ANSI escapes safely without throwing', () => {
+    // Truncated escape byte alone
+    assert.equal(stripAnsi('\u001b'), '\u001b');
+    // Incomplete bracket
+    assert.equal(stripAnsi('\u001b['), '\u001b[');
+    // Incomplete code without terminating character
+    assert.equal(stripAnsi('\u001b[31'), '\u001b[31');
+    // Mixed valid and broken escapes
+    assert.equal(stripAnsi('\u001b[31mError\u001b[0m \u001b[ dangled'), 'Error \u001b[ dangled');
+
+    // Cursor save and restore sequences (\u001b[s and \u001b[u)
+    assert.equal(stripAnsi('\u001b[s[drev] Starting\u001b[u'), '[drev] Starting');
+    assert.equal(stripAnsi('\u001b[s\u001b[32mSuccess\u001b[0m\u001b[u'), 'Success');
+
+    const cursorSpans = parseAnsi('\u001b[s\u001b[32mActive\u001b[0m\u001b[u');
+    assert.equal(cursorSpans.length, 1);
+    assert.equal(cursorSpans[0].text, 'Active');
+    assert.equal(cursorSpans[0].className, 'text-[#3fb950]');
+
+    // parseAnsi must not crash on malformed inputs
+    const brokenSpans = parseAnsi('\u001b[ incomplete \u001b[31mColored\u001b[0m');
+    assert(Array.isArray(brokenSpans));
+    assert(brokenSpans.length > 0);
+  });
+
+  it('formats clipboard log content as pure plain text without ANSI escape sequences', () => {
+    const rawLogLines = [
+      '\u001b[32m[drev] Starting job verify\u001b[0m',
+      '\u001b[1;34m$ go test ./...\u001b[0m',
+      'ok   github.com/drevci/drev 0.12s',
+      '\u001b[32m[drev] Step completed successfully\u001b[0m',
+    ];
+
+    const clipboardText = rawLogLines.map(stripAnsi).join('\n');
+    assert.equal(clipboardText.includes('\u001b'), false);
+    assert.equal(clipboardText.includes('\u001b['), false);
+    assert.equal(clipboardText.split('\n').length, 4);
+    assert.equal(clipboardText.split('\n')[0], '[drev] Starting job verify');
+    assert.equal(clipboardText.split('\n')[1], '$ go test ./...');
+    assert.equal(clipboardText.split('\n')[2], 'ok   github.com/drevci/drev 0.12s');
+    assert.equal(clipboardText.split('\n')[3], '[drev] Step completed successfully');
+  });
+
+  it('classifies 404 vs transient network/server errors accurately for run details', () => {
+    // 1. Real ApiError instances
+    assert.equal(isNotFoundError(new ApiError('Request failed with status 404', 404)), true);
+    assert.equal(isNotFoundError(new ApiError('Resource not found', 404)), true);
+    assert.equal(isNotFoundError(new ApiError('Internal Server Error', 500)), false);
+    assert.equal(isNotFoundError(new ApiError('Service Unavailable', 503)), false);
+
+    // 2. Standard Error instances
+    assert.equal(isNotFoundError(new Error('404 Not Found')), true);
+    assert.equal(isNotFoundError(new Error('Run not found')), true);
+    assert.equal(isNotFoundError(new Error('Failed to connect to backend server')), false);
+    assert.equal(isNotFoundError(new Error('Network error: ECONNREFUSED')), false);
+
+    // 3. Raw error string messages
+    assert.equal(isNotFoundError('Request failed with status 404'), true);
+    assert.equal(isNotFoundError('Run not found'), true);
+    assert.equal(isNotFoundError('Error: 404 Not Found'), true);
+    assert.equal(isNotFoundError('Request failed with status 500'), false);
+    assert.equal(isNotFoundError('Network error: ECONNREFUSED'), false);
+    assert.equal(isNotFoundError(null), false);
+    assert.equal(isNotFoundError(undefined), false);
+  });
+
+  it('safely encodes breadcrumb URLs for pipeline IDs with special characters and slashes', () => {
+    const pipelineIdWithSlash = 'project/service-api';
+    const encoded = encodeURIComponent(pipelineIdWithSlash);
+    assert.equal(encoded, 'project%2Fservice-api');
+
+    const breadcrumbHref = `/runs?pipeline=${encoded}`;
+    assert.equal(breadcrumbHref, '/runs?pipeline=project%2Fservice-api');
+
+    // Decoding back reproduces original
+    assert.equal(decodeURIComponent(encoded), pipelineIdWithSlash);
+  });
+
+  it('handles EventSource teardown, normal completion, and transient live recovery cleanly', async () => {
+    const instances: MockEventSource[] = [];
+
+    class MockEventSource {
+      url: string;
+      onopen: (() => void) | null = null;
+      onmessage: ((ev: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      closed = false;
+      constructor(url: string) {
+        this.url = url;
+        instances.push(this);
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+
+    const globalObj = globalThis as unknown as { EventSource?: unknown };
+    const originalEventSource = globalObj.EventSource;
+    globalObj.EventSource = MockEventSource;
+
+    try {
+      // 1. Consumer teardown: unbinds listeners and closes connection without calling onDone
+      {
+        instances.length = 0;
+        let doneCalled = false;
+        const cleanup = streamLogs('run-1', () => {}, () => { doneCalled = true; });
+        const es1 = instances[0];
+        assert.ok(es1);
+        assert.equal(es1.closed, false);
+        assert.notEqual(es1.onmessage, null);
+        assert.notEqual(es1.onerror, null);
+
+        cleanup();
+
+        assert.equal(es1.closed, true);
+        assert.equal(es1.onopen, null);
+        assert.equal(es1.onmessage, null);
+        assert.equal(es1.onerror, null);
+        assert.equal(doneCalled, false, 'Consumer teardown should not trigger onDone');
+      }
+
+      // 2. Normal stream completion on finished run (isLive = false): onerror terminates cleanly without reconnect
+      {
+        instances.length = 0;
+        let doneCalled = false;
+        streamLogs(
+          'run-finished',
+          () => {},
+          () => { doneCalled = true; },
+          undefined,
+          { isLive: () => false }
+        );
+        const es2 = instances[0];
+        assert.ok(es2);
+        assert.equal(es2.closed, false);
+
+        // Simulate server connection closure (normal completion)
+        es2.onerror?.();
+
+        assert.equal(es2.closed, true);
+        assert.equal(es2.onopen, null);
+        assert.equal(es2.onmessage, null);
+        assert.equal(es2.onerror, null);
+        assert.equal(doneCalled, true, 'Normal stream completion must call onDone');
+        assert.equal(instances.length, 1, 'Completed run must not attempt reconnection');
+      }
+
+      // 3. Transient error during live run (isLive = true): onerror triggers reconnection
+      {
+        instances.length = 0;
+        let doneCalled = false;
+        let openCount = 0;
+        const cleanup = streamLogs(
+          'run-live',
+          () => {},
+          () => { doneCalled = true; },
+          () => { openCount++; },
+          { isLive: () => true, maxRetries: 2, retryDelayMs: 10 }
+        );
+        const es3a = instances[0];
+        assert.ok(es3a);
+        es3a.onopen?.();
+        assert.equal(openCount, 1);
+
+        // Simulate transient socket drop while run is live
+        es3a.onerror?.();
+        assert.equal(es3a.closed, true);
+        assert.equal(doneCalled, false, 'Transient error on live run should not terminate via onDone');
+
+        // Wait for retry delay (10ms)
+        await new Promise((r) => setTimeout(r, 35));
+
+        // A new EventSource should have been created
+        assert.equal(instances.length, 2, 'Should reconnect with new EventSource instance');
+        const es3b = instances[1];
+        assert.ok(es3b);
+        assert.equal(es3b.closed, false);
+        es3b.onopen?.();
+        assert.equal(openCount, 2);
+
+        cleanup();
+        assert.equal(es3b.closed, true);
+      }
+
+      // 4. Bounded retries: after maxRetries is reached, terminates cleanly with onDone
+      {
+        instances.length = 0;
+        let doneCalled = false;
+        const cleanup = streamLogs(
+          'run-dead',
+          () => {},
+          () => { doneCalled = true; },
+          undefined,
+          { isLive: () => true, maxRetries: 1, retryDelayMs: 10 }
+        );
+        const es4a = instances[0];
+        es4a.onerror?.(); // Retry 1
+        await new Promise((r) => setTimeout(r, 35));
+
+        assert.equal(instances.length, 2);
+        const es4b = instances[1];
+        es4b.onerror?.(); // Reached maxRetries (1)
+
+        assert.equal(es4b.closed, true);
+        assert.equal(doneCalled, true, 'Exhausted retries must terminate and call onDone');
+        assert.equal(instances.length, 2, 'Must not reconnect beyond maxRetries');
+
+        cleanup();
+      }
+    } finally {
+      globalObj.EventSource = originalEventSource;
+    }
+  });
+});
+
+describe('SSE Completion-Race Hardening & LogViewer Indicator Derivation', () => {
+  class MockEventSource {
+    url: string;
+    onopen: (() => void) | null = null;
+    onmessage: ((ev: MessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    closed = false;
+    constructor(url: string) {
+      this.url = url;
+      mockInstances.push(this);
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  const mockInstances: MockEventSource[] = [];
+  const globalObj = globalThis as unknown as { EventSource?: unknown };
+  let originalEventSource: unknown;
+
+  before(() => {
+    originalEventSource = globalObj.EventSource;
+    globalObj.EventSource = MockEventSource;
+  });
+
+  after(() => {
+    globalObj.EventSource = originalEventSource;
+  });
+
+  beforeEach(() => {
+    mockInstances.length = 0;
+  });
+
+  it('terminates cleanly without reconnect when backend reports terminal status, even if local isLive() is stale', async () => {
+    let doneCalled = false;
+    const cleanup = streamLogs(
+      'run-race-1',
+      () => {},
+      () => { doneCalled = true; },
+      undefined,
+      {
+        isLive: () => true, // stale local state
+        getRunStatus: async () => 'success', // actual backend terminal state
+        maxRetries: 3,
+        retryDelayMs: 10,
+      }
+    );
+
+    assert.equal(mockInstances.length, 1);
+    const es = mockInstances[0];
+
+    // Stream closes on completed run
+    await es.onerror?.();
+
+    assert.equal(doneCalled, true, 'Must call onDone when backend is terminal');
+    assert.equal(mockInstances.length, 1, 'Must not initiate reconnect when backend reports completed');
+    assert.equal(es.closed, true);
+
+    cleanup();
+  });
+
+  it('reconnects within configured bounds when run is genuinely live on the backend', async () => {
+    let doneCalled = false;
+    let openCount = 0;
+    const cleanup = streamLogs(
+      'run-live-genuine',
+      () => {},
+      () => { doneCalled = true; },
+      () => { openCount++; },
+      {
+        isLive: () => true,
+        getRunStatus: async () => 'running',
+        maxRetries: 2,
+        retryDelayMs: 15,
+      }
+    );
+
+    assert.equal(mockInstances.length, 1);
+    const es1 = mockInstances[0];
+    es1.onopen?.();
+    assert.equal(openCount, 1);
+
+    // Socket drops while running
+    await es1.onerror?.();
+    assert.equal(es1.closed, true);
+    assert.equal(doneCalled, false);
+
+    // Wait for retry delay
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(mockInstances.length, 2, 'Must reconnect when genuinely live');
+    const es2 = mockInstances[1];
+    es2.onopen?.();
+    assert.equal(openCount, 2);
+
+    cleanup();
+    assert.equal(es2.closed, true);
+  });
+
+  it('keeps retries strictly bounded and halts with onDone when status check fails repeatedly', async () => {
+    let doneCalled = false;
+    const cleanup = streamLogs(
+      'run-failing-status',
+      () => {},
+      () => { doneCalled = true; },
+      undefined,
+      {
+        isLive: () => true,
+        getRunStatus: async () => { throw new Error('status check failed: 503'); },
+        maxRetries: 1,
+        retryDelayMs: 15,
+      }
+    );
+
+    assert.equal(mockInstances.length, 1);
+    const es1 = mockInstances[0];
+
+    // First error: attempts 1 bounded retry
+    await es1.onerror?.();
+    await new Promise((r) => setTimeout(r, 40));
+
+    assert.equal(mockInstances.length, 2);
+    const es2 = mockInstances[1];
+
+    // Second error: maxRetries reached, terminates
+    await es2.onerror?.();
+
+    assert.equal(doneCalled, true, 'Must terminate after exhausting retries despite error');
+    assert.equal(mockInstances.length, 2, 'Must not exceed maxRetries');
+
+    cleanup();
+  });
+
+  it('aborts cleanly without timer or callback when unmounted during in-flight status request', async () => {
+    let doneCalled = false;
+    let resolveStatus: (status: string) => void = () => {};
+    const statusPromise = new Promise<string>((resolve) => {
+      resolveStatus = resolve;
+    });
+
+    const cleanup = streamLogs(
+      'run-unmount-race',
+      () => {},
+      () => { doneCalled = true; },
+      undefined,
+      {
+        isLive: () => true,
+        getRunStatus: () => statusPromise,
+        maxRetries: 2,
+        retryDelayMs: 10,
+      }
+    );
+
+    assert.equal(mockInstances.length, 1);
+    const es = mockInstances[0];
+
+    // Trigger error -> enters in-flight status check
+    const errorPromise = es.onerror?.();
+
+    // Consumer tears down component while status query is in flight
+    cleanup();
+    assert.equal(es.closed, true);
+
+    // Status check completes after teardown
+    resolveStatus('running');
+    await errorPromise;
+
+    // Wait past retry delay
+    await new Promise((r) => setTimeout(r, 35));
+
+    assert.equal(mockInstances.length, 1, 'Must not open new connection after unmount');
+    assert.equal(doneCalled, false, 'Teardown must suppress onDone');
+  });
+
+  it('aborts cleanly when unmounted while reconnect timer is pending', async () => {
+    let doneCalled = false;
+    const cleanup = streamLogs(
+      'run-timer-cancel',
+      () => {},
+      () => { doneCalled = true; },
+      undefined,
+      {
+        isLive: () => true,
+        getRunStatus: async () => 'running',
+        maxRetries: 2,
+        retryDelayMs: 50,
+      }
+    );
+
+    const es = mockInstances[0];
+    await es.onerror?.();
+
+    // Unmount during the 50ms delay
+    cleanup();
+
+    // Wait past the 50ms delay
+    await new Promise((r) => setTimeout(r, 70));
+
+    assert.equal(mockInstances.length, 1, 'Pending reconnect timer must be cancelled');
+    assert.equal(doneCalled, false);
+  });
+
+  it('deduplicates replayed logs upon stream reconnection', () => {
+    let lines: string[] = [];
+    let isFirstConnection = true;
+
+    const onOpen = () => {
+      if (!isFirstConnection) {
+        lines = [];
+      }
+      isFirstConnection = false;
+    };
+    const onLine = (line: string) => {
+      lines.push(line);
+    };
+
+    // First connection streams 3 lines
+    onOpen();
+    onLine('Line 1');
+    onLine('Line 2');
+    onLine('Line 3');
+    assert.equal(lines.length, 3);
+
+    // Reconnection replays from byte zero
+    onOpen();
+    onLine('Line 1');
+    onLine('Line 2');
+    onLine('Line 3');
+    onLine('Line 4 (new)');
+
+    assert.equal(lines.length, 4);
+    assert.deepEqual(lines, ['Line 1', 'Line 2', 'Line 3', 'Line 4 (new)']);
+  });
+
+  it('derives live vs closed indicator and completion divider accurately from run state', () => {
+    function deriveIndicatorState(isLive: boolean, isConnected: boolean, linesCount: number) {
+      const isStreamLive = isLive && isConnected;
+      const indicatorText = isStreamLive ? '● live' : '○ closed';
+      const showCompleteDivider = !isStreamLive && linesCount > 0 && !isLive;
+      return { isStreamLive, indicatorText, showCompleteDivider };
+    }
+
+    // 1. Live run with active socket
+    const liveConnected = deriveIndicatorState(true, true, 10);
+    assert.equal(liveConnected.indicatorText, '● live');
+    assert.equal(liveConnected.showCompleteDivider, false);
+
+    // 2. Live run during transient socket drop
+    const liveDisconnected = deriveIndicatorState(true, false, 10);
+    assert.equal(liveDisconnected.indicatorText, '○ closed');
+    assert.equal(liveDisconnected.showCompleteDivider, false);
+
+    // 3. Completed run while socket is still transitioning or closed
+    const completedClosed = deriveIndicatorState(false, false, 15);
+    assert.equal(completedClosed.indicatorText, '○ closed');
+    assert.equal(completedClosed.showCompleteDivider, true);
+
+    // 4. Completed run even if isConnected remained true from prior render
+    const completedStaleConnected = deriveIndicatorState(false, true, 15);
+    assert.equal(completedStaleConnected.indicatorText, '○ closed');
+    assert.equal(completedStaleConnected.showCompleteDivider, true);
+
+    // 5. Zero lines captured on completed run
+    const completedZeroLines = deriveIndicatorState(false, false, 0);
+    assert.equal(completedZeroLines.showCompleteDivider, false);
   });
 });

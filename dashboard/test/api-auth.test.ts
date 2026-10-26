@@ -23,6 +23,7 @@ import {
   _resetRateLimitsForTesting,
   base64UrlEncode,
 } from '../lib/auth-server.ts';
+import { getBackendUrl } from '../lib/server-config.ts';
 
 const TEST_PASSWORD = 'correct-horse-battery-staple-operator';
 const TEST_SESSION_SECRET = 'this-is-a-high-entropy-session-secret-for-tests-32';
@@ -1007,5 +1008,45 @@ describe('Dashboard API Proxy & Authentication Integration', () => {
     const optRes = await proxyOPTIONS(optReq, { params: Promise.resolve({ path: ['health'] }) });
     assert.equal(optRes.status, 204);
     assert.notEqual(optRes.headers.get('access-control-allow-origin'), '*');
+  });
+
+  // 20. Backend URL resolution: environment precedence, trailing slash normalization, and default fallback
+  it('20. Backend URL resolution: environment precedence, trailing slash normalization, and default fallback', () => {
+    const savedEnvBackendUrl = process.env.DREV_BACKEND_URL;
+    const savedEnvApiUrl = process.env.DREV_API_URL;
+    const savedNextPublic = process.env.NEXT_PUBLIC_API_URL;
+    const savedNoEnv = process.env.DREV_NO_ENV_FILE;
+
+    try {
+      // 20a. Strips trailing slashes cleanly
+      process.env.DREV_BACKEND_URL = 'http://127.0.0.1:9090///';
+      assert.equal(getBackendUrl(), 'http://127.0.0.1:9090');
+
+      // 20b. Precedence: DREV_BACKEND_URL > DREV_API_URL > NEXT_PUBLIC_API_URL
+      process.env.DREV_BACKEND_URL = '';
+      process.env.DREV_API_URL = 'http://api-internal:9090/';
+      process.env.NEXT_PUBLIC_API_URL = 'http://public:9090/';
+      assert.equal(getBackendUrl(), 'http://api-internal:9090');
+
+      // 20c. Falls back to NEXT_PUBLIC_API_URL
+      process.env.DREV_API_URL = '';
+      assert.equal(getBackendUrl(), 'http://public:9090');
+
+      // 20d. When all env variables are unset and DREV_NO_ENV_FILE is set, falls back to default localhost:9090
+      delete process.env.DREV_BACKEND_URL;
+      delete process.env.DREV_API_URL;
+      delete process.env.NEXT_PUBLIC_API_URL;
+      process.env.DREV_NO_ENV_FILE = 'true';
+      assert.equal(getBackendUrl(), 'http://localhost:9090');
+    } finally {
+      if (savedEnvBackendUrl !== undefined) process.env.DREV_BACKEND_URL = savedEnvBackendUrl;
+      else delete process.env.DREV_BACKEND_URL;
+      if (savedEnvApiUrl !== undefined) process.env.DREV_API_URL = savedEnvApiUrl;
+      else delete process.env.DREV_API_URL;
+      if (savedNextPublic !== undefined) process.env.NEXT_PUBLIC_API_URL = savedNextPublic;
+      else delete process.env.NEXT_PUBLIC_API_URL;
+      if (savedNoEnv !== undefined) process.env.DREV_NO_ENV_FILE = savedNoEnv;
+      else delete process.env.DREV_NO_ENV_FILE;
+    }
   });
 });

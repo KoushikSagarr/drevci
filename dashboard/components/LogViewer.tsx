@@ -37,6 +37,9 @@ export default function LogViewer({
   const [copied, setCopied] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
 
+  // Derived live connection state: the log stream is only active/live if both the socket is connected and the run is live
+  const isStreamLive = isLive && isConnected;
+
   // Search & Filter state
   const [searchQuery, setSearchQuery] = useState('');
   const [activeMatchIdx, setActiveMatchIdx] = useState(0);
@@ -67,6 +70,7 @@ export default function LogViewer({
   useEffect(() => {
     let cleanup = () => {};
     let isSubscribed = true;
+    let isFirstConnection = true;
 
     if (isLive || !hasFetchedRef.current) {
       cleanup = streamLogs(
@@ -86,7 +90,14 @@ export default function LogViewer({
         () => {
           if (isSubscribed) {
             setIsConnected(true);
+            if (!isFirstConnection) {
+              setLines([]);
+            }
+            isFirstConnection = false;
           }
+        },
+        {
+          isLive: () => isLive,
         }
       );
     }
@@ -333,7 +344,7 @@ export default function LogViewer({
             <span className="h-3 w-3 rounded-full bg-[#3fb950]/70" />
           </div>
           <span className="text-xs font-mono text-text-muted">
-            {isConnected ? '● live' : '○ closed'} — {lines.length} lines
+            {isStreamLive ? '● live' : '○ closed'} — {lines.length} lines
           </span>
 
           {errorCount > 0 && (
@@ -578,7 +589,7 @@ export default function LogViewer({
           );
         })}
 
-        {!isConnected && lines.length > 0 && !isLive && (
+        {!isStreamLive && lines.length > 0 && !isLive && (
           <div className="mt-3 pt-3 border-t border-border/60 text-text-muted text-center text-xs">
             ── pipeline complete ──
           </div>

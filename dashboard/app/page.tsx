@@ -7,7 +7,12 @@ import type { OverviewStats, QueueStatus } from '../lib/api';
 import type { Run } from '../lib/types';
 import StatusBadge from '../components/StatusBadge';
 import LiveDuration from '../components/LiveDuration';
-import { calculateRecentMetrics, formatDurationSec } from '../lib/overview-metrics';
+import {
+  calculateRecentMetrics,
+  formatDurationSec,
+  resolveRefreshStatus,
+  resolveErrorBanner,
+} from '../lib/overview-metrics';
 
 function timeAgo(dateStr?: string) {
   if (!dateStr || dateStr === '0001-01-01T00:00:00Z') return '—';
@@ -170,9 +175,13 @@ export default function OverviewPage() {
           } catch {
             // Ignore secondary fallback error
           }
-          if (!isCancelled && hasFallbackData) {
-            setFallbackActive(true);
-            setStatsUpdatedAt(new Date());
+          if (!isCancelled) {
+            if (hasFallbackData) {
+              setFallbackActive(true);
+              setStatsUpdatedAt(new Date());
+            } else {
+              setFallbackActive(false);
+            }
           }
         }
       } finally {
@@ -230,7 +239,9 @@ export default function OverviewPage() {
     ? formatDurationSec(stats.mean_duration_sec)
     : fallbackMetrics.meanDurationFormatted;
   const effectiveActiveCount = stats ? stats.active_runs_count : fallbackMetrics.activeInBatch;
-  const effectiveRecentFailures: Run[] = stats ? stats.recent_failures : fallbackMetrics.recentFailures;
+  const effectiveRecentFailures: Run[] = (stats?.recent_failures && Array.isArray(stats.recent_failures))
+    ? stats.recent_failures
+    : (fallbackMetrics.recentFailures || []);
 
   const recentRuns = useMemo(() => {
     // Recent Activity always displays at most 10 runs
@@ -249,65 +260,25 @@ export default function OverviewPage() {
   const isInitialLoading = (statsLoading && !stats && !queueFallback) && (runsLoading && !runs);
 
   const refreshStatus = useMemo(() => {
-    function formatTime(d: Date) {
-      return d.toLocaleTimeString('en-US', {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false,
-      });
-    }
-
-    if (isInitialLoading) {
-      return { label: 'Connecting…', color: 'bg-status-pending', type: 'loading' };
-    }
-
-    // Both failed with no fallback data
-    if (statsError && runsError && !fallbackActive && !queueFallback && !fallbackRuns) {
-      return { label: 'Sync paused', color: 'bg-status-failed', type: 'error' };
-    }
-
-    // Runs failed: Recent Activity is stale or unavailable
-    if (runsError) {
-      const timeStr = runsUpdatedAt ? ` (${formatTime(runsUpdatedAt)})` : '';
-      return {
-        label: runsUpdatedAt ? `Partial sync • Stale activity${timeStr}` : 'Partial sync • Activity unavailable',
-        color: 'bg-[#d29922]',
-        type: 'partial',
-      };
-    }
-
-    // Stats failed, but fallback is actively supplying queue/run metrics
-    if (statsError && (fallbackActive || queueFallback || fallbackRuns)) {
-      const timeStr = statsUpdatedAt ? ` (${formatTime(statsUpdatedAt)})` : '';
-      return {
-        label: `Fallback active${timeStr}`,
-        color: 'bg-[#d29922]',
-        type: 'fallback',
-      };
-    }
-
-    // Both stats and runs healthy
-    if (statsUpdatedAt && runsUpdatedAt) {
-      const earliest = statsUpdatedAt < runsUpdatedAt ? statsUpdatedAt : runsUpdatedAt;
-      return {
-        label: `Updated ${formatTime(earliest)}`,
-        color: 'bg-status-success',
-        type: 'healthy',
-      };
-    }
-
-    if (statsUpdatedAt || runsUpdatedAt) {
-      const latest = (statsUpdatedAt || runsUpdatedAt)!;
-      return {
-        label: `Updated ${formatTime(latest)}`,
-        color: 'bg-status-success',
-        type: 'healthy',
-      };
-    }
-
-    return { label: 'Live', color: 'bg-status-success', type: 'healthy' };
+    return resolveRefreshStatus({
+      isInitialLoading,
+      statsError,
+      runsError,
+      fallbackActive,
+      queueFallback,
+      fallbackRuns,
+      statsUpdatedAt,
+      runsUpdatedAt,
+    });
   }, [isInitialLoading, statsError, runsError, fallbackActive, queueFallback, fallbackRuns, statsUpdatedAt, runsUpdatedAt]);
+
+  const errorBanner = useMemo(() => {
+    return resolveErrorBanner({
+      statsError,
+      runsError,
+      fallbackActive,
+    });
+  }, [statsError, runsError, fallbackActive]);
 
   return (
     <main className="min-h-screen bg-background">
@@ -346,20 +317,14 @@ export default function OverviewPage() {
         </div>
 
         {/* Partial Error Notification Banner */}
-        {(statsError || runsError) && (
+        {errorBanner.visible && (
           <div
             role="alert"
             className="flex items-center justify-between rounded-lg border border-status-failed/30 bg-status-failed/10 px-4 py-3 text-sm text-text-primary animate-fade-in-up"
           >
             <div className="flex items-center gap-2">
               <span className="text-status-failed font-bold">⚠</span>
-              <span>
-                {statsError && runsError
-                  ? `Failed to load dashboard data: ${statsError}`
-                  : statsError
-                  ? `Unable to refresh system statistics: ${statsError}`
-                  : `Unable to refresh recent runs: ${runsError}`}
-              </span>
+              <span>{errorBanner.message}</span>
             </div>
             <button
               onClick={() => {
@@ -404,7 +369,7 @@ export default function OverviewPage() {
             {/* 3. Recent Pass Rate (Explicit sample scope) */}
             <StatCard
               label="Recent Pass Rate"
-              value={effectivePassRate !== null ? `${effectivePassRate}%` : '—'}
+              value={typeof effectivePassRate === 'number' ? `${effectivePassRate}%` : '—'}
               sub={
                 effectiveCompletedSampleCount > 0
                   ? effectiveCompletedSampleCount === 1
@@ -415,7 +380,7 @@ export default function OverviewPage() {
                   : 'No completed runs in sample'
               }
               color={
-                effectivePassRate === null
+                typeof effectivePassRate !== 'number'
                   ? 'text-text-muted'
                   : effectivePassRate >= 80
                   ? 'text-status-success'
@@ -424,7 +389,7 @@ export default function OverviewPage() {
                   : 'text-status-failed'
               }
               glowColor={
-                effectivePassRate === null
+                typeof effectivePassRate !== 'number'
                   ? '#71717A'
                   : effectivePassRate >= 80
                   ? '#3fb950'

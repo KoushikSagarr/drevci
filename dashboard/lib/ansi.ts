@@ -3,7 +3,7 @@
  */
 
 // Matches all ANSI escape sequences (CSI, OSC, etc.)
-const ANSI_REGEX = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~]))/g;
+const ANSI_REGEX = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d\/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[A-PR-TZcf-nqr-uy=><~]))/g;
 
 // Matches specifically SGR sequences: ESC [ <params> m
 const SGR_REGEX = /\u001B\[([0-9;]*)m/g;

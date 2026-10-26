@@ -10,6 +10,17 @@ export class ApiError extends Error {
   }
 }
 
+export function isNotFoundError(err: unknown): boolean {
+  if (err instanceof ApiError) return err.status === 404;
+  if (err instanceof Error) {
+    return err.message.includes('404') || err.message.toLowerCase().includes('not found');
+  }
+  if (typeof err === 'string') {
+    return err.includes('404') || err.toLowerCase().includes('not found');
+  }
+  return false;
+}
+
 export interface QueueStatus {
   depth: number;
   workers: number;
@@ -113,31 +124,122 @@ export async function getHealth(): Promise<HealthStatus> {
   return res.json();
 }
 
+export interface StreamLogsOptions {
+  isLive?: () => boolean;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  getRunStatus?: (runId: string) => Promise<string | null>;
+}
+
 export function streamLogs(
   runId: string,
   onLine: (line: string) => void,
   onDone: () => void,
-  onOpen?: () => void
+  onOpen?: () => void,
+  options?: StreamLogsOptions
 ): () => void {
   const url = `${getBaseUrl()}/api/v1/runs/${runId}/logs`;
-  const es = new EventSource(url);
+  let currentEs: EventSource | null = null;
+  let isTeardown = false;
+  let retryCount = 0;
+  let reconnectTimer: NodeJS.Timeout | null = null;
+  const maxRetries = options?.maxRetries ?? 3;
+  const retryDelayMs = options?.retryDelayMs ?? 1000;
 
-  if (onOpen) {
-    es.onopen = () => {
-      onOpen();
+  const cleanupCurrentEs = () => {
+    if (currentEs) {
+      currentEs.onopen = null;
+      currentEs.onmessage = null;
+      currentEs.onerror = null;
+      currentEs.close();
+      currentEs = null;
+    }
+  };
+
+  const connect = () => {
+    if (isTeardown) return;
+
+    const es = new EventSource(url);
+    currentEs = es;
+
+    if (onOpen) {
+      es.onopen = () => {
+        if (!isTeardown) {
+          onOpen();
+        }
+      };
+    }
+
+    es.onmessage = (event) => {
+      if (!isTeardown) {
+        onLine(event.data);
+      }
     };
-  }
 
-  es.onmessage = (event) => {
-    onLine(event.data);
+    es.onerror = async () => {
+      if (isTeardown) return;
+      cleanupCurrentEs();
+
+      if (options?.isLive && !options.isLive()) {
+        // Caller explicitly knows the run is already completed
+        if (!isTeardown) {
+          onDone();
+        }
+        return;
+      }
+
+      if (retryCount >= maxRetries) {
+        // Retry limit reached: terminate cleanly without further retries
+        if (!isTeardown) {
+          onDone();
+        }
+        return;
+      }
+
+      // Verify whether the run is still active or completed on the backend
+      let isStillActive = false;
+      try {
+        if (options?.getRunStatus) {
+          const status = await options.getRunStatus(runId);
+          isStillActive = status === 'running' || status === 'pending';
+        } else {
+          const run = await getRun(runId);
+          isStillActive = run.status === 'running' || run.status === 'pending';
+        }
+      } catch {
+        // If status query fails due to network outage, attempt retry since under limit
+        isStillActive = true;
+      }
+
+      if (isTeardown) return;
+
+      if (!isStillActive) {
+        if (!isTeardown) {
+          onDone();
+        }
+        return;
+      }
+
+      // Transient disconnection during live run: attempt recovery
+      retryCount++;
+      if (!isTeardown) {
+        reconnectTimer = setTimeout(() => {
+          if (!isTeardown) {
+            connect();
+          }
+        }, retryDelayMs);
+      }
+    };
   };
 
-  es.onerror = () => {
-    onDone();
-    es.close();
-  };
+  connect();
 
   return () => {
-    es.close();
+    isTeardown = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    cleanupCurrentEs();
   };
 }
