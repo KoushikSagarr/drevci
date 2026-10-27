@@ -1,0 +1,12 @@
+name: drevci
+
+# Dedicated Compose overlay for local development.
+# Only applied when explicitly passed to docker compose:
+#   docker compose -f docker-compose.yml -f docker-compose.local-dev.yml up -d drevd
+#
+# Binds the drevd engine API strictly to 127.0.0.1 loopback on the host,
+# allowing the local native Next.js dashboard (and host CLI) to reach the engine.
+services:
+  drevd:
+    ports:
+      - "127.0.0.1:${DREV_PORT:-9090}:9090"
