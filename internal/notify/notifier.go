@@ -89,6 +89,9 @@ func (n *Notifier) sendSlack(
 	if run.Status == drevtypes.StatusFailed {
 		statusText = ":x: *Failed*"
 		color = "#e74c3c"
+	} else if run.Status == drevtypes.StatusCancelled {
+		statusText = ":warning: *Cancelled*"
+		color = "#f39c12"
 	}
 
 	shortID := run.ID
@@ -109,6 +112,10 @@ func (n *Notifier) sendSlack(
 			mark = "↻"
 		} else if j.Status == drevtypes.StatusPending {
 			mark = "○"
+		} else if j.Status == drevtypes.StatusCancelled {
+			mark = "⊘"
+		} else if j.Status == drevtypes.StatusSkipped {
+			mark = "↷"
 		}
 		dur := formatDuration(j.StartedAt, j.FinishedAt)
 		jobSummary += fmt.Sprintf("%s %s (%s)\n", mark, j.JobName, dur)
@@ -180,6 +187,10 @@ func (n *Notifier) sendDiscord(
 		statusDesc = "✗ Pipeline Failed"
 		statusValue = "Failed"
 		color = 15158332 // red #E74C3C
+	} else if run.Status == drevtypes.StatusCancelled {
+		statusDesc = "⊘ Pipeline Cancelled"
+		statusValue = "Cancelled"
+		color = 15967250 // orange #F39C12
 	}
 
 	shortID := run.ID
@@ -199,6 +210,10 @@ func (n *Notifier) sendDiscord(
 			mark = "↻"
 		} else if j.Status == drevtypes.StatusPending {
 			mark = "○"
+		} else if j.Status == drevtypes.StatusCancelled {
+			mark = "⊘"
+		} else if j.Status == drevtypes.StatusSkipped {
+			mark = "↷"
 		}
 		dur := formatDuration(j.StartedAt, j.FinishedAt)
 		jobLines += fmt.Sprintf("%s **%s** (%s)\n", mark, j.JobName, dur)

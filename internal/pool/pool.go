@@ -66,34 +66,52 @@ func (p *Pool) processJob(ctx context.Context, job *queue.Job) {
 		log.Printf("[pool] run %s completed in %s", job.RunID, time.Since(start).Round(time.Millisecond))
 	}()
 
-	var finalStatus drevtypes.RunStatus
-
-	if err := p.scheduler.RunPipeline(ctx, job.Pipeline, job.RunID, job.LogWriter); err != nil {
-		log.Printf("[pool] run %s failed: %v", job.RunID, err)
-		_ = p.store.UpdateRunStatus(ctx, job.RunID, drevtypes.StatusFailed)
-		finalStatus = drevtypes.StatusFailed
+	runErr := p.scheduler.RunPipeline(ctx, job.Pipeline, job.RunID, job.LogWriter)
+	if runErr != nil {
+		log.Printf("[pool] run %s finished with error: %v", job.RunID, runErr)
 	} else {
 		log.Printf("[pool] run %s succeeded", job.RunID)
-		_ = p.store.UpdateRunStatus(ctx, job.RunID, drevtypes.StatusSuccess)
-		finalStatus = drevtypes.StatusSuccess
 	}
 
-	// Fire notification asynchronously — never block the worker
+	if p.store == nil {
+		return
+	}
+
+	// Retrieve the run once using an uncancelled context.
+	// The scheduler is the sole authority for run status; the pool never mutates it.
+	storedRun, err := p.store.GetRun(context.Background(), job.RunID)
+	if err != nil {
+		log.Printf("[pool] failed to get run %s from store: %v", job.RunID, err)
+		return
+	}
+	if storedRun == nil {
+		log.Printf("[pool] run %s not found in store", job.RunID)
+		return
+	}
+	if !isTerminalRunStatus(storedRun.Status) {
+		log.Printf("[pool] warning: run %s left in non-terminal status %q by scheduler, skipping notification", job.RunID, storedRun.Status)
+		return
+	}
+
+	// Fire notification asynchronously with the exact stored run — never block the worker
 	if p.notifier != nil {
-		run, err := p.store.GetRun(ctx, job.RunID)
+		jobs, err := p.store.GetRunJobs(context.Background(), job.RunID)
 		if err != nil {
-			log.Printf("[pool] failed to get run for notification: %v", err)
-			return
+			log.Printf("[pool] failed to get run jobs for %s: %v", job.RunID, err)
 		}
-		run.Status = finalStatus
-		jobs, _ := p.store.GetRunJobs(ctx, job.RunID)
 
 		go func() {
 			if err := p.notifier.NotifyPipelineComplete(
-				context.Background(), run, job.Pipeline, jobs,
+				context.Background(), storedRun, job.Pipeline, jobs,
 			); err != nil {
 				log.Printf("[pool] notification error for run %s: %v", job.RunID, err)
 			}
 		}()
 	}
+}
+
+func isTerminalRunStatus(status drevtypes.RunStatus) bool {
+	return status == drevtypes.StatusSuccess ||
+		status == drevtypes.StatusFailed ||
+		status == drevtypes.StatusCancelled
 }

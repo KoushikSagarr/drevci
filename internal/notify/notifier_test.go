@@ -131,3 +131,77 @@ func TestNotify_Disabled(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNotify_Cancelled(t *testing.T) {
+	var slackPayload, discordPayload map[string]interface{}
+	slackServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&slackPayload)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slackServer.Close()
+
+	discordServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&discordPayload)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discordServer.Close()
+
+	n := New(NotificationConfig{
+		SlackWebhookURL:   slackServer.URL,
+		DiscordWebhookURL: discordServer.URL,
+		Enabled:           true,
+	})
+
+	jobs := []*drevtypes.RunJob{
+		{
+			ID: "j1", RunID: "run-cancel", JobName: "job-cancel", Status: drevtypes.StatusCancelled,
+		},
+		{
+			ID: "j2", RunID: "run-cancel", JobName: "job-skip", Status: drevtypes.StatusSkipped,
+		},
+	}
+	err := n.NotifyPipelineComplete(t.Context(), makeTestRun(drevtypes.StatusCancelled), makeTestPipeline(), jobs)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify Slack payload contains Cancelled
+	attachments, ok := slackPayload["attachments"].([]interface{})
+	if !ok || len(attachments) == 0 {
+		t.Fatalf("slack missing attachments")
+	}
+	firstAtt := attachments[0].(map[string]interface{})
+	if firstAtt["color"] != "#f39c12" {
+		t.Errorf("slack color = %v, want #f39c12", firstAtt["color"])
+	}
+	blocks := firstAtt["blocks"].([]interface{})
+	firstBlock := blocks[0].(map[string]interface{})
+	textMap := firstBlock["text"].(map[string]interface{})
+	if textMap["text"] != "*Pipeline: test-pipeline*\nStatus: :warning: *Cancelled*" {
+		t.Errorf("slack text = %v, want Cancelled status", textMap["text"])
+	}
+
+	// Verify Discord payload contains Cancelled
+	embeds, ok := discordPayload["embeds"].([]interface{})
+	if !ok || len(embeds) == 0 {
+		t.Fatalf("discord missing embeds")
+	}
+	firstEmbed := embeds[0].(map[string]interface{})
+	if firstEmbed["color"].(float64) != 15967250 {
+		t.Errorf("discord color = %v, want 15967250", firstEmbed["color"])
+	}
+	fields := firstEmbed["fields"].([]interface{})
+	foundStatus := false
+	for _, f := range fields {
+		fieldMap := f.(map[string]interface{})
+		if fieldMap["name"] == "Status" {
+			foundStatus = true
+			if fieldMap["value"] != "Cancelled" {
+				t.Errorf("discord status = %v, want Cancelled", fieldMap["value"])
+			}
+		}
+	}
+	if !foundStatus {
+		t.Error("discord missing Status field")
+	}
+}
