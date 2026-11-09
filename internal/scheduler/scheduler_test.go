@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -418,5 +419,502 @@ func TestOldSharedWorkspaceDemonstratesCollision(t *testing.T) {
 		t.Log("Note: In this particular scheduling tick, both workers saw their own writes, but collision is a fundamental risk of shared mutable paths.")
 	} else {
 		t.Logf("Proven collision in shared workspace: worker 0 saw %q, worker 1 saw %q", results[0], results[1])
+	}
+}
+
+func TestJobExecutionTimeout_ExceedsTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "timeout-test-pipeline",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "hung-job",
+				Image:   "alpine:latest",
+				Timeout: "50ms",
+				Steps:   []drevtypes.Step{{Name: "sleep", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			select {
+			case <-time.After(500 * time.Millisecond):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to return error due to timeout, got nil")
+	}
+
+	out := buf.String()
+	expectedLog := `[drev] job "hung-job" timed out after 50ms`
+	if !strings.Contains(out, expectedLog) {
+		t.Errorf("expected log output to contain %q, got: %s", expectedLog, out)
+	}
+
+	// Verify run status in store is failed
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusFailed, storedRun.Status)
+	}
+
+	// Verify job status in store is failed
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusFailed {
+		t.Errorf("expected stored job status %q, got %q", drevtypes.StatusFailed, jobs[0].Status)
+	}
+}
+
+func TestJobExecutionTimeout_CompletesBeforeTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "fast-job-pipeline",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "fast-job",
+				Image:   "alpine:latest",
+				Timeout: "1s",
+				Steps:   []drevtypes.Step{{Name: "quick", Run: "echo quick"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err != nil {
+		t.Fatalf("expected RunPipeline to succeed, got: %v", err)
+	}
+
+	// Verify run status in store is success
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusSuccess, storedRun.Status)
+	}
+
+	// Verify job status in store is success
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected stored job status %q, got %q", drevtypes.StatusSuccess, jobs[0].Status)
+	}
+}
+
+func TestJobExecutionTimeout_NoTimeoutConfigured(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "no-timeout-pipeline",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "standard-job",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{{Name: "run", Run: "echo ok"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err != nil {
+		t.Fatalf("expected RunPipeline to succeed, got: %v", err)
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusSuccess, storedRun.Status)
+	}
+}
+
+func TestJobExecutionTimeout_WorkspaceCleanedUpOnTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "cleanup-on-timeout",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "timed-out-job",
+				Image:   "alpine:latest",
+				Timeout: "50ms",
+				Steps:   []drevtypes.Step{{Name: "sleep", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var capturedWorkspaceDir string
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			capturedWorkspaceDir = w.Dir
+			// verify directory exists while running
+			if _, err := os.Stat(capturedWorkspaceDir); err != nil {
+				t.Errorf("expected workspace directory to exist during execution: %v", err)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	_ = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+
+	if capturedWorkspaceDir == "" {
+		t.Fatal("expected workspace dir to be captured")
+	}
+
+	// Workspace must be cleaned up after RunPipeline returns
+	if _, err := os.Stat(capturedWorkspaceDir); !os.IsNotExist(err) {
+		t.Errorf("expected workspace dir %q to be cleaned up after timeout, but it still exists", capturedWorkspaceDir)
+	}
+}
+
+func TestJobExecutionTimeout_InvalidTimeoutHandledGracefully(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "invalid-timeout-pipeline",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "bad-timeout-job",
+				Image:   "alpine:latest",
+				Timeout: "not-a-valid-duration",
+				Steps:   []drevtypes.Step{{Name: "run", Run: "echo ok"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on invalid timeout, got nil")
+	}
+
+	out := buf.String()
+	expectedLog := `[drev] invalid timeout "not-a-valid-duration" for job "bad-timeout-job"`
+	if !strings.Contains(out, expectedLog) {
+		t.Errorf("expected log output to contain %q, got: %s", expectedLog, out)
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusFailed, storedRun.Status)
+	}
+}
+
+func TestJobExecutionTimeout_SuccessfulJobDoesNotFailIfTimerExpiresAfterCompletion(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "tight-timeout-success",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "fast-finishing-job",
+				Image:   "alpine:latest",
+				Timeout: "25ms",
+				Steps:   []drevtypes.Step{{Name: "run", Run: "echo done"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			time.Sleep(10 * time.Millisecond)
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err != nil {
+		t.Fatalf("expected successful job to remain success, got err: %v", err)
+	}
+
+	// Verify that even after the 25ms duration has passed, the job and run stay StatusSuccess
+	time.Sleep(30 * time.Millisecond)
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusSuccess, storedRun.Status)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run jobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected job status %q, got %q", drevtypes.StatusSuccess, jobs[0].Status)
+	}
+}
+
+func TestTimeoutClassification_ParentDeadlineWithNoJobTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "parent-deadline-no-job-timeout",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "no-timeout-job",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{{Name: "run", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer parentCancel()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to return error due to parent deadline, got nil")
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "timed out after") {
+		t.Errorf("expected no job timeout message in log, got: %s", out)
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected stored run status %q, got %q", drevtypes.StatusFailed, storedRun.Status)
+	}
+}
+
+func TestTimeoutClassification_ParentDeadlineWithConfiguredJobTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "parent-deadline-configured-job-timeout",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "long-timeout-job",
+				Image:   "alpine:latest",
+				Timeout: "1h",
+				Steps:   []drevtypes.Step{{Name: "run", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	parentCtx, parentCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer parentCancel()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected error due to parent deadline, got nil")
+	}
+
+	out := buf.String()
+	if strings.Contains(out, `job "long-timeout-job" timed out after 1h`) {
+		t.Errorf("parent deadline was falsely reported as a job timeout: %s", out)
+	}
+}
+
+func TestTimeoutClassification_JobSpecificTimeoutWhileParentRemainsActive(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "job-timeout-active-parent",
+		Jobs: []drevtypes.Job{
+			{
+				Name:    "hung-job",
+				Image:   "alpine:latest",
+				Timeout: "30ms",
+				Steps:   []drevtypes.Step{{Name: "sleep", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected error due to job timeout, got nil")
+	}
+
+	out := buf.String()
+	expectedLog := `[drev] job "hung-job" timed out after 30ms`
+	if !strings.Contains(out, expectedLog) {
+		t.Errorf("expected job timeout message %q in log, got: %s", expectedLog, out)
+	}
+}
+
+func TestTimeoutClassification_SiblingCancellation(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "sibling-cancellation",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "failing-job",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{{Name: "fail", Run: "exit 1"}},
+			},
+			{
+				Name:    "sibling-job",
+				Image:   "alpine:latest",
+				Timeout: "5m",
+				Steps:   []drevtypes.Step{{Name: "run", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "failing-job" {
+				return errors.New("command failed with exit code 1")
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected pipeline failure, got nil")
+	}
+
+	out := buf.String()
+	if strings.Contains(out, `job "sibling-job" timed out after 5m`) {
+		t.Errorf("cancelled sibling was falsely logged as timed out: %s", out)
+	}
+}
+
+func TestTimeoutClassification_SiblingCancellationRacingWithJobTimeout(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "sibling-cancellation-race",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "jobA",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{{Name: "fail", Run: "exit 1"}},
+			},
+			{
+				Name:    "jobB",
+				Image:   "alpine:latest",
+				Timeout: "5s",
+				Steps:   []drevtypes.Step{{Name: "run", Run: "sleep 10"}},
+			},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	jobACompleted := make(chan struct{})
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "jobA" {
+				defer close(jobACompleted)
+				return errors.New("jobA failed with error")
+			}
+			if job.Name == "jobB" {
+				// Deterministically synchronize: wait until jobA has returned its error and canceled egCtx
+				<-jobACompleted
+				<-ctx.Done()
+				// Simulate jobB observing a deadline exceeded error concurrently
+				return context.DeadlineExceeded
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected pipeline failure, got nil")
+	}
+
+	out := buf.String()
+	// Because jobA failed and cancelled egCtx before jobB's timeout was evaluated,
+	// jobB must NOT be reported as a job timeout.
+	if strings.Contains(out, `job "jobB" timed out after`) {
+		t.Errorf("jobB was falsely reported as a job timeout after sibling cancellation: %s", out)
 	}
 }

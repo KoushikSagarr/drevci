@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -735,4 +736,149 @@ func TestResourceLimits_SwapSemantics(t *testing.T) {
 			t.Error("expected error for invalid memory limit string, got nil")
 		}
 	})
+}
+
+func TestRunJob_ContextTimeout_CleansUpContainer(t *testing.T) {
+	removedContainerID := ""
+	var removeOpts container.RemoveOptions
+	var removeCtxHasDeadline bool
+	var removeCtxRemaining time.Duration
+
+	pr, pw := io.Pipe()
+
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+			return container.CreateResponse{ID: "timeout-container-456"}, nil
+		},
+		containerLogsFn: func(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error) {
+			return pr, nil
+		},
+		containerWaitFn: func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			statusCh := make(chan container.WaitResponse)
+			errCh := make(chan error)
+			return statusCh, errCh
+		},
+		containerRemoveFn: func(ctx context.Context, containerID string, options container.RemoveOptions) error {
+			removedContainerID = containerID
+			removeOpts = options
+			if d, ok := ctx.Deadline(); ok {
+				removeCtxHasDeadline = true
+				removeCtxRemaining = time.Until(d)
+			}
+			return nil
+		},
+	}
+	defer pw.Close()
+
+	r := NewWithClient(mock, &mockStore{})
+	job := &drevtypes.Job{
+		Name:  "hung-job",
+		Image: "alpine:latest",
+		Steps: []drevtypes.Step{{Name: "sleep", Run: "sleep 100"}},
+	}
+
+	w, err := workspace.Create()
+	if err != nil {
+		t.Fatalf("creating workspace: %v", err)
+	}
+	defer w.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	var buf bytes.Buffer
+	err = r.RunJob(ctx, &drevtypes.Run{}, job, w, &buf)
+	if err == nil {
+		t.Fatal("expected error due to timeout, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded, got: %v", err)
+	}
+
+	if removedContainerID != "timeout-container-456" {
+		t.Errorf("expected container %q to be removed, got %q", "timeout-container-456", removedContainerID)
+	}
+	if !removeOpts.Force {
+		t.Errorf("expected Force: true in container remove options")
+	}
+	if !removeCtxHasDeadline {
+		t.Error("expected container removal to use bounded cleanup context with deadline")
+	}
+	if removeCtxRemaining <= 0 || removeCtxRemaining > 16*time.Second {
+		t.Errorf("expected cleanup context timeout of ~15s, got remaining %v", removeCtxRemaining)
+	}
+}
+
+func TestRunJob_ContainerRemoveErrorDoesNotMaskOriginalError(t *testing.T) {
+	pr, pw := io.Pipe()
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+			return container.CreateResponse{ID: "err-container-1"}, nil
+		},
+		containerLogsFn: func(ctx context.Context, container string, options container.LogsOptions) (io.ReadCloser, error) {
+			return pr, nil
+		},
+		containerWaitFn: func(ctx context.Context, containerID string, condition container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+			statusCh := make(chan container.WaitResponse)
+			errCh := make(chan error)
+			return statusCh, errCh
+		},
+		containerRemoveFn: func(ctx context.Context, containerID string, options container.RemoveOptions) error {
+			return errors.New("daemon cleanup failure")
+		},
+	}
+	defer pw.Close()
+
+	r := NewWithClient(mock, &mockStore{})
+	job := &drevtypes.Job{
+		Name:  "test-job",
+		Image: "alpine:latest",
+		Steps: []drevtypes.Step{{Name: "step", Run: "sleep 10"}},
+	}
+
+	w, err := workspace.Create()
+	if err != nil {
+		t.Fatalf("creating workspace: %v", err)
+	}
+	defer w.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	var buf bytes.Buffer
+	err = r.RunJob(ctx, &drevtypes.Run{}, job, w, &buf)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected original context.DeadlineExceeded to be preserved despite cleanup error, got: %v", err)
+	}
+}
+
+func TestRunJob_CompletesBeforeTimeout(t *testing.T) {
+	mock := &mockDockerClient{
+		containerCreateFn: func(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+			return container.CreateResponse{ID: "fast-container-789"}, nil
+		},
+	}
+
+	r := NewWithClient(mock, &mockStore{})
+	job := &drevtypes.Job{
+		Name:    "fast-job",
+		Image:   "alpine:latest",
+		Timeout: "5s",
+		Steps:   []drevtypes.Step{{Name: "echo", Run: "echo quick"}},
+	}
+
+	w, err := workspace.Create()
+	if err != nil {
+		t.Fatalf("creating workspace: %v", err)
+	}
+	defer w.Cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var buf bytes.Buffer
+	err = r.RunJob(ctx, &drevtypes.Run{}, job, w, &buf)
+	if err != nil {
+		t.Fatalf("expected job to succeed before timeout, got: %v", err)
+	}
 }

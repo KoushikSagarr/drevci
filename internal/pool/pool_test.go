@@ -3,12 +3,16 @@ package pool
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/drevci/drev/internal/queue"
+	"github.com/drevci/drev/internal/scheduler"
+	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
@@ -138,5 +142,148 @@ func TestPool_RealPool_ContextCancelAllowsStop(t *testing.T) {
 		// Clean return verified
 	case <-time.After(3 * time.Second):
 		t.Fatal("real Pool.Stop() deadlocked after context cancellation")
+	}
+}
+
+type poolMockRunner struct {
+	runFunc func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error
+}
+
+func (m *poolMockRunner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+	if m.runFunc != nil {
+		return m.runFunc(ctx, run, job, w, logWriter)
+	}
+	return nil
+}
+
+func TestPool_WorkerAvailableAfterJobTimeout(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pool_timeout_test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	defer s.Close()
+
+	run1 := &drevtypes.Run{
+		ID:         "run-timeout-1",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRun(context.Background(), run1); err != nil {
+		t.Fatalf("creating run1: %v", err)
+	}
+	if err := s.CreateRunJob(context.Background(), &drevtypes.RunJob{
+		ID:        "rj-1",
+		RunID:     run1.ID,
+		JobName:   "timeout-job",
+		Status:    drevtypes.StatusPending,
+		StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("creating rj1: %v", err)
+	}
+
+	run2 := &drevtypes.Run{
+		ID:         "run-quick-2",
+		PipelineID: "p2",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRun(context.Background(), run2); err != nil {
+		t.Fatalf("creating run2: %v", err)
+	}
+	if err := s.CreateRunJob(context.Background(), &drevtypes.RunJob{
+		ID:        "rj-2",
+		RunID:     run2.ID,
+		JobName:   "quick-job",
+		Status:    drevtypes.StatusPending,
+		StartedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("creating rj2: %v", err)
+	}
+
+	mr := &poolMockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "timeout-job" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+
+	sched := scheduler.New(mr, s)
+	q := queue.New(10)
+	// Single worker pool
+	p := New(1, q, sched, s, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+
+	// Enqueue job 1 (will timeout)
+	if err := q.Enqueue(&queue.Job{
+		RunID: run1.ID,
+		Pipeline: &drevtypes.Pipeline{
+			Name: "pipe-1",
+			Jobs: []drevtypes.Job{
+				{Name: "timeout-job", Image: "alpine", Timeout: "30ms", Steps: []drevtypes.Step{{Name: "s", Run: "sleep 10"}}},
+			},
+		},
+		LogWriter:  nopWriteCloser{io.Discard},
+		EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("enqueuing job 1: %v", err)
+	}
+
+	// Enqueue job 2 (should be picked up by the same worker after job 1 times out)
+	if err := q.Enqueue(&queue.Job{
+		RunID: run2.ID,
+		Pipeline: &drevtypes.Pipeline{
+			Name: "pipe-2",
+			Jobs: []drevtypes.Job{
+				{Name: "quick-job", Image: "alpine", Steps: []drevtypes.Step{{Name: "s", Run: "echo ok"}}},
+			},
+		},
+		LogWriter:  nopWriteCloser{io.Discard},
+		EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("enqueuing job 2: %v", err)
+	}
+
+	// Wait for run2 to finish with StatusSuccess
+	deadline := time.After(3 * time.Second)
+	success := false
+	for !success {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for worker to process run2 after run1 timeout")
+		default:
+			r2, err := s.GetRun(context.Background(), run2.ID)
+			if err == nil && r2.Status == drevtypes.StatusSuccess {
+				success = true
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	cancel()
+	p.Stop()
+
+	// Verify run1 is StatusFailed
+	r1, err := s.GetRun(context.Background(), run1.ID)
+	if err != nil {
+		t.Fatalf("getting run1: %v", err)
+	}
+	if r1.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run1 to have status %q, got %q", drevtypes.StatusFailed, r1.Status)
+	}
+
+	// Verify run2 is StatusSuccess
+	r2, err := s.GetRun(context.Background(), run2.ID)
+	if err != nil {
+		t.Fatalf("getting run2: %v", err)
+	}
+	if r2.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected run2 to have status %q, got %q", drevtypes.StatusSuccess, r2.Status)
 	}
 }

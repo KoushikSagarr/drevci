@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/workspace"
@@ -163,13 +165,42 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				return fmt.Errorf("creating workspace for job %s: %w", job.Name, err)
 			}
 
+			// Determine execution context, enforcing per-job timeout if configured
+			jobCtx := egCtx
+			if job.Timeout != "" {
+				d, parseErr := time.ParseDuration(job.Timeout)
+				if parseErr != nil || d <= 0 {
+					mu.Lock()
+					jobStatuses[jobName] = drevtypes.StatusFailed
+					fmt.Fprintf(logWriter, "[drev] invalid timeout %q for job %q\n", job.Timeout, job.Name)
+					mu.Unlock()
+					s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+					return fmt.Errorf("invalid timeout %q for job %q", job.Timeout, job.Name)
+				}
+				var jobCancel context.CancelFunc
+				jobCtx, jobCancel = context.WithTimeout(egCtx, d)
+				defer jobCancel()
+			}
+
 			s.store.UpdateRunJobStatus(egCtx, rj.ID, drevtypes.StatusRunning)
 
-			err = s.runner.RunJob(egCtx, run, &job, jobWorkspace, logWriter)
+			err = s.runner.RunJob(jobCtx, run, &job, jobWorkspace, logWriter)
 
 			mu.Lock()
 			if err != nil {
 				jobStatuses[jobName] = drevtypes.StatusFailed
+
+				// Report a job timeout only when this job had an explicit timeout configured,
+				// its own deadline was exceeded, and the parent errgroup context was still active
+				// (i.e. egCtx.Err() == nil) when the timeout was observed.
+				isJobTimeout := job.Timeout != "" &&
+					(jobCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded)) &&
+					egCtx.Err() == nil
+
+				if isJobTimeout {
+					fmt.Fprintf(logWriter, "[drev] job %q timed out after %s\n", job.Name, job.Timeout)
+					err = fmt.Errorf("job %q timed out after %s: %w", job.Name, job.Timeout, err)
+				}
 				mu.Unlock()
 				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
 				return err

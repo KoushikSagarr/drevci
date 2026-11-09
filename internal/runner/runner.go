@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -224,7 +225,9 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 
 	containerID := resp.ID
 	defer func() {
-		r.docker.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true})
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_ = r.docker.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{Force: true})
 	}()
 
 	if err := r.docker.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
@@ -241,8 +244,29 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 	}
 	defer logsReader.Close()
 
+	stopLogs := make(chan struct{})
+	var stopOnce sync.Once
+	stopFn := func() {
+		stopOnce.Do(func() {
+			close(stopLogs)
+		})
+	}
+	defer stopFn()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			logsReader.Close()
+		case <-stopLogs:
+		}
+	}()
+
 	// Use stdcopy to demultiplex stdout/stderr properly
 	_, err = stdcopy.StdCopy(logWriter, logWriter, logsReader)
+	stopFn()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return fmt.Errorf("streaming logs: %w", err)
 	}
@@ -251,6 +275,9 @@ func (r *Runner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.
 	select {
 	case err := <-errCh:
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("waiting for container: %w", err)
 		}
 	case status := <-statusCh:

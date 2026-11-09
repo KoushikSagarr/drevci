@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
 	"gopkg.in/yaml.v3"
@@ -78,6 +79,22 @@ func Validate(p *drevtypes.Pipeline) error {
 			return &ParseError{
 				Field:   fmt.Sprintf("jobs[%d].image", i),
 				Message: fmt.Sprintf("job %q must have an image", job.Name),
+			}
+		}
+
+		if job.Timeout != "" {
+			d, err := time.ParseDuration(job.Timeout)
+			if err != nil {
+				return &ParseError{
+					Field:   fmt.Sprintf("jobs[%d].timeout", i),
+					Message: fmt.Sprintf("invalid timeout %q for job %q: %v", job.Timeout, job.Name, err),
+				}
+			}
+			if d <= 0 {
+				return &ParseError{
+					Field:   fmt.Sprintf("jobs[%d].timeout", i),
+					Message: fmt.Sprintf("timeout for job %q must be greater than zero, got %s", job.Name, job.Timeout),
+				}
 			}
 		}
 

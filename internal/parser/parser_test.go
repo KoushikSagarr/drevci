@@ -201,3 +201,132 @@ func TestParseBytesWithExampleConfig(t *testing.T) {
 		t.Errorf("expected APP_NAME=drev, got %q", p.Env["APP_NAME"])
 	}
 }
+
+func TestValidJobTimeout(t *testing.T) {
+	yml := `
+name: timeout-pipeline
+jobs:
+  - name: quick-job
+    image: alpine:latest
+    timeout: 30s
+    steps:
+      - name: step1
+        run: echo hi
+  - name: long-job
+    image: alpine:latest
+    timeout: 5m
+    steps:
+      - name: step2
+        run: echo bye
+`
+	p, err := ParseBytes([]byte(yml))
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if p.Jobs[0].Timeout != "30s" {
+		t.Errorf("expected timeout '30s', got %q", p.Jobs[0].Timeout)
+	}
+	if p.Jobs[1].Timeout != "5m" {
+		t.Errorf("expected timeout '5m', got %q", p.Jobs[1].Timeout)
+	}
+}
+
+func TestInvalidJobTimeoutFormat(t *testing.T) {
+	yml := `
+name: bad-timeout
+jobs:
+  - name: job1
+    image: alpine:latest
+    timeout: not-a-duration
+    steps:
+      - name: step1
+        run: echo hi
+`
+	_, err := ParseBytes([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for invalid timeout format")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected ParseError, got %T: %v", err, err)
+	}
+	if pe.Field != "jobs[0].timeout" {
+		t.Errorf("expected field 'jobs[0].timeout', got %q", pe.Field)
+	}
+	if !strings.Contains(pe.Message, "invalid timeout") {
+		t.Errorf("expected invalid timeout message, got: %s", pe.Message)
+	}
+}
+
+func TestJobTimeoutZero(t *testing.T) {
+	yml := `
+name: zero-timeout
+jobs:
+  - name: job1
+    image: alpine:latest
+    timeout: 0s
+    steps:
+      - name: step1
+        run: echo hi
+`
+	_, err := ParseBytes([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for zero timeout")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected ParseError, got %T: %v", err, err)
+	}
+	if pe.Field != "jobs[0].timeout" {
+		t.Errorf("expected field 'jobs[0].timeout', got %q", pe.Field)
+	}
+	if !strings.Contains(pe.Message, "greater than zero") {
+		t.Errorf("expected greater than zero message, got: %s", pe.Message)
+	}
+}
+
+func TestJobTimeoutNegative(t *testing.T) {
+	yml := `
+name: negative-timeout
+jobs:
+  - name: job1
+    image: alpine:latest
+    timeout: -5s
+    steps:
+      - name: step1
+        run: echo hi
+`
+	_, err := ParseBytes([]byte(yml))
+	if err == nil {
+		t.Fatal("expected error for negative timeout")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected ParseError, got %T: %v", err, err)
+	}
+	if pe.Field != "jobs[0].timeout" {
+		t.Errorf("expected field 'jobs[0].timeout', got %q", pe.Field)
+	}
+	if !strings.Contains(pe.Message, "greater than zero") {
+		t.Errorf("expected greater than zero message, got: %s", pe.Message)
+	}
+}
+
+func TestJobWithoutTimeout(t *testing.T) {
+	yml := `
+name: no-timeout
+jobs:
+  - name: job1
+    image: alpine:latest
+    steps:
+      - name: step1
+        run: echo hi
+`
+	p, err := ParseBytes([]byte(yml))
+	if err != nil {
+		t.Fatalf("expected no error for job without timeout, got: %v", err)
+	}
+	if p.Jobs[0].Timeout != "" {
+		t.Errorf("expected empty timeout, got %q", p.Jobs[0].Timeout)
+	}
+}
