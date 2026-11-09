@@ -6,6 +6,7 @@ const config: Record<RunStatus, { bg: string; text: string; label: string }> = {
   success:   { bg: 'bg-status-success/20', text: 'text-status-success',   label: 'Success' },
   failed:    { bg: 'bg-status-failed/20',  text: 'text-status-failed',    label: 'Failed' },
   cancelled: { bg: 'bg-status-cancelled/20', text: 'text-status-cancelled', label: 'Cancelled' },
+  skipped:   { bg: 'bg-status-cancelled/20', text: 'text-status-cancelled', label: 'Skipped' },
 };
 
 const dotBg: Record<RunStatus, string> = {
@@ -14,6 +15,7 @@ const dotBg: Record<RunStatus, string> = {
   success: 'bg-status-success',
   failed: 'bg-status-failed',
   cancelled: 'bg-status-cancelled',
+  skipped: 'bg-status-cancelled',
 };
 
 export default function StatusBadge({ status, pulse }: { status: RunStatus; pulse?: boolean }) {

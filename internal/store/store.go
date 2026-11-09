@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
@@ -201,7 +202,14 @@ func migrateSQLite(ctx context.Context, db *sql.DB) error {
 // Open creates or opens a SQLite database at dbPath, initialises
 // the schema, enables WAL mode, runs safe migrations, and prepares all statements.
 func Open(dbPath string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := dbPath
+	if !strings.Contains(dsn, "?") {
+		dsn += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	} else if !strings.Contains(dsn, "busy_timeout") {
+		dsn += "&_pragma=busy_timeout(5000)"
+	}
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
@@ -209,6 +217,11 @@ func Open(dbPath string) (*SQLiteStore, error) {
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enabling WAL mode: %w", err)
+	}
+
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("setting busy timeout: %w", err)
 	}
 
 	if err := migrateSQLite(context.Background(), db); err != nil {
@@ -282,7 +295,7 @@ func (s *SQLiteStore) prepare() error {
 	s.stmtUpdateRunJobStatus, err = s.db.Prepare(
 		`UPDATE run_jobs SET status = ?,
 		 started_at  = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
+		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled', 'skipped') THEN ? ELSE finished_at END
 		 WHERE id = ?`)
 	if err != nil {
 		return err

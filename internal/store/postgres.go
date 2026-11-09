@@ -221,7 +221,7 @@ func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, statu
 		UPDATE run_jobs SET
 		  status      = $1,
 		  started_at  = CASE WHEN $2 = 'running'  AND started_at  IS NULL THEN $3 ELSE started_at  END,
-		  finished_at = CASE WHEN $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END
+		  finished_at = CASE WHEN $4 IN ('success','failed','cancelled','skipped') THEN $3 ELSE finished_at END
 		WHERE id = $5`,
 		string(status), string(status), now, string(status), id,
 	)

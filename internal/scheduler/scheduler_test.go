@@ -55,11 +55,10 @@ func setupTestPipeline(t *testing.T, pipeline *drevtypes.Pipeline) (store.Store,
 
 	for _, job := range pipeline.Jobs {
 		rj := &drevtypes.RunJob{
-			ID:        fmt.Sprintf("rj-%s-%d", job.Name, time.Now().UnixNano()),
-			RunID:     runID,
-			JobName:   job.Name,
-			Status:    drevtypes.StatusPending,
-			StartedAt: time.Now(),
+			ID:      fmt.Sprintf("rj-%s-%d", job.Name, time.Now().UnixNano()),
+			RunID:   runID,
+			JobName: job.Name,
+			Status:  drevtypes.StatusPending,
 		}
 		if err := s.CreateRunJob(context.Background(), rj); err != nil {
 			t.Fatalf("creating test run job: %v", err)
@@ -842,9 +841,13 @@ func TestTimeoutClassification_SiblingCancellation(t *testing.T) {
 
 	s, runID := setupTestPipeline(t, pipeline)
 
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
 	mr := &mockRunner{
 		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
 			if job.Name == "failing-job" {
+				parentCancel()
 				return errors.New("command failed with exit code 1")
 			}
 			<-ctx.Done()
@@ -854,7 +857,7 @@ func TestTimeoutClassification_SiblingCancellation(t *testing.T) {
 
 	sched := New(mr, s)
 	var buf bytes.Buffer
-	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
 	if err == nil {
 		t.Fatal("expected pipeline failure, got nil")
 	}
@@ -885,16 +888,20 @@ func TestTimeoutClassification_SiblingCancellationRacingWithJobTimeout(t *testin
 
 	s, runID := setupTestPipeline(t, pipeline)
 
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+
 	jobACompleted := make(chan struct{})
 
 	mr := &mockRunner{
 		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
 			if job.Name == "jobA" {
 				defer close(jobACompleted)
+				parentCancel()
 				return errors.New("jobA failed with error")
 			}
 			if job.Name == "jobB" {
-				// Deterministically synchronize: wait until jobA has returned its error and canceled egCtx
+				// Deterministically synchronize: wait until jobA has returned its error and parentCtx is cancelled
 				<-jobACompleted
 				<-ctx.Done()
 				// Simulate jobB observing a deadline exceeded error concurrently
@@ -906,15 +913,791 @@ func TestTimeoutClassification_SiblingCancellationRacingWithJobTimeout(t *testin
 
 	sched := New(mr, s)
 	var buf bytes.Buffer
-	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
 	if err == nil {
 		t.Fatal("expected pipeline failure, got nil")
 	}
 
 	out := buf.String()
-	// Because jobA failed and cancelled egCtx before jobB's timeout was evaluated,
+	// Because parentCtx was cancelled before jobB's timeout was evaluated,
 	// jobB must NOT be reported as a job timeout.
 	if strings.Contains(out, `job "jobB" timed out after`) {
 		t.Errorf("jobB was falsely reported as a job timeout after sibling cancellation: %s", out)
 	}
+}
+
+func TestDownstreamJobStates_DirectDependencyFailure(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "direct-dep-failure",
+		Jobs: []drevtypes.Job{
+			{Name: "test", Image: "alpine:latest"},
+			{Name: "deploy", Image: "alpine:latest", DependsOn: []string{"test"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var deployExecuted bool
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "test" {
+				return errors.New("unit tests failed")
+			}
+			if job.Name == "deploy" {
+				deployExecuted = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail, got nil")
+	}
+
+	if deployExecuted {
+		t.Errorf("deploy job should never execute after test failed")
+	}
+
+	out := buf.String()
+	expectedLog := `[drev] job "deploy" skipped because dependency "test" was failed`
+	if !strings.Contains(out, expectedLog) {
+		t.Errorf("expected log output to contain %q, got: %s", expectedLog, out)
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run status %q, got %q", drevtypes.StatusFailed, storedRun.Status)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+	}
+
+	if jobMap["test"].Status != drevtypes.StatusFailed {
+		t.Errorf("expected test job status %q, got %q", drevtypes.StatusFailed, jobMap["test"].Status)
+	}
+	if jobMap["deploy"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected deploy job status %q, got %q", drevtypes.StatusSkipped, jobMap["deploy"].Status)
+	}
+	if jobMap["deploy"].FinishedAt.IsZero() {
+		t.Errorf("expected deploy job to have non-zero finished_at timestamp")
+	}
+	if !jobMap["deploy"].StartedAt.IsZero() {
+		t.Errorf("expected deploy job to have zero started_at timestamp, got %v", jobMap["deploy"].StartedAt)
+	}
+}
+
+func TestDownstreamJobStates_MultiLevelDependencyChain(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "multi-level-chain",
+		Jobs: []drevtypes.Job{
+			{Name: "lint", Image: "alpine:latest"},
+			{Name: "test", Image: "alpine:latest", DependsOn: []string{"lint"}},
+			{Name: "deploy", Image: "alpine:latest", DependsOn: []string{"test"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var executed []string
+	var mu sync.Mutex
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			mu.Lock()
+			executed = append(executed, job.Name)
+			mu.Unlock()
+			if job.Name == "lint" {
+				return errors.New("lint check failed")
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail, got nil")
+	}
+
+	if len(executed) != 1 || executed[0] != "lint" {
+		t.Errorf("expected only lint to execute, got %v", executed)
+	}
+
+	out := buf.String()
+	expectedLog1 := `[drev] job "test" skipped because dependency "lint" was failed`
+	expectedLog2 := `[drev] job "deploy" skipped because dependency "test" was skipped`
+	if !strings.Contains(out, expectedLog1) {
+		t.Errorf("expected log output to contain %q, got: %s", expectedLog1, out)
+	}
+	if !strings.Contains(out, expectedLog2) {
+		t.Errorf("expected log output to contain %q, got: %s", expectedLog2, out)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+	}
+
+	if jobMap["lint"].Status != drevtypes.StatusFailed {
+		t.Errorf("expected lint job status %q, got %q", drevtypes.StatusFailed, jobMap["lint"].Status)
+	}
+	if jobMap["test"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected test job status %q, got %q", drevtypes.StatusSkipped, jobMap["test"].Status)
+	}
+	if jobMap["deploy"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected deploy job status %q, got %q", drevtypes.StatusSkipped, jobMap["deploy"].Status)
+	}
+	if jobMap["test"].FinishedAt.IsZero() || jobMap["deploy"].FinishedAt.IsZero() {
+		t.Errorf("expected non-zero finished_at for all skipped jobs")
+	}
+}
+
+func TestDownstreamJobStates_MultipleDependenciesOneFails(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "multi-deps",
+		Jobs: []drevtypes.Job{
+			{Name: "unit-tests", Image: "alpine:latest"},
+			{Name: "integration-tests", Image: "alpine:latest"},
+			{Name: "deploy", Image: "alpine:latest", DependsOn: []string{"unit-tests", "integration-tests"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var deployExecuted bool
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "unit-tests" {
+				return nil
+			}
+			if job.Name == "integration-tests" {
+				return errors.New("integration tests timeout")
+			}
+			if job.Name == "deploy" {
+				deployExecuted = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail, got nil")
+	}
+
+	if deployExecuted {
+		t.Errorf("deploy job should not execute when one dependency fails")
+	}
+
+	out := buf.String()
+	expectedLog := `[drev] job "deploy" skipped because dependency "integration-tests" was failed`
+	if !strings.Contains(out, expectedLog) {
+		t.Errorf("expected log to contain %q, got: %s", expectedLog, out)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+	}
+	if jobMap["unit-tests"].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected unit-tests to succeed, got %q", jobMap["unit-tests"].Status)
+	}
+	if jobMap["integration-tests"].Status != drevtypes.StatusFailed {
+		t.Errorf("expected integration-tests to fail, got %q", jobMap["integration-tests"].Status)
+	}
+	if jobMap["deploy"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected deploy to be skipped, got %q", jobMap["deploy"].Status)
+	}
+}
+
+func TestDownstreamJobStates_IndependentBranchesContinue(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "independent-branches",
+		Jobs: []drevtypes.Job{
+			{Name: "frontend-build", Image: "alpine:latest"},
+			{Name: "frontend-test", Image: "alpine:latest", DependsOn: []string{"frontend-build"}},
+			{Name: "backend-build", Image: "alpine:latest"},
+			{Name: "backend-test", Image: "alpine:latest", DependsOn: []string{"backend-build"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var completed []string
+	var mu sync.Mutex
+	recordComplete := func(name string) {
+		mu.Lock()
+		completed = append(completed, name)
+		mu.Unlock()
+	}
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			switch job.Name {
+			case "frontend-build":
+				return errors.New("webpack error")
+			case "frontend-test":
+				t.Errorf("frontend-test should have been skipped")
+				return nil
+			case "backend-build":
+				time.Sleep(20 * time.Millisecond)
+				recordComplete("backend-build")
+				return nil
+			case "backend-test":
+				time.Sleep(20 * time.Millisecond)
+				recordComplete("backend-test")
+				return nil
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail due to frontend branch failure, got nil")
+	}
+
+	mu.Lock()
+	backendDone := len(completed) == 2 && completed[0] == "backend-build" && completed[1] == "backend-test"
+	mu.Unlock()
+	if !backendDone {
+		t.Errorf("expected backend-build and backend-test to execute to completion, got: %v", completed)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+	}
+
+	if jobMap["frontend-build"].Status != drevtypes.StatusFailed {
+		t.Errorf("expected frontend-build to fail, got %s", jobMap["frontend-build"].Status)
+	}
+	if jobMap["frontend-test"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected frontend-test to be skipped, got %s", jobMap["frontend-test"].Status)
+	}
+	if jobMap["backend-build"].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected backend-build to succeed, got %s", jobMap["backend-build"].Status)
+	}
+	if jobMap["backend-test"].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected backend-test to succeed, got %s", jobMap["backend-test"].Status)
+	}
+}
+
+func TestDownstreamJobStates_TimedOutDependency(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "timed-out-dep",
+		Jobs: []drevtypes.Job{
+			{Name: "hung-parent", Image: "alpine:latest", Timeout: "30ms"},
+			{Name: "child", Image: "alpine:latest", DependsOn: []string{"hung-parent"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	var childExecuted bool
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "hung-parent" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			if job.Name == "child" {
+				childExecuted = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail, got nil")
+	}
+
+	if childExecuted {
+		t.Errorf("child should not have executed")
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, `[drev] job "hung-parent" timed out after 30ms`) {
+		t.Errorf("expected log to contain timeout message, got: %s", out)
+	}
+	if !strings.Contains(out, `[drev] job "child" skipped because dependency "hung-parent" was failed`) {
+		t.Errorf("expected log to contain skip message, got: %s", out)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+	}
+	if jobMap["hung-parent"].Status != drevtypes.StatusFailed {
+		t.Errorf("expected hung-parent to be failed, got %s", jobMap["hung-parent"].Status)
+	}
+	if jobMap["child"].Status != drevtypes.StatusSkipped {
+		t.Errorf("expected child to be skipped, got %s", jobMap["child"].Status)
+	}
+}
+
+func TestDownstreamJobStates_NoPendingJobsAfterCompletion(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "complex-dag-no-pending",
+		Jobs: []drevtypes.Job{
+			{Name: "root1", Image: "alpine:latest"},
+			{Name: "root2", Image: "alpine:latest"},
+			{Name: "child1", Image: "alpine:latest", DependsOn: []string{"root1"}},
+			{Name: "child2", Image: "alpine:latest", DependsOn: []string{"root2"}},
+			{Name: "leaf", Image: "alpine:latest", DependsOn: []string{"child1", "child2"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "root1" {
+				return errors.New("root1 failed")
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	_ = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 5 {
+		t.Fatalf("expected 5 jobs, got %d", len(jobs))
+	}
+
+	for _, j := range jobs {
+		if j.Status == drevtypes.StatusPending {
+			t.Errorf("job %s was left in pending status at completion", j.JobName)
+		}
+		if j.FinishedAt.IsZero() {
+			t.Errorf("job %s has zero finished_at at completion", j.JobName)
+		}
+	}
+}
+
+func TestDownstreamJobStates_ParentContextCancellation(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "external-cancellation",
+		Jobs: []drevtypes.Job{
+			{Name: "long-job", Image: "alpine:latest"},
+			{Name: "waiting-job", Image: "alpine:latest", DependsOn: []string{"long-job"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	jobStarted := make(chan struct{})
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "long-job" {
+				close(jobStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	go func() {
+		<-jobStarted
+		time.Sleep(15 * time.Millisecond)
+		parentCancel()
+	}()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail due to cancellation, got nil")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusCancelled {
+		t.Errorf("expected run status %q, got %q", drevtypes.StatusCancelled, storedRun.Status)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+		if j.Status == drevtypes.StatusPending {
+			t.Errorf("job %s was left in pending status after cancellation", j.JobName)
+		}
+	}
+
+	if jobMap["long-job"].Status != drevtypes.StatusCancelled {
+		t.Errorf("expected long-job status %q, got %q", drevtypes.StatusCancelled, jobMap["long-job"].Status)
+	}
+	if jobMap["waiting-job"].Status != drevtypes.StatusCancelled {
+		t.Errorf("expected waiting-job status %q, got %q", drevtypes.StatusCancelled, jobMap["waiting-job"].Status)
+	}
+}
+
+func TestCancellation_SingleRunningJob(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "single-running-cancel",
+		Jobs: []drevtypes.Job{
+			{Name: "solo", Image: "alpine:latest"},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	go func() {
+		<-started
+		time.Sleep(10 * time.Millisecond)
+		parentCancel()
+	}()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline error, got nil")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusCancelled {
+		t.Errorf("run status = %q, want %q", storedRun.Status, drevtypes.StatusCancelled)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusCancelled {
+		t.Errorf("job status = %q, want %q", jobs[0].Status, drevtypes.StatusCancelled)
+	}
+	if jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected non-zero finished_at for cancelled job")
+	}
+}
+
+func TestCancellation_WaitingJob(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "waiting-job-cancel",
+		Jobs: []drevtypes.Job{
+			{Name: "root", Image: "alpine:latest"},
+			{Name: "child", Image: "alpine:latest", DependsOn: []string{"root"}},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	rootStarted := make(chan struct{})
+	var childRunCalled bool
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "root" {
+				close(rootStarted)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			if job.Name == "child" {
+				childRunCalled = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	go func() {
+		<-rootStarted
+		time.Sleep(10 * time.Millisecond)
+		parentCancel()
+	}()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline error, got nil")
+	}
+
+	if childRunCalled {
+		t.Errorf("child job should never be executed when cancelled while waiting")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusCancelled {
+		t.Errorf("run status = %q, want %q", storedRun.Status, drevtypes.StatusCancelled)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+		if j.Status == drevtypes.StatusPending {
+			t.Errorf("job %s was left in pending status", j.JobName)
+		}
+		if j.FinishedAt.IsZero() {
+			t.Errorf("job %s has zero finished_at", j.JobName)
+		}
+	}
+
+	if jobMap["root"].Status != drevtypes.StatusCancelled {
+		t.Errorf("root job status = %q, want %q", jobMap["root"].Status, drevtypes.StatusCancelled)
+	}
+	if jobMap["child"].Status != drevtypes.StatusCancelled {
+		t.Errorf("child job status = %q, want %q (not skipped)", jobMap["child"].Status, drevtypes.StatusCancelled)
+	}
+}
+
+func TestCancellation_MultipleIndependentRunningJobs(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "multi-running-cancel",
+		Jobs: []drevtypes.Job{
+			{Name: "jobA", Image: "alpine:latest"},
+			{Name: "jobB", Image: "alpine:latest"},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	var startedWg sync.WaitGroup
+	startedWg.Add(2)
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			startedWg.Done()
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+
+	go func() {
+		startedWg.Wait()
+		time.Sleep(10 * time.Millisecond)
+		parentCancel()
+	}()
+
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline error, got nil")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusCancelled {
+		t.Errorf("run status = %q, want %q", storedRun.Status, drevtypes.StatusCancelled)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	for _, j := range jobs {
+		if j.Status != drevtypes.StatusCancelled {
+			t.Errorf("job %s status = %q, want %q", j.JobName, j.Status, drevtypes.StatusCancelled)
+		}
+		if j.FinishedAt.IsZero() {
+			t.Errorf("job %s has zero finished_at", j.JobName)
+		}
+	}
+}
+
+func TestCancellation_WithPrecedingJobFailure(t *testing.T) {
+	pipeline := &drevtypes.Pipeline{
+		Name: "fail-then-cancel",
+		Jobs: []drevtypes.Job{
+			{Name: "failing-job", Image: "alpine:latest"},
+			{Name: "long-job", Image: "alpine:latest"},
+		},
+	}
+
+	s, runID := setupTestPipeline(t, pipeline)
+
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	failFinished := make(chan struct{})
+
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "failing-job" {
+				defer close(failFinished)
+				return errors.New("command failed with exit code 1")
+			}
+			if job.Name == "long-job" {
+				<-failFinished
+				time.Sleep(10 * time.Millisecond)
+				parentCancel()
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	var buf bytes.Buffer
+	err := sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail, got nil")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	// Because a genuine job failure occurred, the overall run must be StatusFailed, not StatusCancelled
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("run status = %q, want %q", storedRun.Status, drevtypes.StatusFailed)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range jobs {
+		jobMap[j.JobName] = j
+		if j.Status == drevtypes.StatusPending {
+			t.Errorf("job %s left pending", j.JobName)
+		}
+	}
+
+	if jobMap["failing-job"].Status != drevtypes.StatusFailed {
+		t.Errorf("failing-job status = %q, want %q", jobMap["failing-job"].Status, drevtypes.StatusFailed)
+	}
+	if jobMap["long-job"].Status != drevtypes.StatusCancelled {
+		t.Errorf("long-job status = %q, want %q", jobMap["long-job"].Status, drevtypes.StatusCancelled)
+	}
+}
+
+func TestDownstreamJobStates_AllSuccessAndFailureSemantics(t *testing.T) {
+	t.Run("all jobs succeed leads to StatusSuccess", func(t *testing.T) {
+		pipeline := &drevtypes.Pipeline{
+			Name: "all-success",
+			Jobs: []drevtypes.Job{
+				{Name: "step1", Image: "alpine:latest"},
+				{Name: "step2", Image: "alpine:latest", DependsOn: []string{"step1"}},
+			},
+		}
+
+		s, runID := setupTestPipeline(t, pipeline)
+		mr := &mockRunner{
+			runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+				return nil
+			},
+		}
+		sched := New(mr, s)
+		var buf bytes.Buffer
+		if err := sched.RunPipeline(context.Background(), pipeline, runID, &buf); err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+
+		storedRun, _ := s.GetRun(context.Background(), runID)
+		if storedRun.Status != drevtypes.StatusSuccess {
+			t.Errorf("expected StatusSuccess, got %s", storedRun.Status)
+		}
+	})
+
+	t.Run("pipeline with skipped jobs leads to StatusFailed", func(t *testing.T) {
+		pipeline := &drevtypes.Pipeline{
+			Name: "has-skipped",
+			Jobs: []drevtypes.Job{
+				{Name: "root", Image: "alpine:latest"},
+				{Name: "child", Image: "alpine:latest", DependsOn: []string{"root"}},
+			},
+		}
+
+		s, runID := setupTestPipeline(t, pipeline)
+		mr := &mockRunner{
+			runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+				if job.Name == "root" {
+					return errors.New("root fail")
+				}
+				return nil
+			},
+		}
+		sched := New(mr, s)
+		var buf bytes.Buffer
+		_ = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+
+		storedRun, _ := s.GetRun(context.Background(), runID)
+		if storedRun.Status != drevtypes.StatusFailed {
+			t.Errorf("expected StatusFailed, got %s", storedRun.Status)
+		}
+	})
 }

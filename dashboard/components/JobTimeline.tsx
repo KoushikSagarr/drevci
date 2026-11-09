@@ -61,6 +61,8 @@ export default function JobTimeline({
         return '✗';
       case 'cancelled':
         return '⊘';
+      case 'skipped':
+        return '↷';
       case 'pending':
       default:
         return '○';
@@ -76,6 +78,7 @@ export default function JobTimeline({
       case 'failed':
         return 'border-status-failed text-status-failed bg-status-failed/5';
       case 'cancelled':
+      case 'skipped':
         return 'border-status-cancelled text-status-cancelled bg-status-cancelled/5';
       case 'pending':
       default:
@@ -92,6 +95,7 @@ export default function JobTimeline({
       case 'failed':
         return 'bg-status-failed';
       case 'cancelled':
+      case 'skipped':
         return 'bg-status-cancelled';
       case 'pending':
       default:

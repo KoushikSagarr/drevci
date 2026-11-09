@@ -11,6 +11,7 @@ const (
 	StatusSuccess   RunStatus = "success"
 	StatusFailed    RunStatus = "failed"
 	StatusCancelled RunStatus = "cancelled"
+	StatusSkipped   RunStatus = "skipped"
 )
 
 // Source defines where the pipeline code comes from.

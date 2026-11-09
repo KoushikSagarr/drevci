@@ -111,6 +111,10 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 	defer w.Cleanup()
 
 	if err := w.Clone(ctx, pipeline.Source, logWriter); err != nil {
+		if ctx.Err() != nil {
+			s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusCancelled)
+			return ctx.Err()
+		}
 		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
 		return err
 	}
@@ -123,32 +127,80 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 	var mu sync.Mutex
 	jobStatuses := make(map[string]drevtypes.RunStatus)
 
-	eg, egCtx := errgroup.WithContext(ctx)
+	var eg errgroup.Group
 
 	for _, jobName := range sortedJobs {
 		jobName := jobName
 		job := jobMap[jobName]
 
 		eg.Go(func() error {
-			for _, depName := range job.DependsOn {
-				select {
-				case <-jobDoneChans[depName]:
-				case <-egCtx.Done():
-					return egCtx.Err()
-				}
-
-				mu.Lock()
-				status := jobStatuses[depName]
-				mu.Unlock()
-
-				if status != drevtypes.StatusSuccess {
-					return fmt.Errorf("dependency %q failed with status %s", depName, status)
-				}
-			}
+			defer close(jobDoneChans[jobName])
 
 			rj, ok := runJobMap[jobName]
 			if !ok {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusFailed
+				mu.Unlock()
 				return fmt.Errorf("run job not found for %s", jobName)
+			}
+
+			if len(job.DependsOn) > 0 {
+				depDone := make(chan string, len(job.DependsOn))
+				for _, dep := range job.DependsOn {
+					dep := dep
+					go func() {
+						select {
+						case <-jobDoneChans[dep]:
+							depDone <- dep
+						case <-ctx.Done():
+						}
+					}()
+				}
+
+				completedDeps := 0
+				var failedDep string
+				var failedDepStatus drevtypes.RunStatus
+
+				for completedDeps < len(job.DependsOn) {
+					select {
+					case dep := <-depDone:
+						completedDeps++
+						mu.Lock()
+						status := jobStatuses[dep]
+						mu.Unlock()
+
+						if status != drevtypes.StatusSuccess && failedDep == "" {
+							failedDep = dep
+							failedDepStatus = status
+						}
+					case <-ctx.Done():
+						mu.Lock()
+						jobStatuses[jobName] = drevtypes.StatusCancelled
+						mu.Unlock()
+						s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusCancelled)
+						return ctx.Err()
+					}
+
+					// If any dependency failed or was skipped, this job cannot execute.
+					// We can skip immediately without waiting for remaining dependencies.
+					if failedDep != "" {
+						break
+					}
+				}
+
+				if failedDep != "" {
+					fmt.Fprintf(logWriter, "[drev] job %q skipped because dependency %q was %s\n", job.Name, failedDep, failedDepStatus)
+					if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSkipped); err != nil {
+						mu.Lock()
+						jobStatuses[jobName] = drevtypes.StatusFailed
+						mu.Unlock()
+						return fmt.Errorf("updating job status to skipped for %s: %w", job.Name, err)
+					}
+					mu.Lock()
+					jobStatuses[jobName] = drevtypes.StatusSkipped
+					mu.Unlock()
+					return nil
+				}
 			}
 
 			// Single-Parent Snapshot Inheritance (Contract Rule 3, 4, 5):
@@ -161,12 +213,15 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 
 			jobWorkspace, err := w.CreateJobWorkspace(job.Name, parentJob)
 			if err != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusFailed
+				mu.Unlock()
 				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
 				return fmt.Errorf("creating workspace for job %s: %w", job.Name, err)
 			}
 
 			// Determine execution context, enforcing per-job timeout if configured
-			jobCtx := egCtx
+			jobCtx := ctx
 			if job.Timeout != "" {
 				d, parseErr := time.ParseDuration(job.Timeout)
 				if parseErr != nil || d <= 0 {
@@ -178,45 +233,97 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 					return fmt.Errorf("invalid timeout %q for job %q", job.Timeout, job.Name)
 				}
 				var jobCancel context.CancelFunc
-				jobCtx, jobCancel = context.WithTimeout(egCtx, d)
+				jobCtx, jobCancel = context.WithTimeout(ctx, d)
 				defer jobCancel()
 			}
 
-			s.store.UpdateRunJobStatus(egCtx, rj.ID, drevtypes.StatusRunning)
+			if err := s.store.UpdateRunJobStatus(ctx, rj.ID, drevtypes.StatusRunning); err != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusFailed
+				mu.Unlock()
+				return fmt.Errorf("updating job status to running for %s: %w", job.Name, err)
+			}
 
 			err = s.runner.RunJob(jobCtx, run, &job, jobWorkspace, logWriter)
 
 			mu.Lock()
 			if err != nil {
-				jobStatuses[jobName] = drevtypes.StatusFailed
+				targetStatus := drevtypes.StatusFailed
+				if ctx.Err() == context.Canceled && (errors.Is(err, context.Canceled) || jobCtx.Err() == context.Canceled) {
+					targetStatus = drevtypes.StatusCancelled
+				}
+				jobStatuses[jobName] = targetStatus
 
 				// Report a job timeout only when this job had an explicit timeout configured,
-				// its own deadline was exceeded, and the parent errgroup context was still active
-				// (i.e. egCtx.Err() == nil) when the timeout was observed.
+				// its own deadline was exceeded, and the parent context was still active
+				// (i.e. ctx.Err() == nil) when the timeout was observed.
 				isJobTimeout := job.Timeout != "" &&
 					(jobCtx.Err() == context.DeadlineExceeded || errors.Is(err, context.DeadlineExceeded)) &&
-					egCtx.Err() == nil
+					ctx.Err() == nil
 
 				if isJobTimeout {
 					fmt.Fprintf(logWriter, "[drev] job %q timed out after %s\n", job.Name, job.Timeout)
 					err = fmt.Errorf("job %q timed out after %s: %w", job.Name, job.Timeout, err)
 				}
 				mu.Unlock()
-				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+				s.store.UpdateRunJobStatus(context.Background(), rj.ID, targetStatus)
 				return err
 			}
-			jobStatuses[jobName] = drevtypes.StatusSuccess
 			mu.Unlock()
 
-			s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSuccess)
-			close(jobDoneChans[jobName])
+			if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSuccess); err != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusFailed
+				mu.Unlock()
+				return fmt.Errorf("updating job status to success for %s: %w", job.Name, err)
+			}
+
+			mu.Lock()
+			jobStatuses[jobName] = drevtypes.StatusSuccess
+			mu.Unlock()
 			return nil
 		})
 	}
 
-	if err := eg.Wait(); err != nil {
+	waitErr := eg.Wait()
+
+	mu.Lock()
+	var hasFailure, hasSkip, hasCancelled bool
+	for _, status := range jobStatuses {
+		switch status {
+		case drevtypes.StatusFailed:
+			hasFailure = true
+		case drevtypes.StatusSkipped:
+			hasSkip = true
+		case drevtypes.StatusCancelled:
+			hasCancelled = true
+		}
+	}
+	mu.Unlock()
+
+	if ctx.Err() == context.Canceled || hasCancelled {
+		if hasFailure {
+			s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+			if waitErr != nil {
+				return waitErr
+			}
+			return fmt.Errorf("pipeline run failed with errors before cancellation")
+		}
+		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusCancelled)
+		if waitErr != nil {
+			return waitErr
+		}
+		return ctx.Err()
+	}
+
+	if waitErr != nil {
 		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
-		return err
+		return waitErr
+	}
+
+	if hasFailure || hasSkip {
+		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+		return fmt.Errorf("pipeline run completed with failed or skipped jobs")
 	}
 
 	s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusSuccess)

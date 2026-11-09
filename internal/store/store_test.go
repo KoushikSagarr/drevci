@@ -681,3 +681,54 @@ func TestSQLiteStore_GetRunStats_SampleLimit(t *testing.T) {
 		t.Errorf("PassRate = %v, want 86", stats35.PassRate)
 	}
 }
+
+func TestUpdateRunJobStatus_Skipped(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	run := &drevtypes.Run{
+		ID:           "run-skip-test",
+		PipelineID:   "pipeline-1",
+		PipelineName: "test-pipeline",
+		Status:       drevtypes.StatusRunning,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+
+	job := &drevtypes.RunJob{
+		ID:      "job-to-skip",
+		RunID:   run.ID,
+		JobName: "downstream",
+		Status:  drevtypes.StatusPending,
+	}
+	if err := s.CreateRunJob(ctx, job); err != nil {
+		t.Fatalf("CreateRunJob() error = %v", err)
+	}
+
+	if err := s.UpdateRunJobStatus(ctx, job.ID, drevtypes.StatusSkipped); err != nil {
+		t.Fatalf("UpdateRunJobStatus(StatusSkipped) error = %v", err)
+	}
+
+	jobs, err := s.GetRunJobs(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetRunJobs() error = %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusSkipped {
+		t.Errorf("job status = %v, want %v", jobs[0].Status, drevtypes.StatusSkipped)
+	}
+	if jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected finished_at to be populated for skipped job, got %v", jobs[0].FinishedAt)
+	}
+	if !jobs[0].StartedAt.IsZero() {
+		t.Errorf("expected started_at to be zero for skipped job, got %v", jobs[0].StartedAt)
+	}
+}

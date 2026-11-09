@@ -88,8 +88,8 @@ export function calculateJobTimeline(
       wallClockSharePercent: 0,
       isLive: false,
       isStarted: false,
-      isFinished: false,
-      formattedDuration: 'Pending',
+      isFinished,
+      formattedDuration: job.status === 'skipped' ? 'Skipped' : 'Pending',
       formattedOffset: '—',
     };
   }

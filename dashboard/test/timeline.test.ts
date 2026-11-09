@@ -183,6 +183,22 @@ describe('Edge Cases and Fallback Safety', () => {
     assert.equal(summary.jobMetrics[0].formattedOffset, '—');
   });
 
+  it('handles skipped jobs with formattedDuration "Skipped"', () => {
+    const skippedJob: RunJob = {
+      id: 'job-s',
+      run_id: 'run-skip',
+      job_name: 'deploy',
+      status: 'skipped',
+      started_at: '',
+      finished_at: '2026-10-24T12:00:10Z',
+    };
+
+    const m = calculateJobTimeline(skippedJob, new Date('2026-10-24T12:00:00Z').getTime(), 20000);
+    assert.equal(m.isStarted, false);
+    assert.equal(m.isFinished, true);
+    assert.equal(m.formattedDuration, 'Skipped');
+  });
+
   it('handles instantaneous / zero-duration jobs cleanly', () => {
     const instantJob: RunJob = {
       id: 'job-instant',
