@@ -732,3 +732,105 @@ func TestUpdateRunJobStatus_Skipped(t *testing.T) {
 		t.Errorf("expected started_at to be zero for skipped job, got %v", jobs[0].StartedAt)
 	}
 }
+
+func TestStore_FailRun(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "failrun.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:          "run-fail-test",
+		PipelineID:  "pipe-fail-test",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "api",
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+
+	job1 := &drevtypes.RunJob{
+		ID:      "job-fail-1",
+		RunID:   run.ID,
+		JobName: "job-1",
+		Status:  drevtypes.StatusPending,
+	}
+	job2 := &drevtypes.RunJob{
+		ID:      "job-fail-2",
+		RunID:   run.ID,
+		JobName: "job-2",
+		Status:  drevtypes.StatusPending,
+	}
+	if err := s.CreateRunJob(ctx, job1); err != nil {
+		t.Fatalf("CreateRunJob(1) error = %v", err)
+	}
+	if err := s.CreateRunJob(ctx, job2); err != nil {
+		t.Fatalf("CreateRunJob(2) error = %v", err)
+	}
+
+	// 1. FailRun with explicit job IDs
+	if err := store.FailRun(ctx, s, run.ID, []string{job1.ID, job2.ID}); err != nil {
+		t.Fatalf("FailRun() error = %v", err)
+	}
+
+	r, err := s.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if r.Status != drevtypes.StatusFailed {
+		t.Errorf("run status = %v, want %v", r.Status, drevtypes.StatusFailed)
+	}
+	if r.FinishedAt.IsZero() {
+		t.Errorf("expected run finished_at to be populated")
+	}
+
+	jobs, err := s.GetRunJobs(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("GetRunJobs() error = %v", err)
+	}
+	for _, j := range jobs {
+		if j.Status != drevtypes.StatusFailed {
+			t.Errorf("job %s status = %v, want %v", j.ID, j.Status, drevtypes.StatusFailed)
+		}
+		if j.FinishedAt.IsZero() {
+			t.Errorf("expected job %s finished_at to be populated", j.ID)
+		}
+	}
+
+	// 2. FailRun with empty jobIDs (discovery through GetRunJobs)
+	run2 := &drevtypes.Run{
+		ID:          "run-fail-disc",
+		PipelineID:  "pipe-fail-disc",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "api",
+	}
+	_ = s.CreateRun(ctx, run2)
+	job3 := &drevtypes.RunJob{
+		ID:      "job-fail-3",
+		RunID:   run2.ID,
+		JobName: "job-3",
+		Status:  drevtypes.StatusPending,
+	}
+	_ = s.CreateRunJob(ctx, job3)
+
+	if err := store.FailRun(ctx, s, run2.ID, nil); err != nil {
+		t.Fatalf("FailRun() with discovery error = %v", err)
+	}
+	r2, _ := s.GetRun(ctx, run2.ID)
+	if r2.Status != drevtypes.StatusFailed {
+		t.Errorf("discovered run status = %v, want %v", r2.Status, drevtypes.StatusFailed)
+	}
+	jobs2, _ := s.GetRunJobs(ctx, run2.ID)
+	if len(jobs2) != 1 || jobs2[0].Status != drevtypes.StatusFailed {
+		t.Errorf("discovered job status = %v, want %v", jobs2[0].Status, drevtypes.StatusFailed)
+	}
+
+	// 3. FailRun handles non-existent IDs gracefully by returning error and logging
+	err = store.FailRun(ctx, s, "nonexistent-run", []string{"nonexistent-job"})
+	if err == nil {
+		t.Errorf("expected error for nonexistent run, got nil")
+	}
+}

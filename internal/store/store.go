@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"time"
@@ -693,4 +694,40 @@ func (s *SQLiteStore) RecordUsage(_ context.Context, _, _, _ string) error {
 
 func (s *SQLiteStore) GetMonthlyUsage(_ context.Context, _ string) (int, error) {
 	return 0, nil
+}
+
+// FailRun marks a run and its jobs as failed with terminal timestamps.
+// If jobIDs is empty, it queries the store for any existing jobs belonging to the run.
+// It logs any update failures and returns an aggregate error if any updates failed.
+func FailRun(ctx context.Context, s Store, runID string, jobIDs []string) error {
+	if s == nil {
+		return nil
+	}
+	bgCtx := context.Background()
+	var errs []error
+
+	if err := s.UpdateRunStatus(bgCtx, runID, drevtypes.StatusFailed); err != nil {
+		log.Printf("[store] failed to update run %s status to failed: %v", runID, err)
+		errs = append(errs, fmt.Errorf("updating run %s status: %w", runID, err))
+	}
+
+	if len(jobIDs) == 0 {
+		if jobs, err := s.GetRunJobs(bgCtx, runID); err == nil {
+			for _, j := range jobs {
+				jobIDs = append(jobIDs, j.ID)
+			}
+		} else {
+			log.Printf("[store] failed to query run jobs for run %s: %v", runID, err)
+			errs = append(errs, fmt.Errorf("querying jobs for run %s: %w", runID, err))
+		}
+	}
+
+	for _, jid := range jobIDs {
+		if err := s.UpdateRunJobStatus(bgCtx, jid, drevtypes.StatusFailed); err != nil {
+			log.Printf("[store] failed to update run job %s status to failed: %v", jid, err)
+			errs = append(errs, fmt.Errorf("updating job %s status: %w", jid, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }

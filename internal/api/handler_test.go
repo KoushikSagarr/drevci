@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +23,10 @@ import (
 	"github.com/drevci/drev/internal/webhook"
 	"github.com/drevci/drev/pkg/drevtypes"
 )
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
 
 func setupTestServer(t *testing.T) (*httptest.Server, *Handler) {
 	return setupTestServerWithLogger(t, nil)
@@ -222,6 +228,100 @@ jobs:
 	json.NewDecoder(res.Body).Decode(&body)
 	if body["run_id"] == "" {
 		t.Errorf("expected run_id, got empty")
+	}
+}
+
+func TestTrigger_QueueFull_MarksRunAndJobsFailed(t *testing.T) {
+	srv, h := setupTestServer(t)
+
+	// Fill the queue to capacity
+	for i := 0; i < 10; i++ {
+		if err := h.queue.Enqueue(&queue.Job{
+			RunID:      fmt.Sprintf("fill-%d", i),
+			Pipeline:   &drevtypes.Pipeline{Name: "fill"},
+			LogWriter:  nopWriteCloser{io.Discard},
+			EnqueuedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("filling queue at %d: %v", i, err)
+		}
+	}
+
+	pipelineYAML := `
+name: test-queue-full
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "test"
+`
+	ymlPath := filepath.Join(t.TempDir(), "queue_full.yml")
+	os.WriteFile(ymlPath, []byte(pipelineYAML), 0644)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"pipeline_path": ymlPath,
+	})
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/pipelines/trigger", bytes.NewBuffer(reqBody))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 Service Unavailable, got %v", res.StatusCode)
+	}
+
+	// Verify in store that the run is marked StatusFailed (NOT left StatusPending)
+	runs, err := h.store.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	var targetRun *drevtypes.Run
+	for _, r := range runs {
+		if r.PipelineID == "test-queue-full" {
+			targetRun = r
+			break
+		}
+	}
+	if targetRun == nil {
+		t.Fatal("expected run record in store, got none")
+	}
+	if targetRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run status %q, got %q (queue rejection must not leave pending run)", drevtypes.StatusFailed, targetRun.Status)
+	}
+	if targetRun.FinishedAt.IsZero() {
+		t.Errorf("expected finished_at to be populated for rejected run")
+	}
+
+	// Verify all jobs in targetRun are StatusFailed with finished_at populated
+	jobs, err := h.store.GetRunJobs(context.Background(), targetRun.ID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusFailed {
+		t.Errorf("expected job status %q, got %q", drevtypes.StatusFailed, jobs[0].Status)
+	}
+	if jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected job finished_at to be populated")
+	}
+
+	// Verify rejection reason is recorded in streamer log
+	r, err := h.streamer.Reader(targetRun.ID)
+	if err != nil {
+		t.Fatalf("reading run log: %v", err)
+	}
+	defer r.Close()
+	logContent, _ := io.ReadAll(r)
+	if !strings.Contains(string(logContent), "[drev] pipeline rejected: queue is full") {
+		t.Errorf("expected log to contain rejection reason, got: %s", string(logContent))
 	}
 }
 

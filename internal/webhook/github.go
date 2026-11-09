@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -138,6 +139,7 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	createdJobIDs := make([]string, 0, len(pipeline.Jobs))
 	for _, job := range pipeline.Jobs {
 		rj := &drevtypes.RunJob{
 			ID:      uuid.New().String(),
@@ -146,13 +148,18 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			Status:  drevtypes.StatusPending,
 		}
 		if err := h.store.CreateRunJob(r.Context(), rj); err != nil {
+			log.Printf("[webhook] failed to create run job %s for run %s: %v", job.Name, runID, err)
+			_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		createdJobIDs = append(createdJobIDs, rj.ID)
 	}
 
 	logW, err := h.streamer.Writer(runID)
 	if err != nil {
+		log.Printf("[webhook] failed to create log writer for run %s: %v", runID, err)
+		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -162,7 +169,10 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		LogWriter:  logW,
 		EnqueuedAt: time.Now(),
 	}); err != nil {
+		log.Printf("[webhook] run %s rejected: %v", runID, err)
+		fmt.Fprintf(logW, "[drev] pipeline rejected: %v\n", err)
 		logW.Close()
+		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
