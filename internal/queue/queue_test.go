@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -60,5 +61,24 @@ func TestDepth(t *testing.T) {
 
 	if d := q.Depth(); d != 2 {
 		t.Errorf("expected depth 2, got %d", d)
+	}
+}
+
+func TestEnqueueWithContext_SuccessAndCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	q := New(1)
+	if err := q.EnqueueWithContext(ctx, makeJob("job-1")); err != nil {
+		t.Fatalf("first enqueue failed: %v", err)
+	}
+
+	// Try enqueuing when full with cancelled context
+	cancelCtx, cancelFunc := context.WithCancel(context.Background())
+	cancelFunc()
+
+	err := q.EnqueueWithContext(cancelCtx, makeJob("job-2"))
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
 	}
 }

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -62,9 +63,23 @@ func (p *Pool) processJob(ctx context.Context, job *queue.Job) {
 	start := time.Now()
 
 	defer func() {
-		job.LogWriter.Close()
+		if job.LogWriter != nil {
+			job.LogWriter.Close()
+		}
 		log.Printf("[pool] run %s completed in %s", job.RunID, time.Since(start).Round(time.Millisecond))
 	}()
+
+	// Atomic durable execution claim: verify run is pending, set status to running,
+	// record started_at, and delete its outbox entry before any pipeline side effects occur.
+	if p.store != nil {
+		if err := p.store.ClaimRunForExecution(ctx, job.RunID); err != nil {
+			log.Printf("[pool] worker failed to claim run %s for execution: %v", job.RunID, err)
+			if job.LogWriter != nil {
+				fmt.Fprintf(job.LogWriter, "[drev] run %s claim rejected: %v\n", job.RunID, err)
+			}
+			return
+		}
+	}
 
 	runErr := p.scheduler.RunPipeline(ctx, job.Pipeline, job.RunID, job.LogWriter)
 	if runErr != nil {

@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -37,6 +38,16 @@ func (q *Queue) Enqueue(job *Job) error {
 		return nil
 	default:
 		return fmt.Errorf("queue is full (%d jobs pending)", q.size)
+	}
+}
+
+// EnqueueWithContext enqueues a job, blocking until space is available or ctx is cancelled.
+func (q *Queue) EnqueueWithContext(ctx context.Context, job *Job) error {
+	select {
+	case q.ch <- job:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

@@ -53,21 +53,68 @@ func New(
 
 type PushPayload struct {
 	Ref        string `json:"ref"`
+	After      string `json:"after"`
 	Repository struct {
 		FullName      string `json:"full_name"`
 		CloneURL      string `json:"clone_url"`
 		DefaultBranch string `json:"default_branch"`
+		Fork          bool   `json:"fork"`
 	} `json:"repository"`
 	HeadCommit struct {
 		ID      string `json:"id"`
 		Message string `json:"message"`
 		Author  struct {
-			Name string `json:"name"`
+			Name  string `json:"name"`
+			Email string `json:"email"`
 		} `json:"author"`
 	} `json:"head_commit"`
 	Pusher struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
 	} `json:"pusher"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+}
+
+type PullRequestPayload struct {
+	Action      string `json:"action"` // "opened", "synchronize", "reopened", etc.
+	Number      int    `json:"number"`
+	PullRequest struct {
+		ID     int64  `json:"id"`
+		Number int    `json:"number"`
+		State  string `json:"state"`
+		Title  string `json:"title"`
+		User   struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Head struct {
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo struct {
+				FullName string `json:"full_name"`
+				CloneURL string `json:"clone_url"`
+				Fork     bool   `json:"fork"`
+			} `json:"repo"`
+		} `json:"head"`
+		Base struct {
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo struct {
+				FullName string `json:"full_name"`
+				CloneURL string `json:"clone_url"`
+			} `json:"repo"`
+		} `json:"base"`
+	} `json:"pull_request"`
+	Repository struct {
+		FullName      string `json:"full_name"`
+		CloneURL      string `json:"clone_url"`
+		DefaultBranch string `json:"default_branch"`
+		Fork          bool   `json:"fork"`
+	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
 }
 
 func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
@@ -94,24 +141,131 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	event := r.Header.Get("X-GitHub-Event")
-	if event != "push" {
+	if event != "push" && event != "pull_request" {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("event ignored"))
 		return
 	}
 
-	var payload PushPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "invalid payload JSON", http.StatusBadRequest)
+	deliveryID := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
+	if deliveryID == "" {
+		http.Error(w, "missing delivery id", http.StatusBadRequest)
 		return
 	}
 
-	branch := strings.TrimPrefix(payload.Ref, "refs/heads/")
-	if branch == payload.Ref {
-		branch = strings.TrimPrefix(payload.Ref, "refs/tags/")
+	var (
+		repoFullName string
+		cloneURL     string
+		branch       string
+		commitSHA    string
+		commitMsg    string
+		triggeredBy  string
+		prNumber     int
+	)
+
+	switch event {
+	case "push":
+		var payload PushPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "invalid payload JSON", http.StatusBadRequest)
+			return
+		}
+
+		commitSHA = payload.HeadCommit.ID
+		if commitSHA == "" {
+			commitSHA = payload.After
+		}
+
+		if payload.Repository.FullName == "" || payload.Repository.CloneURL == "" || payload.Ref == "" || commitSHA == "" {
+			http.Error(w, "malformed or incomplete push payload", http.StatusBadRequest)
+			return
+		}
+
+		branch = strings.TrimPrefix(payload.Ref, "refs/heads/")
+		if branch == payload.Ref {
+			branch = strings.TrimPrefix(payload.Ref, "refs/tags/")
+		}
+
+		repoFullName = payload.Repository.FullName
+		cloneURL = payload.Repository.CloneURL
+		commitMsg = payload.HeadCommit.Message
+		triggeredBy = payload.Pusher.Name
+		if triggeredBy == "" {
+			triggeredBy = payload.Sender.Login
+		}
+		prNumber = 0
+
+	case "pull_request":
+		var payload PullRequestPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "invalid payload JSON", http.StatusBadRequest)
+			return
+		}
+
+		switch payload.Action {
+		case "opened", "synchronize", "reopened":
+			// Supported pull request actions
+		default:
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("event ignored"))
+			return
+		}
+
+		prNumber = payload.Number
+		if prNumber <= 0 {
+			prNumber = payload.PullRequest.Number
+		}
+
+		repoFullName = payload.Repository.FullName
+		if repoFullName == "" {
+			repoFullName = payload.PullRequest.Base.Repo.FullName
+		}
+
+		cloneURL = payload.Repository.CloneURL
+		if cloneURL == "" {
+			cloneURL = payload.PullRequest.Head.Repo.CloneURL
+		}
+		if cloneURL == "" {
+			cloneURL = payload.PullRequest.Base.Repo.CloneURL
+		}
+
+		// Conservative default-deny policy for fork PRs: do not execute external fork PR workloads
+		isFork := payload.PullRequest.Head.Repo.Fork ||
+			(payload.PullRequest.Head.Repo.FullName != "" && repoFullName != "" && payload.PullRequest.Head.Repo.FullName != repoFullName)
+		if isFork {
+			log.Printf("[webhook] fork PR #%d from %s rejected by policy", prNumber, payload.PullRequest.Head.Repo.FullName)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "fork pull requests are not permitted by policy",
+			})
+			return
+		}
+
+		if payload.PullRequest.Head.SHA == "" ||
+			payload.PullRequest.Head.Ref == "" ||
+			repoFullName == "" ||
+			cloneURL == "" ||
+			prNumber <= 0 {
+			http.Error(w, "malformed or incomplete pull_request payload", http.StatusBadRequest)
+			return
+		}
+
+		branch = strings.TrimPrefix(payload.PullRequest.Head.Ref, "refs/heads/")
+		commitSHA = payload.PullRequest.Head.SHA
+		commitMsg = strings.TrimSpace(payload.PullRequest.Title)
+		triggeredBy = payload.PullRequest.User.Login
+		if triggeredBy == "" {
+			triggeredBy = payload.Sender.Login
+		}
 	}
 
-	configPath := filepath.Join(h.configDir, payload.Repository.FullName, ".drev.yml")
+	if strings.Contains(repoFullName, "..") {
+		http.Error(w, "invalid repository name", http.StatusBadRequest)
+		return
+	}
+
+	configPath := filepath.Join(h.configDir, repoFullName, ".drev.yml")
 	pipeline, err := parser.ParseFile(configPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file or directory") || strings.Contains(err.Error(), "cannot find the path") {
@@ -124,21 +278,31 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pipeline.Source.URL = payload.Repository.CloneURL
+	pipeline.Source.URL = cloneURL
 	pipeline.Source.Ref = branch
 
 	runID := uuid.New().String()
+
+	delivery := &drevtypes.WebhookDelivery{
+		DeliveryID: deliveryID,
+		EventType:  event,
+		Repo:       repoFullName,
+		PRNumber:   prNumber,
+		RunID:      runID,
+		CreatedAt:  time.Now().UTC(),
+	}
+
 	run := &drevtypes.Run{
-		ID:         runID,
-		PipelineID: pipeline.Name,
-		Status:     drevtypes.StatusPending,
+		ID:          runID,
+		PipelineID:  pipeline.Name,
+		Status:      drevtypes.StatusPending,
+		CommitSHA:   commitSHA,
+		CommitMsg:   commitMsg,
+		Branch:      branch,
+		TriggeredBy: triggeredBy,
 	}
 
-	if err := h.store.CreateRun(r.Context(), run); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
+	runJobs := make([]*drevtypes.RunJob, 0, len(pipeline.Jobs))
 	createdJobIDs := make([]string, 0, len(pipeline.Jobs))
 	for _, job := range pipeline.Jobs {
 		rj := &drevtypes.RunJob{
@@ -147,19 +311,51 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			JobName: job.Name,
 			Status:  drevtypes.StatusPending,
 		}
-		if err := h.store.CreateRunJob(r.Context(), rj); err != nil {
-			log.Printf("[webhook] failed to create run job %s for run %s: %v", job.Name, runID, err)
-			_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		runJobs = append(runJobs, rj)
+		createdJobIDs = append(createdJobIDs, rj.ID)
+	}
+
+	// Atomically persist delivery claim, run, jobs, and pipeline outbox spec in a single database transaction
+	pipelineSpecBytes, _ := json.Marshal(pipeline)
+	if err := h.store.CreateRunWithDelivery(r.Context(), delivery, run, runJobs, string(pipelineSpecBytes)); err != nil {
+		if errors.Is(err, store.ErrDuplicateDelivery) {
+			log.Printf("[webhook] duplicate delivery %s for %s event detected", deliveryID, event)
+			existing, err := h.store.GetDelivery(r.Context(), deliveryID)
+			if err != nil || existing == nil {
+				log.Printf("[webhook] duplicate delivery %s lookup failed: %v", deliveryID, err)
+				http.Error(w, "failed to query existing delivery", http.StatusInternalServerError)
+				return
+			}
+
+			// Verify referenced run actually exists
+			existingRun, err := h.store.GetRun(r.Context(), existing.RunID)
+			if err != nil || existingRun == nil {
+				log.Printf("[webhook] duplicate delivery %s references non-existent run %s: %v", deliveryID, existing.RunID, err)
+				http.Error(w, "inconsistent webhook delivery state: run not found", http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":      "duplicate",
+				"message":     "delivery already processed",
+				"delivery_id": deliveryID,
+				"run_id":      existing.RunID,
+			})
 			return
 		}
-		createdJobIDs = append(createdJobIDs, rj.ID)
+		log.Printf("[webhook] failed to record run and delivery %s: %v", deliveryID, err)
+		http.Error(w, "failed to record run and delivery", http.StatusInternalServerError)
+		return
 	}
 
 	logW, err := h.streamer.Writer(runID)
 	if err != nil {
 		log.Printf("[webhook] failed to create log writer for run %s: %v", runID, err)
-		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, deliveryID); failErr != nil {
+			log.Printf("[webhook] failed atomic cleanup for run %s after streamer error: %v", runID, failErr)
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -172,23 +368,32 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[webhook] run %s rejected: %v", runID, err)
 		fmt.Fprintf(logW, "[drev] pipeline rejected: %v\n", err)
 		logW.Close()
-		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, deliveryID); failErr != nil {
+			log.Printf("[webhook] failed atomic cleanup for run %s after queue rejection: %v", runID, failErr)
+		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	shortSHA := payload.HeadCommit.ID
+	shortSHA := commitSHA
 	if len(shortSHA) > 7 {
 		shortSHA = shortSHA[:7]
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{
+	resp := map[string]interface{}{
 		"run_id":       runID,
-		"repo":         payload.Repository.FullName,
+		"repo":         repoFullName,
 		"branch":       branch,
 		"commit":       shortSHA,
-		"triggered_by": payload.Pusher.Name,
-	})
+		"triggered_by": triggeredBy,
+		"event":        event,
+		"delivery_id":  deliveryID,
+	}
+	if prNumber > 0 {
+		resp["pr_number"] = prNumber
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(resp)
 }

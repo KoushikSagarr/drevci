@@ -3,9 +3,12 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -832,5 +835,910 @@ func TestStore_FailRun(t *testing.T) {
 	err = store.FailRun(ctx, s, "nonexistent-run", []string{"nonexistent-job"})
 	if err == nil {
 		t.Errorf("expected error for nonexistent run, got nil")
+	}
+}
+
+func TestStore_WebhookDeliveryIdempotency(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "deliveries.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Nil or empty delivery returns error
+	if err := s.RecordDelivery(ctx, nil); err == nil {
+		t.Errorf("expected error when recording nil delivery, got nil")
+	}
+	if err := s.RecordDelivery(ctx, &drevtypes.WebhookDelivery{}); err == nil {
+		t.Errorf("expected error when recording empty delivery_id, got nil")
+	}
+
+	// 2. Querying non-existent delivery returns nil, nil
+	got, err := s.GetDelivery(ctx, "nonexistent-delivery-id")
+	if err != nil {
+		t.Fatalf("GetDelivery(nonexistent) error = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil for nonexistent delivery, got %+v", got)
+	}
+
+	// 3. Successfully record a delivery
+	delivery := &drevtypes.WebhookDelivery{
+		DeliveryID: "delivery-guid-12345",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		PRNumber:   42,
+		RunID:      "run-guid-67890",
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+	}
+	if err := s.RecordDelivery(ctx, delivery); err != nil {
+		t.Fatalf("RecordDelivery() error = %v", err)
+	}
+
+	// 4. Retrieve the recorded delivery and assert fields
+	rec, err := s.GetDelivery(ctx, delivery.DeliveryID)
+	if err != nil {
+		t.Fatalf("GetDelivery() error = %v", err)
+	}
+	if rec == nil {
+		t.Fatalf("expected recorded delivery, got nil")
+	}
+	if rec.DeliveryID != delivery.DeliveryID {
+		t.Errorf("got DeliveryID %q, want %q", rec.DeliveryID, delivery.DeliveryID)
+	}
+	if rec.EventType != delivery.EventType {
+		t.Errorf("got EventType %q, want %q", rec.EventType, delivery.EventType)
+	}
+	if rec.Repo != delivery.Repo {
+		t.Errorf("got Repo %q, want %q", rec.Repo, delivery.Repo)
+	}
+	if rec.PRNumber != delivery.PRNumber {
+		t.Errorf("got PRNumber %d, want %d", rec.PRNumber, delivery.PRNumber)
+	}
+	if rec.RunID != delivery.RunID {
+		t.Errorf("got RunID %q, want %q", rec.RunID, delivery.RunID)
+	}
+	if rec.CreatedAt.IsZero() {
+		t.Errorf("expected non-zero CreatedAt timestamp")
+	}
+
+	// 5. Attempting to record duplicate delivery returns ErrDuplicateDelivery
+	dupDelivery := &drevtypes.WebhookDelivery{
+		DeliveryID: delivery.DeliveryID,
+		EventType:  "pull_request",
+		Repo:       delivery.Repo,
+		PRNumber:   delivery.PRNumber,
+		RunID:      "run-different-id",
+	}
+	err = s.RecordDelivery(ctx, dupDelivery)
+	if err == nil {
+		t.Fatalf("expected ErrDuplicateDelivery on duplicate, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate webhook delivery") {
+		t.Errorf("expected duplicate error, got: %v", err)
+	}
+
+	// 6. Persistence across db close and reopen
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	s2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store.Open() error = %v", err)
+	}
+	defer s2.Close()
+
+	rec2, err := s2.GetDelivery(ctx, delivery.DeliveryID)
+	if err != nil {
+		t.Fatalf("GetDelivery() after reopen error = %v", err)
+	}
+	if rec2 == nil || rec2.DeliveryID != delivery.DeliveryID || rec2.RunID != delivery.RunID {
+		t.Errorf("unexpected delivery after reopen: %+v", rec2)
+	}
+}
+
+func TestStore_CreateRunWithDelivery_Atomicity(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "atomic.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Successful atomic commit of delivery, run, and jobs
+	del1 := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-atomic-001",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		PRNumber:   10,
+		RunID:      "run-atomic-001",
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+	}
+	run1 := &drevtypes.Run{
+		ID:          del1.RunID,
+		PipelineID:  "pipe-1",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+		CommitSHA:   "abc1234567",
+		Branch:      "main",
+	}
+	jobs1 := []*drevtypes.RunJob{
+		{ID: "job-atomic-1", RunID: run1.ID, JobName: "build", Status: drevtypes.StatusPending},
+		{ID: "job-atomic-2", RunID: run1.ID, JobName: "test", Status: drevtypes.StatusPending},
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del1, run1, jobs1, `{"name":"test-spec-1"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery(1) error = %v", err)
+	}
+
+	// Verify all entities exist (delivery, run, jobs, and outbox)
+	gotDel, err := s.GetDelivery(ctx, del1.DeliveryID)
+	if err != nil || gotDel == nil {
+		t.Fatalf("expected delivery in store, got %+v (err: %v)", gotDel, err)
+	}
+	gotRun, err := s.GetRun(ctx, run1.ID)
+	if err != nil || gotRun == nil {
+		t.Fatalf("expected run in store, got %+v (err: %v)", gotRun, err)
+	}
+	gotJobs, err := s.GetRunJobs(ctx, run1.ID)
+	if err != nil || len(gotJobs) != 2 {
+		t.Fatalf("expected 2 jobs in store, got %d (err: %v)", len(gotJobs), err)
+	}
+	outboxItems, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxItems) != 1 || outboxItems[0].RunID != run1.ID {
+		t.Fatalf("expected 1 outbox item for run1, got %+v (err: %v)", outboxItems, err)
+	}
+
+	// 2. Rollback when later job insertion fails (duplicate job ID triggers constraint error)
+	del2 := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-atomic-002",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		PRNumber:   11,
+		RunID:      "run-atomic-002",
+	}
+	run2 := &drevtypes.Run{
+		ID:          del2.RunID,
+		PipelineID:  "pipe-2",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+	}
+	// Job 2 reuses the same primary key as Job 1, forcing failure on 2nd job insert
+	failingJobs := []*drevtypes.RunJob{
+		{ID: "job-atomic-fail-1", RunID: run2.ID, JobName: "step-1", Status: drevtypes.StatusPending},
+		{ID: "job-atomic-fail-1", RunID: run2.ID, JobName: "step-2", Status: drevtypes.StatusPending},
+	}
+
+	err = s.CreateRunWithDelivery(ctx, del2, run2, failingJobs, `{"name":"test-spec-fail"}`)
+	if err == nil {
+		t.Fatalf("expected error on duplicate job ID, got nil")
+	}
+
+	// PROVE ROLLBACK: Neither delivery, run, partial job, nor outbox must exist in database!
+	delCheck, err := s.GetDelivery(ctx, del2.DeliveryID)
+	if err != nil || delCheck != nil {
+		t.Fatalf("expected delivery2 to be rolled back, found: %+v", delCheck)
+	}
+	runCheck, err := s.GetRun(ctx, run2.ID)
+	if err == nil && runCheck != nil {
+		t.Fatalf("expected run2 to be rolled back, found: %+v", runCheck)
+	}
+	jobsCheck, err := s.GetRunJobs(ctx, run2.ID)
+	if len(jobsCheck) != 0 {
+		t.Fatalf("expected 0 jobs for run2, found %d", len(jobsCheck))
+	}
+	outboxCheck, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxCheck) != 1 || outboxCheck[0].RunID != run1.ID {
+		t.Fatalf("outbox should only contain run1, found: %+v", outboxCheck)
+	}
+
+	// 3. Same delivery ID can be retried after rolled-back transaction
+	validJobs2 := []*drevtypes.RunJob{
+		{ID: "job-atomic-valid-1", RunID: run2.ID, JobName: "step-1", Status: drevtypes.StatusPending},
+		{ID: "job-atomic-valid-2", RunID: run2.ID, JobName: "step-2", Status: drevtypes.StatusPending},
+	}
+	if err := s.CreateRunWithDelivery(ctx, del2, run2, validJobs2, `{"name":"test-spec-2"}`); err != nil {
+		t.Fatalf("retrying CreateRunWithDelivery with same delivery ID failed: %v", err)
+	}
+	retriedDel, _ := s.GetDelivery(ctx, del2.DeliveryID)
+	if retriedDel == nil || retriedDel.RunID != run2.ID {
+		t.Errorf("retried delivery not found or mismatched: %+v", retriedDel)
+	}
+	retriedRun, _ := s.GetRun(ctx, run2.ID)
+	if retriedRun == nil {
+		t.Errorf("retried run not found")
+	}
+
+	// 4. Duplicate delivery returns ErrDuplicateDelivery and creates no run
+	delDup := &drevtypes.WebhookDelivery{
+		DeliveryID: del2.DeliveryID,
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      "run-atomic-ghost",
+	}
+	runDup := &drevtypes.Run{
+		ID:         "run-atomic-ghost",
+		PipelineID: "pipe-ghost",
+		Status:     drevtypes.StatusPending,
+	}
+	err = s.CreateRunWithDelivery(ctx, delDup, runDup, nil, "{}")
+	if err == nil {
+		t.Fatalf("expected ErrDuplicateDelivery on duplicate delivery ID, got nil")
+	}
+	if !errors.Is(err, store.ErrDuplicateDelivery) {
+		t.Errorf("expected ErrDuplicateDelivery, got: %v", err)
+	}
+	ghostRun, _ := s.GetRun(ctx, "run-atomic-ghost")
+	if ghostRun != nil {
+		t.Errorf("ghost run should not have been created: %+v", ghostRun)
+	}
+
+	// 5. DeleteDelivery releases delivery claim allowing re-creation
+	if err := s.DeleteDelivery(ctx, del2.DeliveryID); err != nil {
+		t.Fatalf("DeleteDelivery failed: %v", err)
+	}
+	delDeleted, _ := s.GetDelivery(ctx, del2.DeliveryID)
+	if delDeleted != nil {
+		t.Errorf("expected delivery to be deleted, got: %+v", delDeleted)
+	}
+	runRecreated := &drevtypes.Run{
+		ID:         "run-atomic-recreated",
+		PipelineID: "pipe-recreated",
+		Status:     drevtypes.StatusPending,
+	}
+	delRecreated := &drevtypes.WebhookDelivery{
+		DeliveryID: del2.DeliveryID,
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runRecreated.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, delRecreated, runRecreated, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery after DeleteDelivery failed: %v", err)
+	}
+	finalDel, _ := s.GetDelivery(ctx, del2.DeliveryID)
+	if finalDel == nil || finalDel.RunID != runRecreated.ID {
+		t.Errorf("recreated delivery not found: %+v", finalDel)
+	}
+}
+
+func TestStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ghost_deliveries.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed interrupted runs (pending, running) and terminal runs (success, failed)
+	runPending := &drevtypes.Run{
+		ID:         "run-ghost-pending",
+		PipelineID: "p-ghost",
+		Status:     drevtypes.StatusPending,
+	}
+	delPending := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-ghost-pending",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runPending.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, delPending, runPending, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery(pending): %v", err)
+	}
+
+	runRunning := &drevtypes.Run{
+		ID:         "run-ghost-running",
+		PipelineID: "p-ghost",
+		Status:     drevtypes.StatusRunning,
+	}
+	delRunning := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-ghost-running",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runRunning.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, delRunning, runRunning, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery(running): %v", err)
+	}
+
+	runSuccess := &drevtypes.Run{
+		ID:         "run-ghost-success",
+		PipelineID: "p-ghost",
+		Status:     drevtypes.StatusSuccess,
+	}
+	delSuccess := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-ghost-success",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runSuccess.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, delSuccess, runSuccess, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery(success): %v", err)
+	}
+
+	// 2. Call ResetGhostRuns
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	if len(interrupted) != 2 {
+		t.Fatalf("expected 2 interrupted runs, got %d: %v", len(interrupted), interrupted)
+	}
+
+	// 3. Verify interrupted runs are now failed
+	r1, _ := s.GetRun(ctx, runPending.ID)
+	if r1.Status != drevtypes.StatusFailed || r1.FinishedAt.IsZero() {
+		t.Errorf("expected runPending to be failed with finished_at, got: %+v", r1)
+	}
+	r2, _ := s.GetRun(ctx, runRunning.ID)
+	if r2.Status != drevtypes.StatusFailed || r2.FinishedAt.IsZero() {
+		t.Errorf("expected runRunning to be failed with finished_at, got: %+v", r2)
+	}
+
+	// 4. Verify webhook delivery records for interrupted runs are RELEASED
+	dPending, err := s.GetDelivery(ctx, delPending.DeliveryID)
+	if err != nil || dPending != nil {
+		t.Errorf("expected del-ghost-pending to be released, got: %+v", dPending)
+	}
+	dRunning, err := s.GetDelivery(ctx, delRunning.DeliveryID)
+	if err != nil || dRunning != nil {
+		t.Errorf("expected del-ghost-running to be released, got: %+v", dRunning)
+	}
+
+	// 5. Verify webhook delivery records for SUCCESSFUL runs are NOT touched
+	dSuccess, err := s.GetDelivery(ctx, delSuccess.DeliveryID)
+	if err != nil || dSuccess == nil {
+		t.Fatalf("expected del-ghost-success to be preserved, got nil (err: %v)", err)
+	}
+	if dSuccess.RunID != runSuccess.ID {
+		t.Errorf("expected delSuccess.RunID == %q, got %q", runSuccess.ID, dSuccess.RunID)
+	}
+
+	// 6. Proves retry with same delivery ID succeeds after recovery
+	runRetried := &drevtypes.Run{
+		ID:         "run-retried-after-recovery",
+		PipelineID: "p-ghost",
+		Status:     drevtypes.StatusPending,
+	}
+	delRetried := &drevtypes.WebhookDelivery{
+		DeliveryID: delPending.DeliveryID, // Reusing interrupted delivery ID
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runRetried.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, delRetried, runRetried, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery after recovery failed: %v", err)
+	}
+	dFinal, _ := s.GetDelivery(ctx, delPending.DeliveryID)
+	if dFinal == nil || dFinal.RunID != runRetried.ID {
+		t.Errorf("retried delivery not pointing to new run: %+v", dFinal)
+	}
+}
+
+func TestStore_ClaimRunForExecution_Success(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "claim_success.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:         "run-claim-001",
+		PipelineID: "pipe-claim",
+		Status:     drevtypes.StatusPending,
+	}
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-claim-001",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run.ID,
+	}
+	spec := `{"name":"test-spec","jobs":[{"name":"j1"}]}`
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, spec); err != nil {
+		t.Fatalf("CreateRunWithDelivery error = %v", err)
+	}
+
+	// 1. Verify initially in pending outbox
+	items, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(items) != 1 || items[0].RunID != run.ID {
+		t.Fatalf("expected 1 pending outbox item, got: %+v (err: %v)", items, err)
+	}
+	if items[0].PipelineSpec != spec {
+		t.Errorf("expected spec %q, got %q", spec, items[0].PipelineSpec)
+	}
+
+	// 2. Claim run for execution
+	if err := s.ClaimRunForExecution(ctx, run.ID); err != nil {
+		t.Fatalf("ClaimRunForExecution failed: %v", err)
+	}
+
+	// 3. Verify run status is running and started_at is persisted
+	gotRun, err := s.GetRun(ctx, run.ID)
+	if err != nil || gotRun == nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if gotRun.Status != drevtypes.StatusRunning {
+		t.Errorf("expected status running, got %q", gotRun.Status)
+	}
+	if gotRun.StartedAt.IsZero() {
+		t.Errorf("expected non-zero started_at after claim")
+	}
+
+	// 4. Verify outbox record was deleted in the claim transaction
+	itemsAfter, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(itemsAfter) != 0 {
+		t.Fatalf("expected outbox to be empty after claim, got: %+v", itemsAfter)
+	}
+
+	// 5. Verify delivery claim remains intact
+	gotDel, err := s.GetDelivery(ctx, del.DeliveryID)
+	if err != nil || gotDel == nil || gotDel.RunID != run.ID {
+		t.Errorf("delivery claim should remain intact after claim: %+v", gotDel)
+	}
+}
+
+func TestStore_ClaimRunForExecution_Concurrency(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "claim_concurrency.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:         "run-concurrent-claim",
+		PipelineID: "pipe-claim",
+		Status:     drevtypes.StatusPending,
+	}
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-concurrent-claim",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, `{"name":"concurrent"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery error = %v", err)
+	}
+
+	// Launch 10 concurrent worker goroutines attempting to claim the exact same run
+	const concurrency = 10
+	var wg sync.WaitGroup
+	var successCount int64
+	var alreadyClaimedCount int64
+	var unexpectedErrors []error
+	var mu sync.Mutex
+
+	startGate := make(chan struct{})
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+			err := s.ClaimRunForExecution(ctx, run.ID)
+			if err == nil {
+				atomic.AddInt64(&successCount, 1)
+			} else if errors.Is(err, store.ErrRunAlreadyClaimed) {
+				atomic.AddInt64(&alreadyClaimedCount, 1)
+			} else {
+				mu.Lock()
+				unexpectedErrors = append(unexpectedErrors, err)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	close(startGate)
+	wg.Wait()
+
+	if len(unexpectedErrors) > 0 {
+		t.Fatalf("encountered unexpected claim errors: %v", unexpectedErrors)
+	}
+	if successCount != 1 {
+		t.Errorf("expected exactly 1 successful claim, got %d", successCount)
+	}
+	if alreadyClaimedCount != concurrency-1 {
+		t.Errorf("expected %d ErrRunAlreadyClaimed, got %d", concurrency-1, alreadyClaimedCount)
+	}
+
+	// Confirm final run state
+	finalRun, _ := s.GetRun(ctx, run.ID)
+	if finalRun.Status != drevtypes.StatusRunning {
+		t.Errorf("expected final status running, got %s", finalRun.Status)
+	}
+}
+
+func TestStore_ClaimRunForExecution_Rejection(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "claim_rejection.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Claiming non-existent run returns ErrRunAlreadyClaimed
+	err = s.ClaimRunForExecution(ctx, "non-existent-run-id")
+	if !errors.Is(err, store.ErrRunAlreadyClaimed) {
+		t.Errorf("expected ErrRunAlreadyClaimed for missing run, got: %v", err)
+	}
+
+	// 2. Claiming already running run returns ErrRunAlreadyClaimed
+	runRunning := &drevtypes.Run{
+		ID:         "run-already-running",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusRunning,
+	}
+	if err := s.CreateRun(ctx, runRunning); err != nil {
+		t.Fatalf("CreateRun failed: %v", err)
+	}
+	err = s.ClaimRunForExecution(ctx, runRunning.ID)
+	if !errors.Is(err, store.ErrRunAlreadyClaimed) {
+		t.Errorf("expected ErrRunAlreadyClaimed for running run, got: %v", err)
+	}
+
+	// 3. Claiming terminal success run returns ErrRunAlreadyClaimed
+	runSuccess := &drevtypes.Run{
+		ID:         "run-already-success",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusSuccess,
+	}
+	if err := s.CreateRun(ctx, runSuccess); err != nil {
+		t.Fatalf("CreateRun failed: %v", err)
+	}
+	err = s.ClaimRunForExecution(ctx, runSuccess.ID)
+	if !errors.Is(err, store.ErrRunAlreadyClaimed) {
+		t.Errorf("expected ErrRunAlreadyClaimed for success run, got: %v", err)
+	}
+
+	// 4. Claiming terminal failed run returns ErrRunAlreadyClaimed
+	runFailed := &drevtypes.Run{
+		ID:         "run-already-failed",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusFailed,
+	}
+	if err := s.CreateRun(ctx, runFailed); err != nil {
+		t.Fatalf("CreateRun failed: %v", err)
+	}
+	err = s.ClaimRunForExecution(ctx, runFailed.ID)
+	if !errors.Is(err, store.ErrRunAlreadyClaimed) {
+		t.Errorf("expected ErrRunAlreadyClaimed for failed run, got: %v", err)
+	}
+}
+
+func TestStore_GetPendingOutbox(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "get_pending_outbox.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Create 3 valid pending runs with outbox specs
+	t1 := time.Now().UTC().Add(-30 * time.Minute)
+	t2 := time.Now().UTC().Add(-20 * time.Minute)
+	t3 := time.Now().UTC().Add(-10 * time.Minute)
+
+	del1 := &drevtypes.WebhookDelivery{DeliveryID: "d1", RunID: "r1", CreatedAt: t1}
+	del2 := &drevtypes.WebhookDelivery{DeliveryID: "d2", RunID: "r2", CreatedAt: t2}
+	del3 := &drevtypes.WebhookDelivery{DeliveryID: "d3", RunID: "r3", CreatedAt: t3}
+
+	run1 := &drevtypes.Run{ID: "r1", PipelineID: "p", Status: drevtypes.StatusPending}
+	run2 := &drevtypes.Run{ID: "r2", PipelineID: "p", Status: drevtypes.StatusPending}
+	run3 := &drevtypes.Run{ID: "r3", PipelineID: "p", Status: drevtypes.StatusPending}
+
+	if err := s.CreateRunWithDelivery(ctx, del1, run1, nil, `{"id":"spec1"}`); err != nil {
+		t.Fatalf("seed r1 failed: %v", err)
+	}
+	if err := s.CreateRunWithDelivery(ctx, del2, run2, nil, `{"id":"spec2"}`); err != nil {
+		t.Fatalf("seed r2 failed: %v", err)
+	}
+	if err := s.CreateRunWithDelivery(ctx, del3, run3, nil, `{"id":"spec3"}`); err != nil {
+		t.Fatalf("seed r3 failed: %v", err)
+	}
+
+	// 2. Claim r2 so it is running and should NOT appear in pending outbox
+	if err := s.ClaimRunForExecution(ctx, "r2"); err != nil {
+		t.Fatalf("claim r2 failed: %v", err)
+	}
+
+	// 3. Query pending outbox: should only return r1 and r3 in chronological order
+	items, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox error = %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].RunID != "r1" || items[1].RunID != "r3" {
+		t.Errorf("expected [r1, r3] in chronological order, got: [%s, %s]", items[0].RunID, items[1].RunID)
+	}
+
+	// 4. Verify read-only: calling GetPendingOutbox again returns the same 2 items
+	itemsSecond, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(itemsSecond) != 2 {
+		t.Fatalf("GetPendingOutbox should not delete items on read, got %d items", len(itemsSecond))
+	}
+
+	// 5. Test limit enforcement
+	itemsLimit, err := s.GetPendingOutbox(ctx, 1)
+	if err != nil || len(itemsLimit) != 1 || itemsLimit[0].RunID != "r1" {
+		t.Fatalf("expected limit 1 to return r1, got: %+v", itemsLimit)
+	}
+}
+
+func TestStore_FailRunWithDelivery_Success(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_run_delivery.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:         "run-fail-test-01",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-fail-test-01",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run.ID,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "j1", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+		{ID: "j2", RunID: run.ID, JobName: "test", Status: drevtypes.StatusPending},
+	}
+	if err := s.CreateRunWithDelivery(ctx, del, run, jobs, `{"name":"fail-spec"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery error = %v", err)
+	}
+
+	// Atomic fail run, jobs, outbox deletion, and delivery claim release
+	if err := s.FailRunWithDelivery(ctx, run.ID, []string{"j1", "j2"}, del.DeliveryID); err != nil {
+		t.Fatalf("FailRunWithDelivery failed: %v", err)
+	}
+
+	// Verify run is failed with terminal timestamp
+	r, err := s.GetRun(ctx, run.ID)
+	if err != nil || r == nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if r.Status != drevtypes.StatusFailed || r.FinishedAt.IsZero() {
+		t.Errorf("expected run failed with finished_at, got: %+v", r)
+	}
+
+	// Verify jobs are failed with terminal timestamps
+	gotJobs, err := s.GetRunJobs(ctx, run.ID)
+	if err != nil || len(gotJobs) != 2 {
+		t.Fatalf("GetRunJobs failed: %v", err)
+	}
+	for _, j := range gotJobs {
+		if j.Status != drevtypes.StatusFailed || j.FinishedAt.IsZero() {
+			t.Errorf("expected job failed with finished_at, got: %+v", j)
+		}
+	}
+
+	// Verify outbox entry is deleted
+	outboxItems, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxItems) != 0 {
+		t.Errorf("expected outbox entry to be deleted, found: %+v", outboxItems)
+	}
+
+	// Verify webhook delivery claim is deleted (released for retry)
+	delCheck, err := s.GetDelivery(ctx, del.DeliveryID)
+	if err != nil || delCheck != nil {
+		t.Errorf("expected delivery claim to be deleted, found: %+v", delCheck)
+	}
+}
+
+func TestStore_FailRunWithDelivery_Rollback(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_rollback.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:         "run-rollback-test-01",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-rollback-test-01",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run.ID,
+	}
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, `{"name":"rollback-spec"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery error = %v", err)
+	}
+
+	// Attempt FailRunWithDelivery on a non-existent run ID -> should fail and roll back
+	err = s.FailRunWithDelivery(ctx, "non-existent-run-id", nil, del.DeliveryID)
+	if err == nil {
+		t.Fatalf("expected error on non-existent run, got nil")
+	}
+
+	// PROVE ROLLBACK: The original delivery claim for del-rollback-test-01 must STILL EXIST!
+	delCheck, err := s.GetDelivery(ctx, del.DeliveryID)
+	if err != nil || delCheck == nil {
+		t.Fatalf("delivery claim must NOT be deleted when FailRunWithDelivery fails: %+v", delCheck)
+	}
+	if delCheck.RunID != run.ID {
+		t.Errorf("expected delivery to point to original run %s, got %s", run.ID, delCheck.RunID)
+	}
+
+	// Original run must still be pending
+	runCheck, _ := s.GetRun(ctx, run.ID)
+	if runCheck.Status != drevtypes.StatusPending {
+		t.Errorf("expected run to remain pending, got: %s", runCheck.Status)
+	}
+}
+
+func TestStore_CreateRunWithDelivery_EmptyPipelineSpecRejected(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty_spec.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Completely empty string
+	run1 := &drevtypes.Run{ID: "run-empty-1", PipelineID: "p1", Status: drevtypes.StatusPending}
+	del1 := &drevtypes.WebhookDelivery{DeliveryID: "del-empty-1", RunID: run1.ID}
+	err = s.CreateRunWithDelivery(ctx, del1, run1, nil, "")
+	if err == nil {
+		t.Fatalf("expected error for empty pipelineSpec, got nil")
+	}
+
+	// Prove nothing committed
+	dCheck, _ := s.GetDelivery(ctx, del1.DeliveryID)
+	if dCheck != nil {
+		t.Errorf("delivery should not be persisted on empty spec: %+v", dCheck)
+	}
+	rCheck, _ := s.GetRun(ctx, run1.ID)
+	if rCheck != nil {
+		t.Errorf("run should not be persisted on empty spec: %+v", rCheck)
+	}
+	outboxItems, _ := s.GetPendingOutbox(ctx, 10)
+	if len(outboxItems) != 0 {
+		t.Errorf("outbox should be empty, got %d items", len(outboxItems))
+	}
+
+	// 2. Whitespace-only string
+	run2 := &drevtypes.Run{ID: "run-empty-2", PipelineID: "p1", Status: drevtypes.StatusPending}
+	del2 := &drevtypes.WebhookDelivery{DeliveryID: "del-empty-2", RunID: run2.ID}
+	err = s.CreateRunWithDelivery(ctx, del2, run2, nil, "   \t\n  ")
+	if err == nil {
+		t.Fatalf("expected error for whitespace pipelineSpec, got nil")
+	}
+
+	// 3. Retry with valid non-empty specification succeeds
+	err = s.CreateRunWithDelivery(ctx, del1, run1, nil, `{"name":"valid-pipeline"}`)
+	if err != nil {
+		t.Fatalf("CreateRunWithDelivery with valid spec failed: %v", err)
+	}
+	dValid, _ := s.GetDelivery(ctx, del1.DeliveryID)
+	if dValid == nil || dValid.RunID != run1.ID {
+		t.Errorf("expected valid delivery to be persisted: %+v", dValid)
+	}
+}
+
+func TestStore_FailRunWithDelivery_ScopedToRun(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_scoped.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Seed Run A and Delivery A
+	runA := &drevtypes.Run{ID: "run-A", PipelineID: "pA", Status: drevtypes.StatusPending}
+	delA := &drevtypes.WebhookDelivery{DeliveryID: "del-A", RunID: runA.ID}
+	jobsA := []*drevtypes.RunJob{{ID: "job-A", RunID: runA.ID, JobName: "build", Status: drevtypes.StatusPending}}
+	if err := s.CreateRunWithDelivery(ctx, delA, runA, jobsA, `{"name":"specA"}`); err != nil {
+		t.Fatalf("seed run A failed: %v", err)
+	}
+
+	// Seed Run B and Delivery B
+	runB := &drevtypes.Run{ID: "run-B", PipelineID: "pB", Status: drevtypes.StatusPending}
+	delB := &drevtypes.WebhookDelivery{DeliveryID: "del-B", RunID: runB.ID}
+	jobsB := []*drevtypes.RunJob{{ID: "job-B", RunID: runB.ID, JobName: "build", Status: drevtypes.StatusPending}}
+	if err := s.CreateRunWithDelivery(ctx, delB, runB, jobsB, `{"name":"specB"}`); err != nil {
+		t.Fatalf("seed run B failed: %v", err)
+	}
+
+	// Case 1: Pass mismatched job ID (job-B belongs to Run B, not Run A)
+	// Must fail and roll back all changes, ensuring no partial cleanup or delivery deletion
+	err = s.FailRunWithDelivery(ctx, runA.ID, []string{"job-B"}, delA.DeliveryID)
+	if err == nil {
+		t.Fatalf("expected error when passing mismatched job ID, got nil")
+	}
+	if !strings.Contains(err.Error(), "run job job-B not found for run run-A") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	// Verify rollback: Run A must still be pending, Job A pending, Delivery A intact
+	runACheck, _ := s.GetRun(ctx, runA.ID)
+	if runACheck.Status != drevtypes.StatusPending {
+		t.Errorf("run A must remain pending after rollback, got %s", runACheck.Status)
+	}
+	delACheck, _ := s.GetDelivery(ctx, delA.DeliveryID)
+	if delACheck == nil {
+		t.Fatalf("delivery A must NOT be deleted when job validation fails")
+	}
+
+	// Case 2: Pass mismatched delivery ID (del-B belongs to Run B, not Run A)
+	err = s.FailRunWithDelivery(ctx, runA.ID, []string{"job-A"}, delB.DeliveryID)
+	if err == nil {
+		t.Fatalf("expected error when passing mismatched delivery ID, got nil")
+	}
+	if !strings.Contains(err.Error(), "webhook delivery del-B not found for run run-A") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+
+	// Verify Run B and Delivery B are completely untouched
+	delBCheck, err := s.GetDelivery(ctx, delB.DeliveryID)
+	if err != nil || delBCheck == nil {
+		t.Fatalf("delivery B must NOT be deleted: %+v (err: %v)", delBCheck, err)
+	}
+	jobsBCheck, _ := s.GetRunJobs(ctx, runB.ID)
+	if len(jobsBCheck) != 1 || jobsBCheck[0].Status != drevtypes.StatusPending {
+		t.Errorf("job B should still be pending, got: %+v", jobsBCheck[0])
+	}
+	runBCheck, _ := s.GetRun(ctx, runB.ID)
+	if runBCheck.Status != drevtypes.StatusPending {
+		t.Errorf("run B should still be pending, got: %s", runBCheck.Status)
+	}
+
+	// Case 3: Correctly scoped cleanup for Run A
+	if err := s.FailRunWithDelivery(ctx, runA.ID, []string{"job-A"}, delA.DeliveryID); err != nil {
+		t.Fatalf("valid FailRunWithDelivery failed: %v", err)
+	}
+
+	// Run A is now failed, Job A is failed, Delivery A is deleted
+	runACheck, _ = s.GetRun(ctx, runA.ID)
+	if runACheck.Status != drevtypes.StatusFailed {
+		t.Errorf("run A should be failed, got: %s", runACheck.Status)
+	}
+	jobsACheck, _ := s.GetRunJobs(ctx, runA.ID)
+	if len(jobsACheck) != 1 || jobsACheck[0].Status != drevtypes.StatusFailed {
+		t.Errorf("job A should be failed, got: %+v", jobsACheck[0])
+	}
+	delACheck, _ = s.GetDelivery(ctx, delA.DeliveryID)
+	if delACheck != nil {
+		t.Errorf("delivery A should be deleted after successful FailRunWithDelivery")
+	}
+
+	// Run B is STILL unaffected
+	runBCheck, _ = s.GetRun(ctx, runB.ID)
+	if runBCheck.Status != drevtypes.StatusPending {
+		t.Errorf("run B should still be pending, got: %s", runBCheck.Status)
 	}
 }

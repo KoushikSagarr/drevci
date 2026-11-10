@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -220,6 +221,14 @@ func main() {
 			defer stopPool()
 
 			wp.Start(ctx)
+
+			// 4. Recover pending durable outbox runs
+			recoverer := pool.NewOutboxRecoverer(s, q, stream)
+			go func() {
+				if err := recoverer.Recover(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("Warning: outbox recovery finished with error: %v", err)
+				}
+			}()
 
 			wh := webhook.New(s, q, p, stream, webhookSecret, webhookConfig)
 			h := api.New(s, sched, p, stream, q, workers, wh, logDir, notifEnabled)

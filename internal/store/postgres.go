@@ -3,12 +3,14 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 // PostgresStore implements Store backed by a PostgreSQL database (Supabase).
@@ -31,6 +33,88 @@ func OpenPostgres(connString string) (*PostgresStore, error) {
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("pinging postgres: %w", err)
+	}
+
+	initQueries := []string{
+		`CREATE TABLE IF NOT EXISTS webhook_deliveries (
+			delivery_id TEXT PRIMARY KEY,
+			event_type  TEXT NOT NULL,
+			repo        TEXT NOT NULL DEFAULT '',
+			pr_number   INTEGER NOT NULL DEFAULT 0,
+			run_id      UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_run_id ON webhook_deliveries(run_id)`,
+		`CREATE TABLE IF NOT EXISTS pipeline_outbox (
+			run_id        UUID PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+			pipeline_spec TEXT NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_created_at ON pipeline_outbox(created_at ASC)`,
+		`DO $$
+		BEGIN
+			-- 1. webhook_deliveries
+			IF EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'webhook_deliveries'
+			) THEN
+				IF EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = CURRENT_SCHEMA
+					  AND table_name = 'webhook_deliveries'
+					  AND column_name = 'run_id'
+					  AND data_type = 'text'
+				) THEN
+					ALTER TABLE webhook_deliveries ALTER COLUMN run_id TYPE UUID USING run_id::uuid;
+				END IF;
+
+				IF EXISTS (
+					SELECT 1 FROM information_schema.tables
+					WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs'
+				) AND NOT EXISTS (
+					SELECT 1 FROM information_schema.table_constraints
+					WHERE table_schema = CURRENT_SCHEMA
+					  AND table_name = 'webhook_deliveries'
+					  AND constraint_type = 'FOREIGN KEY'
+				) THEN
+					ALTER TABLE webhook_deliveries ADD CONSTRAINT fk_webhook_deliveries_run_id FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE;
+				END IF;
+			END IF;
+
+			-- 2. pipeline_outbox
+			IF EXISTS (
+				SELECT 1 FROM information_schema.tables
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'pipeline_outbox'
+			) THEN
+				IF EXISTS (
+					SELECT 1 FROM information_schema.columns
+					WHERE table_schema = CURRENT_SCHEMA
+					  AND table_name = 'pipeline_outbox'
+					  AND column_name = 'run_id'
+					  AND data_type = 'text'
+				) THEN
+					ALTER TABLE pipeline_outbox ALTER COLUMN run_id TYPE UUID USING run_id::uuid;
+				END IF;
+
+				IF EXISTS (
+					SELECT 1 FROM information_schema.tables
+					WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs'
+				) AND NOT EXISTS (
+					SELECT 1 FROM information_schema.table_constraints
+					WHERE table_schema = CURRENT_SCHEMA
+					  AND table_name = 'pipeline_outbox'
+					  AND constraint_type = 'FOREIGN KEY'
+				) THEN
+					ALTER TABLE pipeline_outbox ADD CONSTRAINT fk_pipeline_outbox_run_id FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE;
+				END IF;
+			END IF;
+		END $$;`,
+	}
+	for _, q := range initQueries {
+		if _, err := db.Exec(q); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("initializing postgres webhook_deliveries: %w", err)
+		}
 	}
 
 	return &PostgresStore{db: db}, nil
@@ -287,17 +371,37 @@ func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 		return nil, nil
 	}
 
-	now := time.Now().UTC()
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE runs SET status = 'failed', finished_at = $1
-		WHERE status IN ('running', 'pending')`, now)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("beginning postgres reset ghost runs transaction: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'failed', finished_at = $1
+		WHERE status IN ('running', 'pending')`, now); err != nil {
+		return nil, fmt.Errorf("updating postgres ghost runs: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE run_jobs SET status = 'failed', finished_at = $1
-		WHERE status IN ('running', 'pending')`, now)
-	return ids, err
+		WHERE status IN ('running', 'pending')`, now); err != nil {
+		return nil, fmt.Errorf("updating postgres ghost run jobs: %w", err)
+	}
+
+	// Release webhook delivery claims for interrupted runs so that GitHub redeliveries can be accepted
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = $1`, id); err != nil {
+			return nil, fmt.Errorf("releasing postgres webhook delivery for ghost run %s: %w", id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing postgres reset ghost runs: %w", err)
+	}
+
+	return ids, nil
 }
 
 // ─── Org management ───────────────────────────────────────────────────────────
@@ -565,4 +669,307 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		ActiveRunsCount:      activeRunsCount,
 		TotalRunsCount:       totalRunsCount,
 	}, nil
+}
+
+// CreateRunWithDelivery atomically creates a webhook delivery record, a run, all associated run jobs,
+// and a pipeline outbox specification record in PostgreSQL.
+// Either all records commit or none commit. Returns ErrDuplicateDelivery on duplicate delivery ID.
+func (s *PostgresStore) CreateRunWithDelivery(
+	ctx context.Context,
+	delivery *drevtypes.WebhookDelivery,
+	run *drevtypes.Run,
+	jobs []*drevtypes.RunJob,
+	pipelineSpec string,
+) error {
+	if delivery == nil || delivery.DeliveryID == "" {
+		return errors.New("delivery cannot be nil or empty")
+	}
+	if run == nil || run.ID == "" {
+		return errors.New("run cannot be nil or empty")
+	}
+	if strings.TrimSpace(pipelineSpec) == "" {
+		return errors.New("pipelineSpec cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning postgres transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Insert webhook delivery record
+	createdAt := time.Now().UTC()
+	if !delivery.CreatedAt.IsZero() {
+		createdAt = delivery.CreatedAt.UTC()
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO webhook_deliveries (delivery_id, event_type, repo, pr_number, run_id, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`,
+		delivery.DeliveryID, delivery.EventType, delivery.Repo, delivery.PRNumber, delivery.RunID, createdAt,
+	)
+	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return ErrDuplicateDelivery
+		}
+		if strings.Contains(err.Error(), "unique constraint") || strings.Contains(err.Error(), "duplicate key") {
+			return ErrDuplicateDelivery
+		}
+		return fmt.Errorf("inserting postgres webhook delivery: %w", err)
+	}
+
+	// 2. Insert run record
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO runs
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
+		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
+		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting postgres run: %w", err)
+	}
+
+	// 3. Insert run jobs
+	for _, job := range jobs {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			job.ID, job.RunID, job.JobName, string(job.Status),
+			pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting postgres run job %s: %w", job.JobName, err)
+		}
+	}
+
+	// 4. Insert into pipeline_outbox
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO pipeline_outbox (run_id, pipeline_spec, created_at)
+		VALUES ($1, $2, $3)`,
+		run.ID, pipelineSpec, createdAt,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting postgres pipeline outbox: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing postgres transaction: %w", err)
+	}
+	return nil
+}
+
+// ClaimRunForExecution atomically claims a pending run for execution in PostgreSQL.
+// It verifies the run is currently pending with started_at IS NULL, transitions it to running,
+// sets started_at, and deletes the pipeline_outbox entry in a single transaction.
+// Returns ErrRunAlreadyClaimed if the run was already claimed, running, or finished.
+func (s *PostgresStore) ClaimRunForExecution(ctx context.Context, runID string) error {
+	if runID == "" {
+		return errors.New("runID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning postgres claim transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'running', started_at = $1
+		WHERE id = $2 AND status = 'pending' AND started_at IS NULL`,
+		now, runID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating run for claim: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected on claim: %w", err)
+	}
+	if n == 0 {
+		return ErrRunAlreadyClaimed
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = $1`, runID); err != nil {
+		return fmt.Errorf("deleting outbox entry for claimed run %s: %w", runID, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing claim transaction: %w", err)
+	}
+	return nil
+}
+
+// GetPendingOutbox retrieves up to limit pending, never-started runs from PostgreSQL outbox,
+// ordered deterministically by creation time.
+func (s *PostgresStore) GetPendingOutbox(ctx context.Context, limit int) ([]*drevtypes.OutboxItem, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT o.run_id, o.pipeline_spec, o.created_at
+		FROM pipeline_outbox o
+		JOIN runs r ON r.id = o.run_id
+		WHERE r.status = 'pending' AND r.started_at IS NULL
+		ORDER BY o.created_at ASC, o.run_id ASC
+		LIMIT $1`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying postgres pending outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*drevtypes.OutboxItem
+	for rows.Next() {
+		var item drevtypes.OutboxItem
+		var createdAt time.Time
+		if err := rows.Scan(&item.RunID, &item.PipelineSpec, &createdAt); err != nil {
+			return nil, fmt.Errorf("scanning outbox item: %w", err)
+		}
+		item.CreatedAt = createdAt
+		items = append(items, &item)
+	}
+	return items, rows.Err()
+}
+
+// FailRunWithDelivery atomically marks a run and its jobs as failed with terminal timestamps,
+// deletes any matching pipeline_outbox record, and deletes the matching webhook delivery claim in PostgreSQL.
+// Any failure rolls back all changes.
+func (s *PostgresStore) FailRunWithDelivery(ctx context.Context, runID string, jobIDs []string, deliveryID string) error {
+	if runID == "" {
+		return errors.New("runID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning fail run with delivery transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+
+	// 1. Mark run failed
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'failed',
+		    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+		WHERE id = $2`, now, runID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating run %s to failed: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected on run failure: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("run %s not found", runID)
+	}
+
+	// 2. Mark relevant jobs failed
+	if len(jobIDs) > 0 {
+		for _, jid := range jobIDs {
+			res, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'failed',
+				    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+				WHERE id = $2 AND run_id = $3`, now, jid, runID)
+			if err != nil {
+				return fmt.Errorf("updating run job %s to failed: %w", jid, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("checking rows affected for job %s: %w", jid, err)
+			}
+			if n == 0 {
+				return fmt.Errorf("run job %s not found for run %s", jid, runID)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'failed',
+			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+			WHERE run_id = $2`, now, runID); err != nil {
+			return fmt.Errorf("updating run jobs for run %s to failed: %w", runID, err)
+		}
+	}
+
+	// 3. Delete matching outbox record
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = $1`, runID); err != nil {
+		return fmt.Errorf("deleting outbox record for run %s: %w", runID, err)
+	}
+
+	// 4. Delete matching webhook delivery claim if deliveryID is provided (scoped strictly to this run)
+	if deliveryID != "" {
+		res, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivery_id = $1 AND run_id = $2`, deliveryID, runID)
+		if err != nil {
+			return fmt.Errorf("deleting delivery claim %s for run %s: %w", deliveryID, runID, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("checking rows affected on delivery deletion: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("webhook delivery %s not found for run %s", deliveryID, runID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing fail run with delivery transaction: %w", err)
+	}
+	return nil
+}
+
+// DeleteDelivery removes a webhook delivery record from PostgreSQL.
+func (s *PostgresStore) DeleteDelivery(ctx context.Context, deliveryID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivery_id = $1`, deliveryID)
+	return err
+}
+
+// RecordDelivery persists a webhook delivery record in PostgreSQL. Returns ErrDuplicateDelivery on duplicate delivery ID.
+func (s *PostgresStore) RecordDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery) error {
+	if delivery == nil || delivery.DeliveryID == "" {
+		return errors.New("delivery cannot be nil or empty")
+	}
+	query := `
+		INSERT INTO webhook_deliveries (delivery_id, event_type, repo, pr_number, run_id)
+		VALUES ($1, $2, $3, $4, $5)`
+	_, err := s.db.ExecContext(ctx, query,
+		delivery.DeliveryID, delivery.EventType, delivery.Repo, delivery.PRNumber, delivery.RunID,
+	)
+	if err != nil {
+		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+			return ErrDuplicateDelivery
+		}
+		if strings.Contains(err.Error(), "unique constraint") || strings.Contains(err.Error(), "duplicate key") {
+			return ErrDuplicateDelivery
+		}
+		return fmt.Errorf("recording postgres webhook delivery: %w", err)
+	}
+	return nil
+}
+
+// GetDelivery retrieves the webhook delivery record from PostgreSQL.
+func (s *PostgresStore) GetDelivery(ctx context.Context, deliveryID string) (*drevtypes.WebhookDelivery, error) {
+	query := `
+		SELECT delivery_id, event_type, repo, pr_number, run_id, created_at
+		FROM webhook_deliveries
+		WHERE delivery_id = $1`
+	var d drevtypes.WebhookDelivery
+	var createdAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, query, deliveryID).Scan(
+		&d.DeliveryID, &d.EventType, &d.Repo, &d.PRNumber, &d.RunID, &createdAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting postgres webhook delivery: %w", err)
+	}
+	d.CreatedAt = scanNullTime(&createdAt)
+	return &d, nil
 }

@@ -132,3 +132,20 @@ type UsageEvent struct {
 	Quantity   float64   `json:"quantity"`
 	RecordedAt time.Time `json:"recorded_at"`
 }
+
+// WebhookDelivery records processed GitHub webhook deliveries for persistent idempotency.
+type WebhookDelivery struct {
+	DeliveryID string    `json:"delivery_id"`
+	EventType  string    `json:"event_type"`
+	Repo       string    `json:"repo"`
+	PRNumber   int       `json:"pr_number,omitempty"`
+	RunID      string    `json:"run_id"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// OutboxItem represents a pending pipeline run awaiting execution in the outbox.
+type OutboxItem struct {
+	RunID        string    `json:"run_id"`
+	PipelineSpec string    `json:"pipeline_spec"`
+	CreatedAt    time.Time `json:"created_at"`
+}

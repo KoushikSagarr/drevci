@@ -45,6 +45,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status_created_at ON runs(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_run_jobs_run_id ON run_jobs(run_id);`
 
+// ErrDuplicateDelivery indicates that a webhook delivery with the same ID has already been recorded.
+var ErrDuplicateDelivery = errors.New("duplicate webhook delivery")
+
+// ErrRunAlreadyClaimed indicates that a run is no longer pending or has already been claimed by another worker.
+var ErrRunAlreadyClaimed = errors.New("run already claimed or not pending")
+
 // Store defines the persistence interface for pipeline runs and SaaS tenancy.
 type Store interface {
 	// ── Core pipeline methods ──────────────────────────────────────────────
@@ -58,6 +64,15 @@ type Store interface {
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 	GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error)
+
+	// ── Webhook delivery idempotency & durable outbox ─────────────────────
+	CreateRunWithDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery, run *drevtypes.Run, jobs []*drevtypes.RunJob, pipelineSpec string) error
+	RecordDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery) error
+	GetDelivery(ctx context.Context, deliveryID string) (*drevtypes.WebhookDelivery, error)
+	DeleteDelivery(ctx context.Context, deliveryID string) error
+	ClaimRunForExecution(ctx context.Context, runID string) error
+	FailRunWithDelivery(ctx context.Context, runID string, jobIDs []string, deliveryID string) error
+	GetPendingOutbox(ctx context.Context, limit int) ([]*drevtypes.OutboxItem, error)
 
 	// ── Org management (PostgreSQL / SaaS only) ───────────────────────────
 	CreateOrg(ctx context.Context, org *drevtypes.Org) error
@@ -90,6 +105,8 @@ type SQLiteStore struct {
 	stmtGetRecentFailures  *sql.Stmt
 	stmtCountActiveRuns    *sql.Stmt
 	stmtCountTotalRuns     *sql.Stmt
+	stmtRecordDelivery     *sql.Stmt
+	stmtGetDelivery        *sql.Stmt
 }
 
 type columnDef struct {
@@ -186,10 +203,31 @@ func migrateSQLite(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("migrating run_jobs table: %w", err)
 	}
 
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS webhook_deliveries (
+		delivery_id TEXT PRIMARY KEY,
+		event_type  TEXT NOT NULL,
+		repo        TEXT NOT NULL DEFAULT '',
+		pr_number   INTEGER NOT NULL DEFAULT 0,
+		run_id      TEXT NOT NULL,
+		created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("creating webhook_deliveries table: %w", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS pipeline_outbox (
+		run_id        TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+		pipeline_spec TEXT NOT NULL,
+		created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		return fmt.Errorf("creating pipeline_outbox table: %w", err)
+	}
+
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_runs_status_created_at ON runs(status, created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_run_jobs_run_id ON run_jobs(run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_run_id ON webhook_deliveries(run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_outbox_created_at ON pipeline_outbox(created_at ASC)`,
 	}
 	for _, idx := range indexes {
 		if _, err := db.ExecContext(ctx, idx); err != nil {
@@ -246,6 +284,7 @@ func (s *SQLiteStore) Close() error {
 		s.stmtListRuns, s.stmtCreateRunJob, s.stmtUpdateRunJobStatus,
 		s.stmtGetRunJobs, s.stmtGetTerminalRuns, s.stmtGetRecentFailures,
 		s.stmtCountActiveRuns, s.stmtCountTotalRuns,
+		s.stmtRecordDelivery, s.stmtGetDelivery,
 	} {
 		if stmt != nil {
 			stmt.Close()
@@ -336,6 +375,20 @@ func (s *SQLiteStore) prepare() error {
 
 	s.stmtCountTotalRuns, err = s.db.Prepare(
 		`SELECT COUNT(*) FROM runs`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtRecordDelivery, err = s.db.Prepare(
+		`INSERT INTO webhook_deliveries (delivery_id, event_type, repo, pr_number, run_id)
+		 VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+
+	s.stmtGetDelivery, err = s.db.Prepare(
+		`SELECT delivery_id, event_type, repo, pr_number, run_id, created_at
+		 FROM webhook_deliveries WHERE delivery_id = ?`)
 	if err != nil {
 		return err
 	}
@@ -541,17 +594,37 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 		return nil, nil
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE runs SET status = 'failed', finished_at = ?
-		WHERE status IN ('running', 'pending')`, now)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("beginning reset ghost runs transaction: %w", err)
 	}
-	_, err = s.db.ExecContext(ctx, `
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = 'failed', finished_at = ?
+		WHERE status IN ('running', 'pending')`, now); err != nil {
+		return nil, fmt.Errorf("updating ghost runs: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE run_jobs SET status = 'failed', finished_at = ?
-		WHERE status IN ('running', 'pending')`, now)
-	return ids, err
+		WHERE status IN ('running', 'pending')`, now); err != nil {
+		return nil, fmt.Errorf("updating ghost run jobs: %w", err)
+	}
+
+	// Release webhook delivery claims for interrupted runs so that GitHub redeliveries can be accepted
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, id); err != nil {
+			return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing reset ghost runs: %w", err)
+	}
+
+	return ids, nil
 }
 
 func (s *SQLiteStore) GetRunStats(ctx context.Context, _ string, sampleLimit int) (*drevtypes.RunStats, error) {
@@ -694,6 +767,295 @@ func (s *SQLiteStore) RecordUsage(_ context.Context, _, _, _ string) error {
 
 func (s *SQLiteStore) GetMonthlyUsage(_ context.Context, _ string) (int, error) {
 	return 0, nil
+}
+
+// CreateRunWithDelivery atomically creates a webhook delivery record, a run, all associated run jobs,
+// and a pipeline outbox specification record in a single transaction.
+// Either all records commit or none commit. Returns ErrDuplicateDelivery on duplicate delivery ID.
+func (s *SQLiteStore) CreateRunWithDelivery(
+	ctx context.Context,
+	delivery *drevtypes.WebhookDelivery,
+	run *drevtypes.Run,
+	jobs []*drevtypes.RunJob,
+	pipelineSpec string,
+) error {
+	if delivery == nil || delivery.DeliveryID == "" {
+		return errors.New("delivery cannot be nil or empty")
+	}
+	if run == nil || run.ID == "" {
+		return errors.New("run cannot be nil or empty")
+	}
+	if strings.TrimSpace(pipelineSpec) == "" {
+		return errors.New("pipelineSpec cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning sqlite transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Insert webhook delivery record
+	now := time.Now().UTC().Format(time.RFC3339)
+	if !delivery.CreatedAt.IsZero() {
+		now = delivery.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO webhook_deliveries (delivery_id, event_type, repo, pr_number, run_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		delivery.DeliveryID, delivery.EventType, delivery.Repo, delivery.PRNumber, delivery.RunID, now,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed") {
+			return ErrDuplicateDelivery
+		}
+		return fmt.Errorf("inserting webhook delivery: %w", err)
+	}
+
+	// 2. Insert run record
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.OrgID, run.PipelineID, string(run.Status),
+		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
+		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting run: %w", err)
+	}
+
+	// 3. Insert all associated run jobs
+	for _, job := range jobs {
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			job.ID, job.RunID, job.JobName, string(job.Status),
+			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting run job %s: %w", job.JobName, err)
+		}
+	}
+
+	// 4. Insert into pipeline_outbox
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO pipeline_outbox (run_id, pipeline_spec, created_at)
+		 VALUES (?, ?, ?)`,
+		run.ID, pipelineSpec, now,
+	)
+	if err != nil {
+		return fmt.Errorf("inserting pipeline outbox: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing sqlite transaction: %w", err)
+	}
+	return nil
+}
+
+// ClaimRunForExecution atomically claims a pending run for execution.
+// It verifies the run is currently pending with started_at IS NULL, transitions it to running,
+// sets started_at, and deletes the pipeline_outbox entry in a single transaction.
+// Returns ErrRunAlreadyClaimed if the run was already claimed, running, or finished.
+func (s *SQLiteStore) ClaimRunForExecution(ctx context.Context, runID string) error {
+	if runID == "" {
+		return errors.New("runID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning claim transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'running', started_at = ?
+		WHERE id = ? AND status = 'pending' AND started_at IS NULL`,
+		now, runID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating run for claim: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected on claim: %w", err)
+	}
+	if n == 0 {
+		return ErrRunAlreadyClaimed
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("deleting outbox entry for claimed run %s: %w", runID, err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing claim transaction: %w", err)
+	}
+	return nil
+}
+
+// GetPendingOutbox retrieves up to limit pending, never-started runs from the outbox,
+// ordered deterministically by creation time.
+func (s *SQLiteStore) GetPendingOutbox(ctx context.Context, limit int) ([]*drevtypes.OutboxItem, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT o.run_id, o.pipeline_spec, o.created_at
+		FROM pipeline_outbox o
+		JOIN runs r ON r.id = o.run_id
+		WHERE r.status = 'pending' AND r.started_at IS NULL
+		ORDER BY o.created_at ASC, o.rowid ASC
+		LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying pending outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*drevtypes.OutboxItem
+	for rows.Next() {
+		var item drevtypes.OutboxItem
+		var createdAt sql.NullString
+		if err := rows.Scan(&item.RunID, &item.PipelineSpec, &createdAt); err != nil {
+			return nil, fmt.Errorf("scanning outbox item: %w", err)
+		}
+		item.CreatedAt = scanTime(&createdAt)
+		items = append(items, &item)
+	}
+	return items, rows.Err()
+}
+
+// FailRunWithDelivery atomically marks a run and its jobs as failed with terminal timestamps,
+// deletes any matching pipeline_outbox record, and deletes the matching webhook delivery claim.
+// Any failure rolls back all changes.
+func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, jobIDs []string, deliveryID string) error {
+	if runID == "" {
+		return errors.New("runID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning fail run with delivery transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	// 1. Mark run failed
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'failed',
+		    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+		WHERE id = ?`, now, runID,
+	)
+	if err != nil {
+		return fmt.Errorf("updating run %s to failed: %w", runID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("checking rows affected on run failure: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("run %s not found", runID)
+	}
+
+	// 2. Mark relevant jobs failed
+	if len(jobIDs) > 0 {
+		for _, jid := range jobIDs {
+			res, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'failed',
+				    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+				WHERE id = ? AND run_id = ?`, now, jid, runID)
+			if err != nil {
+				return fmt.Errorf("updating run job %s to failed: %w", jid, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("checking rows affected for job %s: %w", jid, err)
+			}
+			if n == 0 {
+				return fmt.Errorf("run job %s not found for run %s", jid, runID)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'failed',
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+			WHERE run_id = ?`, now, runID); err != nil {
+			return fmt.Errorf("updating run jobs for run %s to failed: %w", runID, err)
+		}
+	}
+
+	// 3. Delete matching outbox record
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("deleting outbox record for run %s: %w", runID, err)
+	}
+
+	// 4. Delete matching webhook delivery claim if deliveryID is provided (scoped strictly to this run)
+	if deliveryID != "" {
+		res, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivery_id = ? AND run_id = ?`, deliveryID, runID)
+		if err != nil {
+			return fmt.Errorf("deleting delivery claim %s for run %s: %w", deliveryID, runID, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("checking rows affected on delivery deletion: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("webhook delivery %s not found for run %s", deliveryID, runID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing fail run with delivery transaction: %w", err)
+	}
+	return nil
+}
+
+// DeleteDelivery removes a webhook delivery record, used to release delivery claims when enqueue is rejected.
+func (s *SQLiteStore) DeleteDelivery(ctx context.Context, deliveryID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE delivery_id = ?`, deliveryID)
+	return err
+}
+
+// RecordDelivery persists a webhook delivery record. Returns ErrDuplicateDelivery if the delivery ID already exists.
+func (s *SQLiteStore) RecordDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery) error {
+	if delivery == nil || delivery.DeliveryID == "" {
+		return errors.New("delivery cannot be nil or empty")
+	}
+	_, err := s.stmtRecordDelivery.ExecContext(ctx,
+		delivery.DeliveryID, delivery.EventType, delivery.Repo, delivery.PRNumber, delivery.RunID,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "constraint failed") {
+			return ErrDuplicateDelivery
+		}
+		return fmt.Errorf("recording webhook delivery: %w", err)
+	}
+	return nil
+}
+
+// GetDelivery retrieves the webhook delivery record for a delivery ID.
+func (s *SQLiteStore) GetDelivery(ctx context.Context, deliveryID string) (*drevtypes.WebhookDelivery, error) {
+	var d drevtypes.WebhookDelivery
+	var createdAt sql.NullString
+	err := s.stmtGetDelivery.QueryRowContext(ctx, deliveryID).Scan(
+		&d.DeliveryID, &d.EventType, &d.Repo, &d.PRNumber, &d.RunID, &createdAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("getting webhook delivery: %w", err)
+	}
+	d.CreatedAt = scanTime(&createdAt)
+	return &d, nil
 }
 
 // FailRun marks a run and its jobs as failed with terminal timestamps.
