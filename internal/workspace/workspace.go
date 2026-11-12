@@ -38,15 +38,7 @@ func (sw *sanitizedWriter) Write(p []byte) (n int, err error) {
 
 // isCommitSHA returns true if the string is a 40-character (SHA-1) or 64-character (SHA-256) hexadecimal hash.
 func isCommitSHA(s string) bool {
-	if len(s) != 40 && len(s) != 64 {
-		return false
-	}
-	for _, c := range s {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
-			return false
-		}
-	}
-	return true
+	return drevtypes.IsCommitSHA(s)
 }
 
 // Workspace manages the lifecycle of a build directory.
@@ -183,7 +175,13 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		}
 	}()
 
+	rawCommitSHA := strings.TrimSpace(source.CommitSHA)
 	rawRef := strings.TrimSpace(source.Ref)
+
+	if strings.HasPrefix(rawCommitSHA, "-") {
+		cloneErr = fmt.Errorf("git clone failed: invalid commit SHA %q: cannot start with '-'", rawCommitSHA)
+		return cloneErr
+	}
 	if strings.HasPrefix(rawRef, "-") {
 		cloneErr = fmt.Errorf("git clone failed: invalid ref %q: ref name cannot start with '-'", rawRef)
 		return cloneErr
@@ -191,10 +189,20 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 
 	var expectedSHA string
 	var fetchTarget string
+	var isDirectSHA bool
 
-	if isCommitSHA(rawRef) {
+	if rawCommitSHA != "" {
+		if !drevtypes.IsCommitSHA(rawCommitSHA) {
+			cloneErr = fmt.Errorf("git clone failed: invalid commit SHA %q", rawCommitSHA)
+			return cloneErr
+		}
+		expectedSHA = strings.ToLower(rawCommitSHA)
+		fetchTarget = expectedSHA
+		isDirectSHA = true
+	} else if isCommitSHA(rawRef) {
 		expectedSHA = strings.ToLower(rawRef)
 		fetchTarget = rawRef
+		isDirectSHA = true
 	} else if atIdx := strings.Index(rawRef, "@"); atIdx != -1 {
 		prefix := strings.TrimSpace(rawRef[:atIdx])
 		target := strings.TrimSpace(rawRef[atIdx+1:])
@@ -208,6 +216,7 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 				fetchTarget = prefix
 			} else {
 				fetchTarget = target
+				isDirectSHA = true
 			}
 		} else {
 			fetchTarget = rawRef
@@ -254,20 +263,76 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 		fmt.Fprintf(sw, "[drev] fetching %s from %s\n", fetchTarget, maskCredentials(source.URL))
 	}
 
+	var fetchSuccess bool
 	var fetchErrBuf bytes.Buffer
-	fetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "--depth", "1", "origin", "--", fetchTarget)
-	fetchCmd.Dir = sourceDir
-	fetchCmd.Stdout = sw
-	fetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
-	if err := fetchCmd.Run(); err != nil {
-		// Retry with full fetch if shallow fetch failed
-		fullFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "origin", "--", fetchTarget)
-		fullFetchCmd.Dir = sourceDir
-		fullFetchCmd.Stdout = sw
-		fullFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
-		if err2 := fullFetchCmd.Run(); err2 != nil {
-			cloneErr = fmt.Errorf("git clone failed: fetch %s from %s: %w (%s)", fetchTarget, source.URL, err2, strings.TrimSpace(fetchErrBuf.String()))
+
+	// If a direct commit SHA was requested (via CommitSHA or Ref), attempt direct SHA fetch
+	if isDirectSHA {
+		fetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "--depth", "1", "origin", "--", expectedSHA)
+		fetchCmd.Dir = sourceDir
+		fetchCmd.Stdout = sw
+		fetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+		if err := fetchCmd.Run(); err == nil {
+			fetchSuccess = true
+		} else {
+			fullFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "origin", "--", expectedSHA)
+			fullFetchCmd.Dir = sourceDir
+			fullFetchCmd.Stdout = sw
+			fullFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+			if err2 := fullFetchCmd.Run(); err2 == nil {
+				fetchSuccess = true
+			}
+		}
+
+		// Fallback: if direct SHA fetch failed on a server that disallows fetching raw SHAs,
+		// and a named ref was provided, try fetching that ref
+		if !fetchSuccess && rawRef != "" && rawRef != expectedSHA {
+			refToFetch := rawRef
+			if atIdx := strings.Index(rawRef, "@"); atIdx != -1 {
+				refToFetch = strings.TrimSpace(rawRef[:atIdx])
+			}
+			if refToFetch != "" && !strings.HasPrefix(refToFetch, "-") {
+				refFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "--depth", "1", "origin", "--", refToFetch)
+				refFetchCmd.Dir = sourceDir
+				refFetchCmd.Stdout = sw
+				refFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+				if err := refFetchCmd.Run(); err == nil {
+					fetchSuccess = true
+				} else {
+					fullRefFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "origin", "--", refToFetch)
+					fullRefFetchCmd.Dir = sourceDir
+					fullRefFetchCmd.Stdout = sw
+					fullRefFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+					if err2 := fullRefFetchCmd.Run(); err2 == nil {
+						fetchSuccess = true
+					}
+				}
+			}
+		}
+
+		if !fetchSuccess {
+			cloneErr = fmt.Errorf("git clone failed: fetch %s from %s: %s", expectedSHA, source.URL, strings.TrimSpace(fetchErrBuf.String()))
 			return cloneErr
+		}
+	} else {
+		// Non-direct-SHA fetch (e.g. named branch, PR ref, or <ref>@<sha>): fetch fetchTarget
+		fetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "--depth", "1", "origin", "--", fetchTarget)
+		fetchCmd.Dir = sourceDir
+		fetchCmd.Stdout = sw
+		fetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+		if err := fetchCmd.Run(); err == nil {
+			fetchSuccess = true
+		} else {
+			fullFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "origin", "--", fetchTarget)
+			fullFetchCmd.Dir = sourceDir
+			fullFetchCmd.Stdout = sw
+			fullFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+			if err2 := fullFetchCmd.Run(); err2 == nil {
+				fetchSuccess = true
+			} else {
+				cloneErr = fmt.Errorf("git clone failed: fetch %s from %s: %w (%s)", fetchTarget, source.URL, err2, strings.TrimSpace(fetchErrBuf.String()))
+				return cloneErr
+			}
 		}
 	}
 

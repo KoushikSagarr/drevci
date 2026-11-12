@@ -442,6 +442,44 @@ jobs:
 	if del == nil || del.RunID != runID || del.PRNumber != 42 {
 		t.Fatalf("unexpected delivery record: %+v", del)
 	}
+
+	// Verify enqueued job has Source PR metadata
+	select {
+	case job := <-h.queue.Drain():
+		if job.Pipeline.Source.CommitSHA != "a1b2c3d4e5f678901234567890abcdef12345678" {
+			t.Errorf("expected job source CommitSHA, got %s", job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.Ref != "feature-login" {
+			t.Errorf("expected job source Ref feature-login, got %s", job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.PRNumber != 42 {
+			t.Errorf("expected job source PRNumber 42, got %d", job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected job to be enqueued")
+	}
+
+	// Verify outbox record contains Source PR metadata
+	outboxItems, err := h.store.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("h.store.GetPendingOutbox: %v", err)
+	}
+	if len(outboxItems) != 1 {
+		t.Fatalf("expected 1 outbox item, got %d", len(outboxItems))
+	}
+	var outboxPipeline drevtypes.Pipeline
+	if err := json.Unmarshal([]byte(outboxItems[0].PipelineSpec), &outboxPipeline); err != nil {
+		t.Fatalf("unmarshaling outbox pipeline spec: %v", err)
+	}
+	if outboxPipeline.Source.CommitSHA != "a1b2c3d4e5f678901234567890abcdef12345678" {
+		t.Errorf("expected outbox source CommitSHA, got %s", outboxPipeline.Source.CommitSHA)
+	}
+	if outboxPipeline.Source.Ref != "feature-login" {
+		t.Errorf("expected outbox source Ref feature-login, got %s", outboxPipeline.Source.Ref)
+	}
+	if outboxPipeline.Source.PRNumber != 42 {
+		t.Errorf("expected outbox source PRNumber 42, got %d", outboxPipeline.Source.PRNumber)
+	}
 }
 
 func TestGitHubWebhook_PullRequest_Synchronize(t *testing.T) {
@@ -455,7 +493,7 @@ func TestGitHubWebhook_PullRequest_Synchronize(t *testing.T) {
 	payload := makePRPayload(
 		"synchronize", 42,
 		"octocat/hello-world", "https://github.com/octocat/hello-world.git",
-		"feature-login", "syncsha98765432101234567890abcdef12345678",
+		"feature-login", "b1b2c3d4e5f678901234567890abcdef12345678",
 		"Add new login page - sync", "octocat-dev",
 		false, "octocat/hello-world",
 	)
@@ -472,6 +510,22 @@ func TestGitHubWebhook_PullRequest_Synchronize(t *testing.T) {
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
 	}
+
+	// Verify enqueued job has updated Source metadata for synchronize
+	select {
+	case job := <-h.queue.Drain():
+		if job.Pipeline.Source.CommitSHA != "b1b2c3d4e5f678901234567890abcdef12345678" {
+			t.Errorf("expected job source CommitSHA b1b2..., got %s", job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.Ref != "feature-login" {
+			t.Errorf("expected job source Ref feature-login, got %s", job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.PRNumber != 42 {
+			t.Errorf("expected job source PRNumber 42, got %d", job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected synchronize job to be enqueued")
+	}
 }
 
 func TestGitHubWebhook_PullRequest_Reopened(t *testing.T) {
@@ -485,7 +539,7 @@ func TestGitHubWebhook_PullRequest_Reopened(t *testing.T) {
 	payload := makePRPayload(
 		"reopened", 42,
 		"octocat/hello-world", "https://github.com/octocat/hello-world.git",
-		"feature-login", "reopensha8765432101234567890abcdef12345678",
+		"feature-login", "c1c2c3c4c5c678901234567890abcdef12345678",
 		"Add new login page - reopen", "octocat-dev",
 		false, "octocat/hello-world",
 	)
@@ -501,6 +555,223 @@ func TestGitHubWebhook_PullRequest_Reopened(t *testing.T) {
 
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
+	}
+
+	// Verify enqueued job has updated Source metadata for reopen
+	select {
+	case job := <-h.queue.Drain():
+		if job.Pipeline.Source.CommitSHA != "c1c2c3c4c5c678901234567890abcdef12345678" {
+			t.Errorf("expected job source CommitSHA c1c2..., got %s", job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.Ref != "feature-login" {
+			t.Errorf("expected job source Ref feature-login, got %s", job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.PRNumber != 42 {
+			t.Errorf("expected job source PRNumber 42, got %d", job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected reopen job to be enqueued")
+	}
+}
+
+func TestGitHubWebhook_PullRequest_PropagatesSourceRevisionMetadata(t *testing.T) {
+	actions := []string{"opened", "synchronize", "reopened"}
+
+	for _, act := range actions {
+		t.Run(act, func(t *testing.T) {
+			configDir := t.TempDir()
+			repoDir := filepath.Join(configDir, "octocat", "hello-world")
+			os.MkdirAll(repoDir, 0755)
+			os.WriteFile(filepath.Join(repoDir, ".drev.yml"), []byte(validPipelineYAML), 0644)
+
+			h := setupTestHandler(t, "secret", configDir)
+
+			headSHA := "e1e2e3e4e5e678901234567890abcdef12345678"
+			headRef := "refs/heads/feature-branch"
+			cloneURL := "https://github.com/octocat/hello-world.git"
+			prNum := 77
+
+			payload := makePRPayload(
+				act, prNum,
+				"octocat/hello-world", cloneURL,
+				headRef, headSHA,
+				"PR for "+act, "alice",
+				false, "octocat/hello-world",
+			)
+			body, _ := json.Marshal(payload)
+
+			deliveryID := fmt.Sprintf("del-prop-%s", act)
+			req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+			req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("X-GitHub-Delivery", deliveryID)
+
+			rr := httptest.NewRecorder()
+			h.Handle(rr, req)
+
+			if rr.Code != http.StatusAccepted {
+				t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
+			}
+
+			// Verify in-memory queue job source fields
+			select {
+			case job := <-h.queue.Drain():
+				if job.Pipeline.Source.URL != cloneURL {
+					t.Errorf("expected URL %s, got %s", cloneURL, job.Pipeline.Source.URL)
+				}
+				if job.Pipeline.Source.Ref != headRef {
+					t.Errorf("expected Ref %s, got %s", headRef, job.Pipeline.Source.Ref)
+				}
+				if job.Pipeline.Source.CommitSHA != headSHA {
+					t.Errorf("expected CommitSHA %s, got %s", headSHA, job.Pipeline.Source.CommitSHA)
+				}
+				if job.Pipeline.Source.PRNumber != prNum {
+					t.Errorf("expected PRNumber %d, got %d", prNum, job.Pipeline.Source.PRNumber)
+				}
+			default:
+				t.Fatal("expected job to be in queue")
+			}
+
+			// Verify durable outbox source fields
+			ctx := context.Background()
+			outbox, err := h.store.GetPendingOutbox(ctx, 10)
+			if err != nil {
+				t.Fatalf("GetPendingOutbox: %v", err)
+			}
+			if len(outbox) != 1 {
+				t.Fatalf("expected 1 outbox item, got %d", len(outbox))
+			}
+
+			parsed, err := parser.ParseBytes([]byte(outbox[0].PipelineSpec))
+			if err != nil {
+				t.Fatalf("parsing outbox spec: %v", err)
+			}
+			if parsed.Source.URL != cloneURL {
+				t.Errorf("outbox Source.URL mismatch: expected %s, got %s", cloneURL, parsed.Source.URL)
+			}
+			if parsed.Source.Ref != headRef {
+				t.Errorf("outbox Source.Ref mismatch: expected %s, got %s", headRef, parsed.Source.Ref)
+			}
+			if parsed.Source.CommitSHA != headSHA {
+				t.Errorf("outbox Source.CommitSHA mismatch: expected %s, got %s", headSHA, parsed.Source.CommitSHA)
+			}
+			if parsed.Source.PRNumber != prNum {
+				t.Errorf("outbox Source.PRNumber mismatch: expected %d, got %d", prNum, parsed.Source.PRNumber)
+			}
+		})
+	}
+}
+
+func TestGitHubWebhook_PullRequest_MalformedHeadSHA(t *testing.T) {
+	cases := []struct {
+		name    string
+		headSHA string
+		headRef string
+		prNum   int
+	}{
+		{
+			name:    "empty head SHA",
+			headSHA: "",
+			headRef: "feature-branch",
+			prNum:   100,
+		},
+		{
+			name:    "short SHA (7 chars)",
+			headSHA: "a1b2c3d",
+			headRef: "feature-branch",
+			prNum:   100,
+		},
+		{
+			name:    "short SHA (16 chars)",
+			headSHA: "1234567890abcdef",
+			headRef: "feature-branch",
+			prNum:   100,
+		},
+		{
+			name:    "non-hex letters in 40-char string",
+			headSHA: "g1b2c3d4e5f678901234567890abcdef12345678",
+			headRef: "feature-branch",
+			prNum:   100,
+		},
+		{
+			name:    "option-like SHA starting with dash",
+			headSHA: "-1b2c3d4e5f678901234567890abcdef12345678",
+			headRef: "feature-branch",
+			prNum:   100,
+		},
+		{
+			name:    "option-like Ref starting with dash",
+			headSHA: "a1b2c3d4e5f678901234567890abcdef12345678",
+			headRef: "--upload-pack=evil",
+			prNum:   100,
+		},
+		{
+			name:    "zero PR number",
+			headSHA: "a1b2c3d4e5f678901234567890abcdef12345678",
+			headRef: "feature-branch",
+			prNum:   0,
+		},
+		{
+			name:    "negative PR number",
+			headSHA: "a1b2c3d4e5f678901234567890abcdef12345678",
+			headRef: "feature-branch",
+			prNum:   -1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			configDir := t.TempDir()
+			repoDir := filepath.Join(configDir, "octocat", "hello-world")
+			os.MkdirAll(repoDir, 0755)
+			os.WriteFile(filepath.Join(repoDir, ".drev.yml"), []byte(validPipelineYAML), 0644)
+
+			h := setupTestHandler(t, "secret", configDir)
+
+			payload := makePRPayload(
+				"opened", tc.prNum,
+				"octocat/hello-world", "https://github.com/octocat/hello-world.git",
+				tc.headRef, tc.headSHA,
+				"Test PR", "octocat-dev",
+				false, "octocat/hello-world",
+			)
+			body, _ := json.Marshal(payload)
+
+			deliveryID := "del-malformed-" + strings.ReplaceAll(tc.name, " ", "-")
+			req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+			req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+			req.Header.Set("X-GitHub-Event", "pull_request")
+			req.Header.Set("X-GitHub-Delivery", deliveryID)
+
+			rr := httptest.NewRecorder()
+			h.Handle(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 Bad Request, got %v: %s", rr.Code, rr.Body.String())
+			}
+
+			// Verify nothing was persisted or queued
+			ctx := context.Background()
+			del, err := h.store.GetDelivery(ctx, deliveryID)
+			if err != nil {
+				t.Fatalf("GetDelivery error: %v", err)
+			}
+			if del != nil {
+				t.Errorf("expected no delivery record created for malformed request, found: %+v", del)
+			}
+
+			outbox, err := h.store.GetPendingOutbox(ctx, 10)
+			if err != nil {
+				t.Fatalf("GetPendingOutbox error: %v", err)
+			}
+			if len(outbox) != 0 {
+				t.Errorf("expected 0 outbox entries, found: %d", len(outbox))
+			}
+
+			if h.queue.Depth() != 0 {
+				t.Errorf("expected 0 queued jobs, found: %d", h.queue.Depth())
+			}
+		})
 	}
 }
 

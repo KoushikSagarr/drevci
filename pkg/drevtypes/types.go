@@ -16,9 +16,24 @@ const (
 
 // Source defines where the pipeline code comes from.
 type Source struct {
-	Type string `yaml:"type" json:"type"`
-	URL  string `yaml:"url"  json:"url"`
-	Ref  string `yaml:"ref"  json:"ref"`
+	Type      string `yaml:"type"                 json:"type"`
+	URL       string `yaml:"url"                  json:"url"`
+	Ref       string `yaml:"ref"                  json:"ref"`
+	CommitSHA string `yaml:"commit_sha,omitempty" json:"commit_sha,omitempty"`
+	PRNumber  int    `yaml:"pr_number,omitempty"  json:"pr_number,omitempty"`
+}
+
+// IsCommitSHA returns true if the string is a 40-character (SHA-1) or 64-character (SHA-256) hexadecimal hash.
+func IsCommitSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // Pipeline is the top-level definition parsed from a .drev.yml file.

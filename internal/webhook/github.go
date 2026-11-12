@@ -157,6 +157,8 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		repoFullName string
 		cloneURL     string
 		branch       string
+		sourceRef    string
+		sourceSHA    string
 		commitSHA    string
 		commitMsg    string
 		triggeredBy  string
@@ -188,6 +190,8 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 		repoFullName = payload.Repository.FullName
 		cloneURL = payload.Repository.CloneURL
+		sourceRef = branch
+		sourceSHA = ""
 		commitMsg = payload.HeadCommit.Message
 		triggeredBy = payload.Pusher.Name
 		if triggeredBy == "" {
@@ -243,7 +247,9 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if payload.PullRequest.Head.SHA == "" ||
+			!drevtypes.IsCommitSHA(payload.PullRequest.Head.SHA) ||
 			payload.PullRequest.Head.Ref == "" ||
+			strings.HasPrefix(payload.PullRequest.Head.Ref, "-") ||
 			repoFullName == "" ||
 			cloneURL == "" ||
 			prNumber <= 0 {
@@ -252,6 +258,8 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 
 		branch = strings.TrimPrefix(payload.PullRequest.Head.Ref, "refs/heads/")
+		sourceRef = payload.PullRequest.Head.Ref
+		sourceSHA = payload.PullRequest.Head.SHA
 		commitSHA = payload.PullRequest.Head.SHA
 		commitMsg = strings.TrimSpace(payload.PullRequest.Title)
 		triggeredBy = payload.PullRequest.User.Login
@@ -279,7 +287,9 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pipeline.Source.URL = cloneURL
-	pipeline.Source.Ref = branch
+	pipeline.Source.Ref = sourceRef
+	pipeline.Source.CommitSHA = sourceSHA
+	pipeline.Source.PRNumber = prNumber
 
 	runID := uuid.New().String()
 

@@ -485,6 +485,183 @@ func TestClone_PRRef(t *testing.T) {
 	})
 }
 
+func TestClone_SourceCommitSHA_Authoritative(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, commit1, commit2 := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	// Remote main branch has advanced to commit2, but Source specifies CommitSHA = commit1
+	src := drevtypes.Source{
+		Type:      "git",
+		URL:       repo,
+		Ref:       "main",
+		CommitSHA: commit1,
+	}
+
+	var buf bytes.Buffer
+	if err := w.Clone(context.Background(), src, &buf); err != nil {
+		t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+	}
+
+	head := getRepoHeadSHA(t, w.SourceDir())
+	if !strings.EqualFold(head, commit1) {
+		t.Errorf("expected HEAD %s, got %s (branch tip was %s)", commit1, head, commit2)
+	}
+
+	content, err := os.ReadFile(filepath.Join(w.SourceDir(), "hello", "hello.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "// version 1") {
+		t.Errorf("expected version 1 content, got: %s", string(content))
+	}
+	if strings.Contains(string(content), "// version 2") {
+		t.Errorf("unexpectedly checked out latest branch tip version 2 instead of target CommitSHA")
+	}
+}
+
+func TestClone_SourceCommitSHA_Mismatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, _, _ := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	// A valid 40-hex SHA that does not exist in repo
+	nonExistentSHA := "0000000000000000000000000000000000000000"
+	src := drevtypes.Source{
+		Type:      "git",
+		URL:       repo,
+		Ref:       "main",
+		CommitSHA: nonExistentSHA,
+	}
+
+	var buf bytes.Buffer
+	err = w.Clone(context.Background(), src, &buf)
+	if err == nil {
+		t.Fatal("expected error for non-existent commit SHA, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "git clone failed") {
+		t.Errorf("expected error to contain 'git clone failed', got: %v", err)
+	}
+
+	if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+		t.Errorf("expected sourceDir to be cleaned up after failure, but it exists: %s", w.SourceDir())
+	}
+}
+
+func TestClone_SourceCommitSHA_Malformed(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, _, _ := createMultiCommitRepo(t)
+
+	tests := []struct {
+		name      string
+		commitSHA string
+	}{
+		{
+			name:      "short sha",
+			commitSHA: "1234567",
+		},
+		{
+			name:      "non-hex characters",
+			commitSHA: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+		},
+		{
+			name:      "option-like sha",
+			commitSHA: "-1234567890abcdef1234567890abcdef1234567",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := Create()
+			if err != nil {
+				t.Fatalf("Create() error: %v", err)
+			}
+			defer w.Cleanup()
+
+			src := drevtypes.Source{
+				Type:      "git",
+				URL:       repo,
+				Ref:       "main",
+				CommitSHA: tc.commitSHA,
+			}
+
+			var buf bytes.Buffer
+			err = w.Clone(context.Background(), src, &buf)
+			if err == nil {
+				t.Fatalf("expected error for malformed commit SHA %q, got nil", tc.commitSHA)
+			}
+
+			if !strings.Contains(err.Error(), "invalid commit SHA") {
+				t.Errorf("expected error to contain 'invalid commit SHA', got: %v", err)
+			}
+
+			if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+				t.Errorf("expected sourceDir to be cleaned up after validation failure: %s", w.SourceDir())
+			}
+		})
+	}
+}
+
+func TestClone_NonPR_PreservesBranchCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, _, commit2 := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	// Non-PR caller: CommitSHA is empty, Ref is "main"
+	src := drevtypes.Source{
+		Type:      "git",
+		URL:       repo,
+		Ref:       "main",
+		CommitSHA: "",
+	}
+
+	var buf bytes.Buffer
+	if err := w.Clone(context.Background(), src, &buf); err != nil {
+		t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+	}
+
+	head := getRepoHeadSHA(t, w.SourceDir())
+	if !strings.EqualFold(head, commit2) {
+		t.Errorf("expected branch tip HEAD %s, got %s", commit2, head)
+	}
+
+	content, err := os.ReadFile(filepath.Join(w.SourceDir(), "hello", "hello.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "// version 2") {
+		t.Errorf("expected version 2 content from branch tip, got: %s", string(content))
+	}
+}
+
 func TestClone_OptionInjectionRejected(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")

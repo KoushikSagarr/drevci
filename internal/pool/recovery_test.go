@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -413,5 +414,101 @@ func TestOutboxRecoverer_InvalidPipelineSpec_MarksRunFailedAndDeletesOutbox(t *t
 	outboxAfter, _ := s.GetPendingOutbox(ctx, 10)
 	if len(outboxAfter) != 0 {
 		t.Errorf("expected outbox to be cleared for invalid spec, got %d items", len(outboxAfter))
+	}
+}
+
+func TestOutboxRecoverer_PreservesPRMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recovery_pr_metadata.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	pipeline := &drevtypes.Pipeline{
+		Name: "pipeline-pr-recover",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       "https://github.com/octocat/hello-world.git",
+			Ref:       "refs/pull/42/head",
+			CommitSHA: "b1b2c3d4e5f678901234567890abcdef12345678",
+			PRNumber:  42,
+		},
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "test-job",
+				Image: "alpine",
+				Steps: []drevtypes.Step{
+					{Name: "step1", Run: "echo ok"},
+				},
+			},
+		},
+	}
+
+	specBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		t.Fatalf("marshaling pipeline spec: %v", err)
+	}
+
+	runID := "run-pr-recover-1"
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-pr-1",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		PRNumber:   42,
+		RunID:      runID,
+	}
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: pipeline.Name,
+		Status:     drevtypes.StatusPending,
+		CommitSHA:  pipeline.Source.CommitSHA,
+		Branch:     "feature-login",
+	}
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:      "job-rec-1",
+			RunID:   runID,
+			JobName: "test-job",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, jobs, string(specBytes)); err != nil {
+		t.Fatalf("CreateRunWithDelivery: %v", err)
+	}
+
+	q := queue.New(10)
+	recoverer := NewOutboxRecoverer(s, q, nil)
+
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+
+	if q.Depth() != 1 {
+		t.Fatalf("expected 1 job in queue, got %d", q.Depth())
+	}
+
+	select {
+	case job := <-q.Drain():
+		if job.RunID != runID {
+			t.Errorf("expected RunID %s, got %s", runID, job.RunID)
+		}
+		if job.Pipeline.Source.URL != pipeline.Source.URL {
+			t.Errorf("expected Source.URL %s, got %s", pipeline.Source.URL, job.Pipeline.Source.URL)
+		}
+		if job.Pipeline.Source.Ref != pipeline.Source.Ref {
+			t.Errorf("expected Source.Ref %s, got %s", pipeline.Source.Ref, job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.CommitSHA != pipeline.Source.CommitSHA {
+			t.Errorf("expected Source.CommitSHA %s, got %s", pipeline.Source.CommitSHA, job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.PRNumber != pipeline.Source.PRNumber {
+			t.Errorf("expected Source.PRNumber %d, got %d", pipeline.Source.PRNumber, job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected job to be readable from queue")
 	}
 }
