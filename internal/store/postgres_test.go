@@ -923,3 +923,209 @@ func TestPostgres_MigrationUpgradeLive(t *testing.T) {
 		t.Fatalf("executing migration 004 failed: %v", err)
 	}
 }
+
+func TestPostgresStore_CreateRunJobs_Success(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := "run-pg-batch-001"
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "pipe-pg-1",
+		Status:     drevtypes.StatusRunning,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:         "job-pg-b-1",
+			RunID:      runID,
+			JobName:    "build",
+			Status:     drevtypes.StatusRunning,
+			StartedAt:  now,
+			FinishedAt: now.Add(time.Minute),
+		},
+		{
+			ID:      "job-pg-b-2",
+			RunID:   runID,
+			JobName: "test",
+			Status:  "", // Defaults to pending
+		},
+	}
+
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if len(gotJobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(gotJobs))
+	}
+}
+
+func TestPostgresStore_CreateRunJobs_Validation(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := "run-pg-val-001"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p1", Status: drevtypes.StatusPending}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// Blank runID
+	if err := s.CreateRunJobs(ctx, "", []*drevtypes.RunJob{{ID: "j1", RunID: "", JobName: "b"}}); err == nil {
+		t.Error("expected error on blank runID")
+	}
+
+	// Empty jobs slice
+	if err := s.CreateRunJobs(ctx, runID, []*drevtypes.RunJob{}); err == nil {
+		t.Error("expected error on empty jobs slice")
+	}
+
+	// Nil jobs slice
+	if err := s.CreateRunJobs(ctx, runID, nil); err == nil {
+		t.Error("expected error on nil jobs slice")
+	}
+
+	// Nil job entry
+	if err := s.CreateRunJobs(ctx, runID, []*drevtypes.RunJob{nil}); err == nil {
+		t.Error("expected error on nil job entry")
+	}
+
+	// Mismatched RunID
+	if err := s.CreateRunJobs(ctx, runID, []*drevtypes.RunJob{{ID: "j1", RunID: "other-run", JobName: "b"}}); err == nil {
+		t.Error("expected error on mismatched RunID")
+	}
+
+	// Duplicate job ID
+	if err := s.CreateRunJobs(ctx, runID, []*drevtypes.RunJob{
+		{ID: "dup-1", RunID: runID, JobName: "b1"},
+		{ID: "dup-1", RunID: runID, JobName: "b2"},
+	}); err == nil {
+		t.Error("expected error on duplicate job ID")
+	}
+
+	// Duplicate job name
+	if err := s.CreateRunJobs(ctx, runID, []*drevtypes.RunJob{
+		{ID: "j1", RunID: runID, JobName: "same"},
+		{ID: "j2", RunID: runID, JobName: "same"},
+	}); err == nil {
+		t.Error("expected error on duplicate job name")
+	}
+
+	// Nonexistent run
+	if err := s.CreateRunJobs(ctx, "run-nonexistent", []*drevtypes.RunJob{{ID: "j1", RunID: "run-nonexistent", JobName: "b"}}); err == nil {
+		t.Error("expected error on nonexistent run")
+	}
+}
+
+func TestPostgresStore_CreateRunJobs_Atomicity_RollbackOnConstraintFailure(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := "run-pg-rb-1"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p-rb", Status: drevtypes.StatusRunning}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// 1. Seed existing job
+	seededJobID := "job-pg-seeded-1"
+	if err := s.CreateRunJob(ctx, &drevtypes.RunJob{
+		ID:      seededJobID,
+		RunID:   runID,
+		JobName: "setup",
+		Status:  drevtypes.StatusSuccess,
+	}); err != nil {
+		t.Fatalf("CreateRunJob(seeded): %v", err)
+	}
+
+	// 2. Submit batch with new job 1 and duplicate-ID job 2
+	newJobID := "job-pg-new-1"
+	failingBatch := []*drevtypes.RunJob{
+		{
+			ID:      newJobID,
+			RunID:   runID,
+			JobName: "build-step",
+			Status:  drevtypes.StatusPending,
+		},
+		{
+			ID:      seededJobID, // duplicate primary key in database
+			RunID:   runID,
+			JobName: "test-step",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+
+	err := s.CreateRunJobs(ctx, runID, failingBatch)
+	if err == nil {
+		t.Fatal("expected database constraint error on duplicate job ID, got nil")
+	}
+
+	// 3. PROVE ROLLBACK: newJobID must not exist in the database
+	jobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != seededJobID {
+		t.Fatalf("expected only seeded job, found %d jobs", len(jobs))
+	}
+
+	// 4. Retry with valid batch succeeds
+	validBatch := []*drevtypes.RunJob{
+		{
+			ID:      newJobID,
+			RunID:   runID,
+			JobName: "build-step",
+			Status:  drevtypes.StatusPending,
+		},
+		{
+			ID:      "job-pg-valid-2",
+			RunID:   runID,
+			JobName: "test-step",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+	if err := s.CreateRunJobs(ctx, runID, validBatch); err != nil {
+		t.Fatalf("retry CreateRunJobs failed: %v", err)
+	}
+
+	finalJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(finalJobs) != 3 {
+		t.Fatalf("expected 3 jobs after retry, got %d (err: %v)", len(finalJobs), err)
+	}
+}
+
+func TestPostgresStore_CreateRunJob_Compatible(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := "run-pg-compat-1"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p-c", Status: drevtypes.StatusRunning}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	job := &drevtypes.RunJob{
+		ID:      "pg-single-1",
+		RunID:   runID,
+		JobName: "compile",
+		Status:  drevtypes.StatusPending,
+	}
+
+	if err := s.CreateRunJob(ctx, job); err != nil {
+		t.Fatalf("CreateRunJob: %v", err)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(gotJobs) != 1 {
+		t.Fatalf("expected 1 job, got %d (err: %v)", len(gotJobs), err)
+	}
+	if gotJobs[0].ID != "pg-single-1" {
+		t.Errorf("expected pg-single-1, got %s", gotJobs[0].ID)
+	}
+}

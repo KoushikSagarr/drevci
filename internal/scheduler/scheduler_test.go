@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1700,4 +1701,1715 @@ func TestDownstreamJobStates_AllSuccessAndFailureSemantics(t *testing.T) {
 			t.Errorf("expected StatusFailed, got %s", storedRun.Status)
 		}
 	})
+}
+
+// ── Dynamic Scheduler Execution Tests (Task 2.3.4) ───────────────────────────
+
+// createTestGitRepo initializes a local git repository with the given files and commits them.
+func createTestGitRepo(t *testing.T, files map[string]string) (string, string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available in PATH")
+	}
+
+	repoDir := t.TempDir()
+	gitCmd := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\noutput: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	gitCmd("init", "-b", "main")
+	gitCmd("config", "user.email", "test@drev.local")
+	gitCmd("config", "user.name", "Drev Test")
+
+	for relPath, content := range files {
+		fullPath := filepath.Join(repoDir, relPath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatalf("creating dir for %s: %v", relPath, err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatalf("writing %s: %v", relPath, err)
+		}
+	}
+
+	gitCmd("add", ".")
+	gitCmd("commit", "-m", "initial commit")
+	sha := gitCmd("rev-parse", "HEAD")
+	return repoDir, sha
+}
+
+func TestDynamicScheduler_Bootstrap_Success(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: dynamic-test
+jobs:
+  - name: build
+    image: alpine:latest
+    steps:
+      - name: build-step
+        run: echo "building"
+  - name: test
+    image: alpine:latest
+    depends_on: [build]
+    steps:
+      - name: test-step
+        run: echo "testing"
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-bootstrap-success"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "dynamic-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	executedJobs := make([]string, 0)
+	var mu sync.Mutex
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			mu.Lock()
+			executedJobs = append(executedJobs, job.Name)
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "dynamic-test",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v\nlog: %s", err, buf.String())
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusSuccess {
+		t.Fatalf("expected run StatusSuccess, got %v (err: %v)", storedRun.Status, err)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("expected 2 stored jobs, got %d (err: %v)", len(jobs), err)
+	}
+	for _, j := range jobs {
+		if j.Status != drevtypes.StatusSuccess {
+			t.Errorf("job %s expected StatusSuccess, got %s", j.JobName, j.Status)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executedJobs) != 2 || executedJobs[0] != "build" || executedJobs[1] != "test" {
+		t.Fatalf("expected jobs [build, test], got %v", executedJobs)
+	}
+}
+
+func TestDynamicScheduler_TriggerSourcePreserved(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: divergent-source-test
+source:
+  type: git
+  url: https://evil.attacker.com/repo.git
+  ref: refs/heads/malicious
+  commit_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  pr_number: 999
+jobs:
+  - name: secure-job
+    image: alpine:latest
+    steps:
+      - name: s1
+        run: echo "secure"
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-trigger-source-preserved"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "divergent-source-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	authoritativeSource := drevtypes.Source{
+		Type:      "git",
+		URL:       repoDir,
+		Ref:       "refs/pull/42/head",
+		CommitSHA: sha,
+		PRNumber:  42,
+	}
+
+	repoConfigSeenDivergent := false
+	executedJob := ""
+	var observedRepoPipeline *drevtypes.Pipeline
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			executedJob = job.Name
+			data, err := os.ReadFile(filepath.Join(w.Dir, ".drev.yml"))
+			if err == nil && strings.Contains(string(data), "https://evil.attacker.com/repo.git") {
+				repoConfigSeenDivergent = true
+			}
+			// Verify active execution source by checking root workspace config load in runFunc
+			rootWS := &workspace.Workspace{Dir: filepath.Dir(filepath.Dir(w.Dir))}
+			resolvedPipeline, err := rootWS.LoadRepositoryConfig(authoritativeSource)
+			if err == nil {
+				observedRepoPipeline = resolvedPipeline
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name:   "divergent-source-test",
+		Source: authoritativeSource,
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v", err)
+	}
+
+	if !repoConfigSeenDivergent {
+		t.Fatal("expected runner to see divergent repo .drev.yml in workspace")
+	}
+
+	if executedJob != "secure-job" {
+		t.Fatalf("expected secure-job to execute, got %q", executedJob)
+	}
+
+	if observedRepoPipeline == nil {
+		t.Fatal("expected runner to successfully load repository config with authoritative source")
+	}
+	if observedRepoPipeline.Source != authoritativeSource {
+		t.Fatalf("resolved pipeline did not preserve authoritative trigger source!\nexpected: %+v\ngot: %+v", authoritativeSource, observedRepoPipeline.Source)
+	}
+
+	// Verify caller-owned pipeline was NOT mutated in place
+	if bootstrapPipeline.Jobs != nil {
+		t.Fatalf("caller pipeline Jobs was unexpectedly mutated in place: %+v", bootstrapPipeline.Jobs)
+	}
+	if bootstrapPipeline.Source != authoritativeSource {
+		t.Fatalf("caller pipeline Source was unexpectedly mutated!\nexpected: %+v\ngot: %+v", authoritativeSource, bootstrapPipeline.Source)
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusSuccess {
+		t.Fatalf("expected run StatusSuccess, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_JobsRegisterBeforeFirstRunnerInvocation(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: pre-exec-reg-test
+jobs:
+  - name: job-alpha
+    image: alpine:latest
+    steps:
+      - name: s1
+        run: echo "alpha"
+  - name: job-beta
+    image: alpine:latest
+    steps:
+      - name: s2
+        run: echo "beta"
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-pre-exec-reg"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "pre-exec-reg-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	firstCallCheckPassed := false
+	var mu sync.Mutex
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			mu.Lock()
+			defer mu.Unlock()
+			jobs, err := s.GetRunJobs(context.Background(), runID)
+			if err == nil && len(jobs) == 2 {
+				firstCallCheckPassed = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "pre-exec-reg-test",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v", err)
+	}
+
+	mu.Lock()
+	passed := firstCallCheckPassed
+	mu.Unlock()
+	if !passed {
+		t.Fatal("expected all jobs to be registered in DB before runner invocation")
+	}
+}
+
+func TestDynamicScheduler_AbsentConfig_WithHostFallback(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		"README.md": "# Hello World\n",
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-absent-fallback"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "fallback-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	fallbackPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "fallback-job",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{
+					{Name: "s1", Run: "echo fallback"},
+				},
+			},
+		},
+	}
+
+	executed := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "fallback-job" {
+				executed = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s, WithHostFallback(fallbackPipeline))
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v\nlog: %s", err, buf.String())
+	}
+
+	if !strings.Contains(buf.String(), "falling back to host configuration (deprecated)") {
+		t.Errorf("expected deprecation warning in log, got: %s", buf.String())
+	}
+	if !executed {
+		t.Error("expected fallback-job to be executed")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusSuccess {
+		t.Fatalf("expected StatusSuccess, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CaseE_UnregisteredRepo_UsesIncomingPipelineFallbackOnlyWhenAbsent(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		"README.md": "# No drev.yml here\n",
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-e-absent"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "incoming-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	executedJob := ""
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			executedJob = job.Name
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	incomingPipeline := &drevtypes.Pipeline{
+		Name: "incoming-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+		Jobs: []drevtypes.Job{
+			{Name: "incoming-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Run: "echo 1"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), incomingPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v", err)
+	}
+
+	if executedJob != "incoming-job" {
+		t.Fatalf("expected incoming-job executed, got %q", executedJob)
+	}
+	if !strings.Contains(buf.String(), "falling back to host configuration") {
+		t.Errorf("expected fallback warning in log, got: %s", buf.String())
+	}
+}
+
+func TestDynamicScheduler_CaseE_AuthoritativeRepoOverridesIncomingJobs(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: repo-pipeline
+jobs:
+  - name: repo-job
+    image: alpine:latest
+    steps:
+      - name: s1
+        run: echo "repo job"
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-e-repo-authoritative"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "incoming-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	executedJob := ""
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			executedJob = job.Name
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	incomingPipeline := &drevtypes.Pipeline{
+		Name: "incoming-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+		Jobs: []drevtypes.Job{
+			{Name: "incoming-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Run: "echo 1"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), incomingPipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v", err)
+	}
+
+	if executedJob != "repo-job" {
+		t.Fatalf("expected repo-job to be executed (repo authoritative), got %q", executedJob)
+	}
+}
+
+func TestDynamicScheduler_AbsentConfig_NoFallback_Fails(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		"README.md": "# No drev.yml here\n",
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-absent-no-fallback"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s) // no fallback
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail when config absent and no fallback configured")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("expected 0 registered jobs, got %d", len(jobs))
+	}
+}
+
+func TestDynamicScheduler_MalformedConfig_DoesNotFallback(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `::: this is not valid yaml :::`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-malformed-config"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	fallbackPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "fallback-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Run: "echo fallback"}}},
+		},
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s, WithHostFallback(fallbackPipeline))
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on malformed config")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called: fallback should NOT trigger on malformed config")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+
+	if !strings.Contains(buf.String(), "resolving repository configuration failed") {
+		t.Errorf("expected diagnostic error in log, got: %s", buf.String())
+	}
+}
+
+func TestDynamicScheduler_SymlinkEscape_DoesNotFallback(t *testing.T) {
+	externalDir := t.TempDir()
+	externalConfig := filepath.Join(externalDir, "escape.drev.yml")
+	if err := os.WriteFile(externalConfig, []byte("name: escape\njobs:\n  - name: escape-job\n    image: alpine:latest\n    steps:\n      - name: s1\n        run: echo escape\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		"README.md": "# Symlink test\n",
+	})
+
+	symlinkPath := filepath.Join(repoDir, ".drev.yml")
+	if err := os.Symlink(externalConfig, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("git", "-C", repoDir, "add", ".drev.yml")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, out)
+	}
+	cmd = exec.Command("git", "-C", repoDir, "commit", "-m", "add symlink")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, out)
+	}
+	cmd = exec.Command("git", "-C", repoDir, "rev-parse", "HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse: %v", err)
+	}
+	sha = strings.TrimSpace(string(out))
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-symlink-escape"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	fallbackPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "fallback-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Run: "echo fallback"}}},
+		},
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s, WithHostFallback(fallbackPipeline))
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on symlink escape")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called: fallback should NOT trigger on symlink escape")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CloneFailure_DoesNotFallback(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-clone-fail"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	fallbackPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "fallback-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Run: "echo fallback"}}},
+		},
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s, WithHostFallback(fallbackPipeline))
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       "file:///non/existent/path/repo.git",
+			CommitSHA: "1111111111111111111111111111111111111111",
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on clone error")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called on clone error")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CircularDependencyInRepoConfig(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: cycle-pipeline
+jobs:
+  - name: job-a
+    image: alpine:latest
+    depends_on: [job-b]
+    steps:
+      - name: s1
+        run: echo a
+  - name: job-b
+    image: alpine:latest
+    depends_on: [job-a]
+    steps:
+      - name: s2
+        run: echo b
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-cycle"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "cycle-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "cycle-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on circular dependency")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+
+	jobs, _ := s.GetRunJobs(context.Background(), runID)
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs registered when DAG validation fails, got %d", len(jobs))
+	}
+}
+
+func TestDynamicScheduler_EmptyResolvedPipelineFails(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: empty-pipeline
+jobs: []
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-empty-resolved"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "empty-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "empty-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on empty resolved pipeline")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+type failBatchStoreWrapper struct {
+	store.Store
+	failCreateRunJobs bool
+}
+
+func (w *failBatchStoreWrapper) CreateRunJobs(ctx context.Context, runID string, jobs []*drevtypes.RunJob) error {
+	if w.failCreateRunJobs {
+		return errors.New("simulated batch registration database failure")
+	}
+	return w.Store.CreateRunJobs(ctx, runID, jobs)
+}
+
+func TestDynamicScheduler_BatchRegistrationFailure_RollbackAndNoRunnerCall(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: batch-fail-test
+jobs:
+  - name: job-1
+    image: alpine:latest
+    steps:
+      - name: s1
+        run: echo 1
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	realStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer realStore.Close()
+
+	wrappedStore := &failBatchStoreWrapper{
+		Store:             realStore,
+		failCreateRunJobs: true,
+	}
+
+	runID := "run-batch-fail"
+	if err := realStore.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "batch-fail-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, wrappedStore)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "batch-fail-test",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail when CreateRunJobs fails")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called when CreateRunJobs failed")
+	}
+
+	storedRun, _ := realStore.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+
+	jobs, _ := realStore.GetRunJobs(context.Background(), runID)
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs in DB, got %d", len(jobs))
+	}
+}
+
+func TestDynamicScheduler_CaseD_InconsistentBootstrapFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-d"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := s.CreateRunJob(context.Background(), &drevtypes.RunJob{
+		ID:      "rj-unexpected",
+		RunID:   runID,
+		JobName: "unexpected-job",
+		Status:  drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       "https://github.com/drevci/test.git",
+			CommitSHA: "1111111111111111111111111111111111111111",
+		},
+		Jobs: nil,
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on inconsistent bootstrap (Case D)")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CaseF_EmptyPipelineNoSourceFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-f"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "empty",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	emptyPipeline := &drevtypes.Pipeline{
+		Name:   "empty",
+		Source: drevtypes.Source{},
+		Jobs:   nil,
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), emptyPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on empty invalid pipeline (Case F)")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CaseB_MismatchedPersistedRecordsFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-b-mismatch"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if err := s.CreateRunJob(context.Background(), &drevtypes.RunJob{
+		ID:      "rj-1",
+		RunID:   runID,
+		JobName: "job-1",
+		Status:  drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	pipeline := &drevtypes.Pipeline{
+		Name: "p1",
+		Jobs: []drevtypes.Job{
+			{Name: "job-1", Steps: []drevtypes.Step{{Run: "echo 1"}}},
+			{Name: "job-2", Steps: []drevtypes.Step{{Run: "echo 2"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on mismatched persisted records")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CaseB_DuplicateOrUnexpectedPersistedRecordsFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-case-b-unexpected"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	// Unexpected job name "job-unexpected"
+	if err := s.CreateRunJob(context.Background(), &drevtypes.RunJob{
+		ID:      "rj-unexp",
+		RunID:   runID,
+		JobName: "job-unexpected",
+		Status:  drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	pipeline := &drevtypes.Pipeline{
+		Name: "p1",
+		Jobs: []drevtypes.Job{
+			{Name: "job-1", Steps: []drevtypes.Step{{Run: "echo 1"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on unexpected persisted job record")
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_CloneCancellation(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: cancel-test
+jobs:
+  - name: j1
+    image: alpine:latest
+    steps:
+      - name: s1
+        run: echo 1
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-clone-cancel"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "cancel-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	sched := New(&mockRunner{}, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "cancel-test",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(ctx, bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusCancelled {
+		t.Fatalf("expected StatusCancelled, got %v", storedRun.Status)
+	}
+}
+
+type failStatusStoreWrapper struct {
+	store.Store
+	failStatus drevtypes.RunStatus
+}
+
+func (w *failStatusStoreWrapper) UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
+	if status == w.failStatus {
+		return errors.New("simulated UpdateRunStatus failure")
+	}
+	return w.Store.UpdateRunStatus(ctx, id, status)
+}
+
+func TestDynamicScheduler_StatusUpdateFailurePreservesBothErrors(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	realStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer realStore.Close()
+
+	wrappedStore := &failStatusStoreWrapper{
+		Store:      realStore,
+		failStatus: drevtypes.StatusFailed,
+	}
+
+	runID := "run-status-join"
+	if err := realStore.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	sched := New(&mockRunner{}, wrappedStore)
+	emptyPipeline := &drevtypes.Pipeline{
+		Name:   "empty",
+		Source: drevtypes.Source{},
+		Jobs:   nil,
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), emptyPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail")
+	}
+
+	if !strings.Contains(err.Error(), "invalid pipeline") {
+		t.Errorf("expected original error in returned error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "simulated UpdateRunStatus failure") {
+		t.Errorf("expected status update error in returned error, got: %v", err)
+	}
+}
+
+func TestDynamicScheduler_DirectInMemoryWithoutPreRegisteredRecords(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-direct-in-memory"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "direct-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	executed := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			if job.Name == "in-mem-job" {
+				executed = true
+			}
+			return nil
+		},
+	}
+
+	sched := New(mr, s)
+	pipeline := &drevtypes.Pipeline{
+		Name:   "direct-pipeline",
+		Source: drevtypes.Source{},
+		Jobs: []drevtypes.Job{
+			{Name: "in-mem-job", Steps: []drevtypes.Step{{Name: "s1", Run: "echo direct"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := sched.RunPipeline(context.Background(), pipeline, runID, &buf); err != nil {
+		t.Fatalf("RunPipeline failed: %v", err)
+	}
+
+	if !executed {
+		t.Error("expected in-mem-job to be executed")
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected 1 job registered in DB, got %d", len(jobs))
+	}
+	if jobs[0].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected job StatusSuccess, got %s", jobs[0].Status)
+	}
+
+	storedRun, _ := s.GetRun(context.Background(), runID)
+	if storedRun.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected run StatusSuccess, got %s", storedRun.Status)
+	}
+}
+
+type timeoutStoreWrapper struct {
+	store.Store
+	mu        sync.Mutex
+	failFirst bool
+}
+
+func (w *timeoutStoreWrapper) GetRun(ctx context.Context, id string) (*drevtypes.Run, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failFirst {
+		w.failFirst = false
+		return nil, fmt.Errorf("simulated timeout: %w", context.DeadlineExceeded)
+	}
+	return w.Store.GetRun(ctx, id)
+}
+
+func TestDynamicScheduler_IndependentDeadlineExceeded_ActiveContext(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	realStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer realStore.Close()
+
+	wrappedStore := &timeoutStoreWrapper{
+		Store:     realStore,
+		failFirst: true,
+	}
+
+	runID := "run-deadline-active-ctx"
+	if err := realStore.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "timeout-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, wrappedStore)
+	pipeline := &drevtypes.Pipeline{
+		Name: "timeout-test",
+		Jobs: []drevtypes.Job{
+			{Name: "j1", Image: "alpine:latest", Steps: []drevtypes.Step{{Name: "s1", Run: "echo 1"}}},
+		},
+	}
+
+	parentCtx := context.Background() // parent context is active (parentCtx.Err() == nil)
+	var buf bytes.Buffer
+	err = sched.RunPipeline(parentCtx, pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on simulated deadline exceeded error")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called")
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected error to wrap context.DeadlineExceeded, got: %v", err)
+	}
+
+	storedRun, err := realStore.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusCancelled {
+		t.Fatalf("expected run status StatusCancelled, got: %s", storedRun.Status)
+	}
+}
+
+type failGetRunStoreWrapper struct {
+	store.Store
+	err error
+}
+
+func (w *failGetRunStoreWrapper) GetRun(ctx context.Context, id string) (*drevtypes.Run, error) {
+	return nil, w.err
+}
+
+func TestDynamicScheduler_RunLookupFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	realStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer realStore.Close()
+
+	lookupErr := errors.New("simulated fatal disk error during GetRun")
+	wrappedStore := &failGetRunStoreWrapper{
+		Store: realStore,
+		err:   lookupErr,
+	}
+
+	runID := "run-lookup-fail"
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, wrappedStore)
+	pipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "j1", Image: "alpine:latest", Steps: []drevtypes.Step{{Name: "s1", Run: "echo 1"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail when GetRun fails")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called when GetRun failed")
+	}
+
+	if !strings.Contains(err.Error(), "loading run from database") {
+		t.Errorf("expected error to mention 'loading run from database', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "checking run status before finalization") {
+		t.Errorf("expected error to preserve second lookup failure via errors.Join, got: %v", err)
+	}
+}
+
+type failGetRunJobsStoreWrapper struct {
+	store.Store
+	err error
+}
+
+func (w *failGetRunJobsStoreWrapper) GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error) {
+	return nil, w.err
+}
+
+func TestDynamicScheduler_RunJobsLookupFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	realStore, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer realStore.Close()
+
+	jobsLookupErr := errors.New("simulated fatal disk error during GetRunJobs")
+	wrappedStore := &failGetRunJobsStoreWrapper{
+		Store: realStore,
+		err:   jobsLookupErr,
+	}
+
+	runID := "run-jobs-lookup-fail"
+	if err := realStore.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, wrappedStore)
+	pipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "j1", Image: "alpine:latest", Steps: []drevtypes.Step{{Name: "s1", Run: "echo 1"}}},
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail when GetRunJobs fails")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called when GetRunJobs failed")
+	}
+
+	if !strings.Contains(err.Error(), "loading run jobs from database") {
+		t.Errorf("expected error to mention 'loading run jobs from database', got: %v", err)
+	}
+
+	storedRun, err := realStore.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("getting stored run: %v", err)
+	}
+	if storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected run status to be finalized as StatusFailed, got: %s", storedRun.Status)
+	}
+}
+
+func TestDynamicScheduler_WorkspaceCleanupAfterPreparationFailure(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `::: malformed yaml syntax :::`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-workspace-cleanup"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	beforeMatches, err := filepath.Glob(filepath.Join(os.TempDir(), "drev-workspace-*"))
+	if err != nil {
+		t.Fatalf("glob temp dir: %v", err)
+	}
+	beforeSet := make(map[string]bool, len(beforeMatches))
+	for _, m := range beforeMatches {
+		beforeSet[m] = true
+	}
+
+	sched := New(&mockRunner{}, s)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on malformed config")
+	}
+
+	afterMatches, err := filepath.Glob(filepath.Join(os.TempDir(), "drev-workspace-*"))
+	if err != nil {
+		t.Fatalf("glob temp dir: %v", err)
+	}
+
+	for _, m := range afterMatches {
+		if !beforeSet[m] {
+			t.Fatalf("leaked workspace directory found after preparation failure: %s", m)
+		}
+	}
+}
+
+func TestDynamicScheduler_InvalidStepConfig_DoesNotFallback(t *testing.T) {
+	repoDir, sha := createTestGitRepo(t, map[string]string{
+		".drev.yml": `name: invalid-step-pipeline
+jobs:
+  - name: test-job
+    image: alpine:latest
+    steps:
+      - name: step-missing-run
+`,
+	})
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	runID := "run-invalid-step"
+	if err := s.CreateRun(context.Background(), &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test-pipeline",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	fallbackPipeline := &drevtypes.Pipeline{
+		Name: "fallback-pipeline",
+		Jobs: []drevtypes.Job{
+			{Name: "fallback-job", Image: "alpine:latest", Steps: []drevtypes.Step{{Name: "s1", Run: "echo fallback"}}},
+		},
+	}
+
+	runnerCalled := false
+	mr := &mockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			runnerCalled = true
+			return nil
+		},
+	}
+
+	sched := New(mr, s, WithHostFallback(fallbackPipeline))
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       repoDir,
+			CommitSHA: sha,
+		},
+	}
+
+	var buf bytes.Buffer
+	err = sched.RunPipeline(context.Background(), bootstrapPipeline, runID, &buf)
+	if err == nil {
+		t.Fatal("expected RunPipeline to fail on invalid step configuration")
+	}
+
+	if runnerCalled {
+		t.Error("runner was unexpectedly called: fallback should NOT trigger on invalid step config")
+	}
+
+	storedRun, err := s.GetRun(context.Background(), runID)
+	if err != nil || storedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected StatusFailed, got %v", storedRun.Status)
+	}
+
+	jobs, err := s.GetRunJobs(context.Background(), runID)
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("expected 0 registered jobs in DB when step validation fails, got %d", len(jobs))
+	}
+}
+
+func TestDynamicScheduler_UnreadableConfig_DoesNotFallback(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("skipping test: running as root (file permission restrictions do not apply)")
+	}
+
+	// Git clone creates files with standard permissions (0644/0755) and cannot check out mode 0000 files.
+	// In the dynamic scheduler lifecycle, workspace creation and clone occur atomically within RunPipeline
+	// before config resolution, without an interception hook to chmod files between clone and resolve.
+	// Direct unreadable config handling (bypassing fallback) is independently verified in
+	// internal/workspace/config_test.go (TestResolveConfig_UnreadableFile_BypassesFallback).
+	t.Skip("skipping test: git clone normalizes file permissions to 0644/0755 and cannot check out unreadable (mode 0000) files without post-clone filesystem interception")
+}
+
+func TestDynamicScheduler_AlreadyTerminalStatusPreserved(t *testing.T) {
+	terminalStatuses := []drevtypes.RunStatus{
+		drevtypes.StatusCancelled,
+		drevtypes.StatusFailed,
+		drevtypes.StatusSuccess,
+	}
+
+	for _, initialStatus := range terminalStatuses {
+		t.Run(string(initialStatus), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "test.db")
+			s, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer s.Close()
+
+			runID := "run-term-" + string(initialStatus)
+			if err := s.CreateRun(context.Background(), &drevtypes.Run{
+				ID:         runID,
+				PipelineID: "term-pipeline",
+				Status:     initialStatus,
+			}); err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+
+			runnerCalled := false
+			mr := &mockRunner{
+				runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+					runnerCalled = true
+					return nil
+				},
+			}
+
+			sched := New(mr, s)
+			pipeline := &drevtypes.Pipeline{
+				Name: "term-pipeline",
+				Jobs: []drevtypes.Job{
+					{Name: "j1", Image: "alpine:latest", Steps: []drevtypes.Step{{Name: "s1", Run: "echo 1"}}},
+				},
+			}
+
+			var buf bytes.Buffer
+			err = sched.RunPipeline(context.Background(), pipeline, runID, &buf)
+			if err == nil {
+				t.Fatalf("expected RunPipeline to fail for run already in status %s, got nil", initialStatus)
+			}
+
+			if runnerCalled {
+				t.Errorf("runner was called for run in terminal status %s", initialStatus)
+			}
+
+			storedRun, err := s.GetRun(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("getting stored run: %v", err)
+			}
+			if storedRun.Status != initialStatus {
+				t.Fatalf("terminal status was overwritten! expected %s, got %s", initialStatus, storedRun.Status)
+			}
+		})
+	}
 }

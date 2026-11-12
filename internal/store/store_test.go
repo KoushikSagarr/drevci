@@ -1742,3 +1742,398 @@ func TestStore_FailRunWithDelivery_ScopedToRun(t *testing.T) {
 		t.Errorf("run B should still be pending, got: %s", runBCheck.Status)
 	}
 }
+
+func TestSQLiteStore_CreateRunJobs_Success(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "batch_success.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Seed run
+	runID := "run-batch-001"
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "pipe-batch-1",
+		Status:     drevtypes.StatusRunning,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:         "job-b-1",
+			RunID:      runID,
+			JobName:    "build",
+			Status:     drevtypes.StatusRunning,
+			StartedAt:  now,
+			FinishedAt: now.Add(time.Minute),
+		},
+		{
+			ID:      "job-b-2",
+			RunID:   runID,
+			JobName: "test",
+			Status:  drevtypes.StatusPending,
+		},
+		{
+			ID:      "job-b-3",
+			RunID:   runID,
+			JobName: "deploy",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if len(gotJobs) != 3 {
+		t.Fatalf("expected 3 jobs, got %d", len(gotJobs))
+	}
+
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range gotJobs {
+		jobMap[j.ID] = j
+	}
+
+	// Verify job 1 timestamps and status
+	j1, ok := jobMap["job-b-1"]
+	if !ok {
+		t.Fatalf("job-b-1 not found in store")
+	}
+	if j1.JobName != "build" || j1.Status != drevtypes.StatusRunning {
+		t.Errorf("job-b-1 mismatch: %+v", j1)
+	}
+	if !j1.StartedAt.Equal(now) {
+		t.Errorf("expected StartedAt %v, got %v", now, j1.StartedAt)
+	}
+	if !j1.FinishedAt.Equal(now.Add(time.Minute)) {
+		t.Errorf("expected FinishedAt %v, got %v", now.Add(time.Minute), j1.FinishedAt)
+	}
+
+	// Verify job 2 and 3
+	j2, ok := jobMap["job-b-2"]
+	if !ok || j2.JobName != "test" || j2.Status != drevtypes.StatusPending {
+		t.Errorf("job-b-2 mismatch: %+v", j2)
+	}
+	j3, ok := jobMap["job-b-3"]
+	if !ok || j3.JobName != "deploy" || j3.Status != drevtypes.StatusPending {
+		t.Errorf("job-b-3 mismatch: %+v", j3)
+	}
+}
+
+func TestSQLiteStore_CreateRunJobs_DefaultPendingStatus(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "batch_default_status.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	runID := "run-batch-def"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p1", Status: drevtypes.StatusRunning}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:      "job-empty-status",
+			RunID:   runID,
+			JobName: "lint",
+			Status:  "", // Empty status should default to StatusPending
+		},
+	}
+
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(gotJobs) != 1 {
+		t.Fatalf("expected 1 job, got %d (err: %v)", len(gotJobs), err)
+	}
+	if gotJobs[0].Status != drevtypes.StatusPending {
+		t.Errorf("expected default status StatusPending, got %s", gotJobs[0].Status)
+	}
+}
+
+func TestSQLiteStore_CreateRunJobs_ValidationErrors(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "batch_validation.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	runID := "run-valid-1"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p1", Status: drevtypes.StatusPending}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		runID       string
+		jobs        []*drevtypes.RunJob
+		errContains string
+	}{
+		{
+			name:        "blank runID empty string",
+			runID:       "",
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: "", JobName: "build"}},
+			errContains: "runID cannot be empty",
+		},
+		{
+			name:        "blank runID whitespace only",
+			runID:       "   ",
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: "   ", JobName: "build"}},
+			errContains: "runID cannot be empty",
+		},
+		{
+			name:        "nil jobs slice",
+			runID:       runID,
+			jobs:        nil,
+			errContains: "jobs slice cannot be nil",
+		},
+		{
+			name:        "empty jobs slice",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{},
+			errContains: "jobs slice cannot be empty",
+		},
+		{
+			name:        "nil job entry at index 0",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{nil},
+			errContains: "cannot be nil",
+		},
+		{
+			name:        "nil job entry at index 1",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: runID, JobName: "b"}, nil},
+			errContains: "cannot be nil",
+		},
+		{
+			name:        "blank job ID",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{{ID: "  ", RunID: runID, JobName: "b"}},
+			errContains: "blank ID",
+		},
+		{
+			name:        "blank job name",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: runID, JobName: "  "}},
+			errContains: "blank JobName",
+		},
+		{
+			name:        "mismatched job RunID",
+			runID:       runID,
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: "different-run-id", JobName: "b"}},
+			errContains: "mismatched RunID",
+		},
+		{
+			name:  "duplicate job ID within batch",
+			runID: runID,
+			jobs: []*drevtypes.RunJob{
+				{ID: "dup-id", RunID: runID, JobName: "build"},
+				{ID: "dup-id", RunID: runID, JobName: "test"},
+			},
+			errContains: "duplicate job ID",
+		},
+		{
+			name:  "duplicate job name within batch",
+			runID: runID,
+			jobs: []*drevtypes.RunJob{
+				{ID: "j1", RunID: runID, JobName: "same-name"},
+				{ID: "j2", RunID: runID, JobName: "same-name"},
+			},
+			errContains: "duplicate job name",
+		},
+		{
+			name:        "nonexistent run ID",
+			runID:       "run-does-not-exist",
+			jobs:        []*drevtypes.RunJob{{ID: "j1", RunID: "run-does-not-exist", JobName: "build"}},
+			errContains: "not found",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := s.CreateRunJobs(ctx, tc.runID, tc.jobs)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.errContains)
+			}
+			if !strings.Contains(err.Error(), tc.errContains) {
+				t.Errorf("expected error containing %q, got: %v", tc.errContains, err)
+			}
+		})
+	}
+
+	// Verify valid run still has 0 jobs
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if len(gotJobs) != 0 {
+		t.Errorf("expected 0 jobs in valid run after validation failures, got %d", len(gotJobs))
+	}
+}
+
+func TestSQLiteStore_CreateRunJobs_Atomicity_RollbackOnConstraintFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "batch_rollback.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	runID := "run-rb-atomic-1"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p-rb", Status: drevtypes.StatusRunning}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// 1. Seed an existing job into the database
+	seededJobID := "job-seeded-001"
+	if err := s.CreateRunJob(ctx, &drevtypes.RunJob{
+		ID:      seededJobID,
+		RunID:   runID,
+		JobName: "setup",
+		Status:  drevtypes.StatusSuccess,
+	}); err != nil {
+		t.Fatalf("CreateRunJob(seeded): %v", err)
+	}
+
+	// Verify seeded job exists
+	initialJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(initialJobs) != 1 {
+		t.Fatalf("expected 1 seeded job, got %d (err: %v)", len(initialJobs), err)
+	}
+
+	// 2. Submit a batch whose first job has a NEW ID and second job reuses seededJobID
+	// Pre-validation passes because within the batch IDs and names are unique!
+	newJobID := "job-new-transient-001"
+	failingBatch := []*drevtypes.RunJob{
+		{
+			ID:      newJobID,
+			RunID:   runID,
+			JobName: "build-step",
+			Status:  drevtypes.StatusPending,
+		},
+		{
+			ID:      seededJobID, // Reuses existing ID in DB -> causes PK constraint failure in DB
+			RunID:   runID,
+			JobName: "test-step",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+
+	err = s.CreateRunJobs(ctx, runID, failingBatch)
+	if err == nil {
+		t.Fatal("expected database constraint error on duplicate job ID, got nil")
+	}
+
+	// 3. PROVE ROLLBACK: newJobID must NOT exist in the database!
+	afterRollbackJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs after rollback: %v", err)
+	}
+	if len(afterRollbackJobs) != 1 {
+		t.Fatalf("expected exactly 1 job remaining after rollback, found %d", len(afterRollbackJobs))
+	}
+	if afterRollbackJobs[0].ID != seededJobID {
+		t.Errorf("expected only seeded job %s, found %s", seededJobID, afterRollbackJobs[0].ID)
+	}
+
+	// Direct query via separate connection to verify job-new-transient-001 is completely absent
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer rawDB.Close()
+
+	var count int
+	row := rawDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_jobs WHERE id = ?`, newJobID)
+	if err := row.Scan(&count); err != nil {
+		t.Fatalf("querying for rolled-back job: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("job %s was not rolled back! found in database (count=%d)", newJobID, count)
+	}
+
+	// 4. Retry with valid jobs succeeds after rollback
+	validBatch := []*drevtypes.RunJob{
+		{
+			ID:      newJobID,
+			RunID:   runID,
+			JobName: "build-step",
+			Status:  drevtypes.StatusPending,
+		},
+		{
+			ID:      "job-new-valid-002",
+			RunID:   runID,
+			JobName: "test-step",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+
+	if err := s.CreateRunJobs(ctx, runID, validBatch); err != nil {
+		t.Fatalf("retry CreateRunJobs failed: %v", err)
+	}
+
+	finalJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs after retry: %v", err)
+	}
+	if len(finalJobs) != 3 {
+		t.Fatalf("expected 3 total jobs after retry, found %d", len(finalJobs))
+	}
+}
+
+func TestSQLiteStore_CreateRunJob_Compatible(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "single_job_compat.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	runID := "run-single-compat"
+	if err := s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p-compat", Status: drevtypes.StatusRunning}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	job := &drevtypes.RunJob{
+		ID:      "single-j1",
+		RunID:   runID,
+		JobName: "compile",
+		Status:  drevtypes.StatusPending,
+	}
+
+	if err := s.CreateRunJob(ctx, job); err != nil {
+		t.Fatalf("CreateRunJob: %v", err)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(gotJobs) != 1 {
+		t.Fatalf("expected 1 job, got %d (err: %v)", len(gotJobs), err)
+	}
+	if gotJobs[0].ID != "single-j1" || gotJobs[0].JobName != "compile" {
+		t.Errorf("job mismatch: %+v", gotJobs[0])
+	}
+}

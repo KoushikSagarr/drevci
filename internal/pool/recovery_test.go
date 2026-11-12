@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
@@ -28,15 +30,23 @@ func TestOutboxRecoverer_Success(t *testing.T) {
 
 	ctx := context.Background()
 
-	spec := `
-name: pipeline-recover
-jobs:
-  - name: test-job
-    image: alpine
-    steps:
-      - name: step1
-        run: echo ok
-`
+	pipeline := &drevtypes.Pipeline{
+		Name: "pipeline-recover",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "test-job",
+				Image: "alpine",
+				Steps: []drevtypes.Step{
+					{Name: "step1", Run: "echo ok"},
+				},
+			},
+		},
+	}
+	specBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	spec := string(specBytes)
 
 	// Seed 3 pending runs in outbox
 	for i := 1; i <= 3; i++ {
@@ -105,15 +115,23 @@ func TestOutboxRecoverer_QueueFull_NoLoss(t *testing.T) {
 
 	ctx := context.Background()
 
-	spec := `
-name: pipeline-full
-jobs:
-  - name: job1
-    image: alpine
-    steps:
-      - name: s
-        run: echo hi
-`
+	pipeline := &drevtypes.Pipeline{
+		Name: "pipeline-full",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "job1",
+				Image: "alpine",
+				Steps: []drevtypes.Step{
+					{Name: "s", Run: "echo hi"},
+				},
+			},
+		},
+	}
+	specBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	spec := string(specBytes)
 
 	// Seed 5 pending outbox items
 	for i := 1; i <= 5; i++ {
@@ -182,15 +200,23 @@ func TestOutboxRecoverer_Cancellation(t *testing.T) {
 	}
 	defer s.Close()
 
-	spec := `
-name: pipeline-cancel
-jobs:
-  - name: j
-    image: alpine
-    steps:
-      - name: s
-        run: echo ok
-`
+	pipeline := &drevtypes.Pipeline{
+		Name: "pipeline-cancel",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "j",
+				Image: "alpine",
+				Steps: []drevtypes.Step{
+					{Name: "s", Run: "echo ok"},
+				},
+			},
+		},
+	}
+	specBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	spec := string(specBytes)
 	ctx := context.Background()
 	for i := 1; i <= 3; i++ {
 		runID := fmt.Sprintf("run-c-%d", i)
@@ -510,5 +536,421 @@ func TestOutboxRecoverer_PreservesPRMetadata(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected job to be readable from queue")
+	}
+}
+
+func TestOutboxRecoverer_BootstrapSpec_ZeroJobs_Success(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recovery_bootstrap_zero_jobs.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Bootstrap specification intentionally has no jobs (worker will discover them after checkout)
+	bootstrapPipeline := &drevtypes.Pipeline{
+		Name: "octocat/hello-world",
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       "https://github.com/octocat/hello-world.git",
+			Ref:       "refs/heads/feature-bootstrap",
+			CommitSHA: "b1b2c3d4e5f678901234567890abcdef12345678",
+			PRNumber:  42,
+		},
+		Jobs: nil, // Zero jobs
+	}
+
+	specBytes, err := json.Marshal(bootstrapPipeline)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	runID := "run-bootstrap-zero-jobs-1"
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-bootstrap-1",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		PRNumber:   42,
+		RunID:      runID,
+	}
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: bootstrapPipeline.Name,
+		Status:     drevtypes.StatusPending,
+		CommitSHA:  bootstrapPipeline.Source.CommitSHA,
+		Branch:     "feature-bootstrap",
+	}
+
+	// Persist to outbox with zero run jobs
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, string(specBytes)); err != nil {
+		t.Fatalf("CreateRunWithDelivery: %v", err)
+	}
+
+	q := queue.New(10)
+	recoverer := NewOutboxRecoverer(s, q, nil)
+
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("recoverer.Recover failed: %v", err)
+	}
+
+	if q.Depth() != 1 {
+		t.Fatalf("expected 1 job enqueued, got %d", q.Depth())
+	}
+
+	select {
+	case job := <-q.Drain():
+		if job.RunID != runID {
+			t.Errorf("expected RunID %s, got %s", runID, job.RunID)
+		}
+		if len(job.Pipeline.Jobs) != 0 {
+			t.Errorf("expected 0 jobs in recovered bootstrap pipeline, got %d", len(job.Pipeline.Jobs))
+		}
+		if job.Pipeline.Name != bootstrapPipeline.Name {
+			t.Errorf("expected Name %s, got %s", bootstrapPipeline.Name, job.Pipeline.Name)
+		}
+		if job.Pipeline.Source.URL != bootstrapPipeline.Source.URL {
+			t.Errorf("expected Source.URL %s, got %s", bootstrapPipeline.Source.URL, job.Pipeline.Source.URL)
+		}
+		if job.Pipeline.Source.Ref != bootstrapPipeline.Source.Ref {
+			t.Errorf("expected Source.Ref %s, got %s", bootstrapPipeline.Source.Ref, job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.CommitSHA != bootstrapPipeline.Source.CommitSHA {
+			t.Errorf("expected Source.CommitSHA %s, got %s", bootstrapPipeline.Source.CommitSHA, job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.PRNumber != bootstrapPipeline.Source.PRNumber {
+			t.Errorf("expected Source.PRNumber %d, got %d", bootstrapPipeline.Source.PRNumber, job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected job to be in queue")
+	}
+}
+
+func TestOutboxRecoverer_InvalidBootstrapSource_Rejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		pipeline *drevtypes.Pipeline
+	}{
+		{
+			name: "empty source URL",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL: "",
+					Ref: "main",
+				},
+			},
+		},
+		{
+			name: "option-like source URL",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL: "--upload-pack=evil",
+					Ref: "main",
+				},
+			},
+		},
+		{
+			name: "option-like source ref",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL: "https://github.com/octocat/hello-world.git",
+					Ref: "--flag",
+				},
+			},
+		},
+		{
+			name: "option-like commit SHA",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:       "https://github.com/octocat/hello-world.git",
+					CommitSHA: "-b1b2c3d4e5f678901234567890abcdef12345678",
+				},
+			},
+		},
+		{
+			name: "short commit SHA",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:       "https://github.com/octocat/hello-world.git",
+					CommitSHA: "1234567",
+				},
+			},
+		},
+		{
+			name: "non-hex commit SHA",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:       "https://github.com/octocat/hello-world.git",
+					CommitSHA: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+				},
+			},
+		},
+		{
+			name: "negative PR number",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:      "https://github.com/octocat/hello-world.git",
+					Ref:      "main",
+					PRNumber: -1,
+				},
+			},
+		},
+		{
+			name: "URL present but both Ref and CommitSHA empty",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL: "https://github.com/octocat/hello-world.git",
+				},
+			},
+		},
+		{
+			name: "PRNumber > 0 with empty CommitSHA",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:      "https://github.com/octocat/hello-world.git",
+					Ref:      "feature-branch",
+					PRNumber: 42,
+				},
+			},
+		},
+		{
+			name: "PRNumber > 0 with malformed CommitSHA",
+			pipeline: &drevtypes.Pipeline{
+				Name: "test-pipeline",
+				Source: drevtypes.Source{
+					URL:       "https://github.com/octocat/hello-world.git",
+					Ref:       "feature-branch",
+					CommitSHA: "not-a-valid-sha",
+					PRNumber:  42,
+				},
+			},
+		},
+		{
+			name: "empty pipeline name",
+			pipeline: &drevtypes.Pipeline{
+				Name: "",
+				Source: drevtypes.Source{
+					URL: "https://github.com/octocat/hello-world.git",
+					Ref: "main",
+				},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "invalid_bootstrap.db")
+			s, err := store.Open(dbPath)
+			if err != nil {
+				t.Fatalf("store.Open: %v", err)
+			}
+			defer s.Close()
+
+			ctx := context.Background()
+			specBytes, err := json.Marshal(tc.pipeline)
+			if err != nil {
+				t.Fatalf("json.Marshal: %v", err)
+			}
+
+			runID := "run-invalid-" + strings.ReplaceAll(tc.name, " ", "-")
+			del := &drevtypes.WebhookDelivery{
+				DeliveryID: "del-invalid-" + strings.ReplaceAll(tc.name, " ", "-"),
+				EventType:  "pull_request",
+				Repo:       "octocat/hello-world",
+				RunID:      runID,
+			}
+			run := &drevtypes.Run{
+				ID:         runID,
+				PipelineID: tc.pipeline.Name,
+				Status:     drevtypes.StatusPending,
+			}
+
+			if err := s.CreateRunWithDelivery(ctx, del, run, nil, string(specBytes)); err != nil {
+				t.Fatalf("CreateRunWithDelivery: %v", err)
+			}
+
+			q := queue.New(10)
+			recoverer := NewOutboxRecoverer(s, q, nil)
+
+			if err := recoverer.Recover(ctx); err != nil {
+				t.Fatalf("recoverer.Recover failed: %v", err)
+			}
+
+			// Nothing should be enqueued
+			if q.Depth() != 0 {
+				t.Errorf("expected 0 jobs in queue for invalid bootstrap spec, got %d", q.Depth())
+			}
+
+			// Run must be marked StatusFailed in store
+			dbRun, err := s.GetRun(ctx, runID)
+			if err != nil || dbRun == nil {
+				t.Fatalf("failed to get run from store: %v", err)
+			}
+			if dbRun.Status != drevtypes.StatusFailed {
+				t.Errorf("expected run status StatusFailed, got %s", dbRun.Status)
+			}
+
+			// Outbox entry must be cleared so it doesn't endlessly retry
+			outboxAfter, _ := s.GetPendingOutbox(ctx, 10)
+			if len(outboxAfter) != 0 {
+				t.Errorf("expected outbox to be cleared, got %d items", len(outboxAfter))
+			}
+		})
+	}
+}
+
+func TestOutboxRecoverer_CorruptedJSON_FailsSafely(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "corrupted_json.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	corruptedJSON := `{"name": "test", "source": {invalid json`
+
+	runID := "run-corrupted-json-1"
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-corrupted-json-1",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runID,
+	}
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "test",
+		Status:     drevtypes.StatusPending,
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, corruptedJSON); err != nil {
+		t.Fatalf("CreateRunWithDelivery: %v", err)
+	}
+
+	q := queue.New(10)
+	recoverer := NewOutboxRecoverer(s, q, nil)
+
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("recoverer.Recover failed: %v", err)
+	}
+
+	if q.Depth() != 0 {
+		t.Errorf("expected 0 jobs in queue for corrupted JSON, got %d", q.Depth())
+	}
+
+	dbRun, err := s.GetRun(ctx, runID)
+	if err != nil || dbRun == nil {
+		t.Fatalf("failed to get run from store: %v", err)
+	}
+	if dbRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run status StatusFailed, got %s", dbRun.Status)
+	}
+
+	outboxAfter, _ := s.GetPendingOutbox(ctx, 10)
+	if len(outboxAfter) != 0 {
+		t.Errorf("expected outbox to be cleared for corrupted JSON, got %d items", len(outboxAfter))
+	}
+}
+
+func TestOutboxRecoverer_YAMLPayload_RejectedByStrictJSON(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "yaml_payload_rejected.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	// Valid YAML that is NOT valid JSON
+	yamlPayload := `
+name: pipeline-yaml
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: step1
+        run: echo ok
+`
+
+	runID := "run-yaml-rejected-1"
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-yaml-rejected-1",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      runID,
+	}
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "pipeline-yaml",
+		Status:     drevtypes.StatusPending,
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, nil, yamlPayload); err != nil {
+		t.Fatalf("CreateRunWithDelivery: %v", err)
+	}
+
+	q := queue.New(10)
+	recoverer := NewOutboxRecoverer(s, q, nil)
+
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("recoverer.Recover failed: %v", err)
+	}
+
+	if q.Depth() != 0 {
+		t.Errorf("expected 0 jobs in queue for YAML payload, got %d", q.Depth())
+	}
+
+	dbRun, err := s.GetRun(ctx, runID)
+	if err != nil || dbRun == nil {
+		t.Fatalf("failed to get run from store: %v", err)
+	}
+	if dbRun.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run status StatusFailed, got %s", dbRun.Status)
+	}
+
+	outboxAfter, _ := s.GetPendingOutbox(ctx, 10)
+	if len(outboxAfter) != 0 {
+		t.Errorf("expected outbox to be cleared for rejected YAML payload, got %d items", len(outboxAfter))
+	}
+}
+
+func TestNormalParser_StillRejectsZeroJobs(t *testing.T) {
+	// Verify that normal parser.Validate strictly rejects zero-job configurations
+	p := &drevtypes.Pipeline{
+		Name: "test-pipeline",
+		Jobs: nil,
+	}
+
+	err := parser.Validate(p)
+	if err == nil {
+		t.Fatal("expected parser.Validate to reject pipeline with zero jobs, got nil")
+	}
+
+	var parseErr *parser.ParseError
+	if !errors.As(err, &parseErr) {
+		t.Fatalf("expected error to be *parser.ParseError, got %T: %v", err, err)
+	}
+	if parseErr.Field != "jobs" {
+		t.Errorf("expected error Field 'jobs', got %q", parseErr.Field)
+	}
+
+	// Verify parser.ParseBytes also strictly rejects zero-job YAML
+	rawYAML := []byte("name: test-pipeline\njobs: []\n")
+	_, err = parser.ParseBytes(rawYAML)
+	if err == nil {
+		t.Fatal("expected parser.ParseBytes to reject zero-job YAML, got nil")
+	}
+	if !errors.As(err, &parseErr) || parseErr.Field != "jobs" {
+		t.Errorf("expected ParseError on field 'jobs', got %v", err)
 	}
 }

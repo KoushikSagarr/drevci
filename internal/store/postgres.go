@@ -299,6 +299,52 @@ func (s *PostgresStore) CreateRunJob(ctx context.Context, job *drevtypes.RunJob)
 	return err
 }
 
+// CreateRunJobs atomically inserts a batch of jobs for a run in a single transaction in PostgreSQL.
+// If any job insertion or validation fails, zero newly inserted jobs are committed.
+func (s *PostgresStore) CreateRunJobs(ctx context.Context, runID string, jobs []*drevtypes.RunJob) error {
+	if err := validateRunJobsBatch(runID, jobs); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning postgres transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Verify target run exists
+	var exists int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE id = $1`, runID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("run %s not found: %w", runID, sql.ErrNoRows)
+		}
+		return fmt.Errorf("verifying postgres run %s: %w", runID, err)
+	}
+
+	for _, job := range jobs {
+		status := job.Status
+		if status == "" {
+			status = drevtypes.StatusPending
+		}
+
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			job.ID, runID, job.JobName, string(status),
+			pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting postgres run job %s: %w", job.JobName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing postgres transaction: %w", err)
+	}
+	return nil
+}
+
 func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `

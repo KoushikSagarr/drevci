@@ -2,14 +2,18 @@ package pool
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/store"
+	"github.com/drevci/drev/pkg/drevtypes"
 )
 
 // LogStreamerProvider abstracts log stream writer creation for recovered runs.
@@ -75,7 +79,7 @@ func (r *OutboxRecoverer) Recover(ctx context.Context) error {
 			newItemsCount++
 
 			// Parse pipeline spec
-			pipeline, err := parser.ParseBytes([]byte(item.PipelineSpec))
+			pipeline, err := deserializeRecoveredPipeline([]byte(item.PipelineSpec))
 			if err != nil {
 				log.Printf("[recovery] invalid pipeline spec for run %s: %v", item.RunID, err)
 				// Atomically fail run and clear corrupted outbox entry so it doesn't block recovery
@@ -117,6 +121,82 @@ func (r *OutboxRecoverer) Recover(ctx context.Context) error {
 		// all pending outbox entries have been safely submitted to the queue.
 		if newItemsCount == 0 {
 			break
+		}
+	}
+
+	return nil
+}
+
+// deserializeRecoveredPipeline deserializes a persisted pipeline specification from the outbox.
+// It strictly expects standard JSON payloads matching the outbox persistence format.
+// If the pipeline defines jobs (populated spec), it validates structural and semantic correctness
+// using parser.Validate. If the pipeline has zero jobs (bootstrap spec), it validates bootstrap
+// source metadata so the worker can discover jobs after checkout.
+func deserializeRecoveredPipeline(data []byte) (*drevtypes.Pipeline, error) {
+	var p drevtypes.Pipeline
+
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("parsing pipeline spec JSON: %w", err)
+	}
+
+	if strings.TrimSpace(p.Name) == "" {
+		return nil, errors.New("pipeline spec must have a name")
+	}
+
+	if len(p.Jobs) > 0 {
+		// Populated pipeline specification: enforce strict structural and DAG validation
+		if err := parser.Validate(&p); err != nil {
+			return nil, fmt.Errorf("validating populated pipeline spec: %w", err)
+		}
+	} else {
+		// Bootstrap pipeline specification: validate source checkout metadata
+		if err := validateBootstrapSource(p.Source); err != nil {
+			return nil, fmt.Errorf("validating bootstrap source: %w", err)
+		}
+	}
+
+	return &p, nil
+}
+
+// validateBootstrapSource verifies that a bootstrap specification contains valid repository metadata.
+func validateBootstrapSource(src drevtypes.Source) error {
+	rawURL := strings.TrimSpace(src.URL)
+	if rawURL == "" {
+		return errors.New("bootstrap pipeline source URL cannot be empty")
+	}
+	if strings.HasPrefix(rawURL, "-") {
+		return fmt.Errorf("invalid bootstrap source URL %q: cannot start with '-'", rawURL)
+	}
+
+	rawRef := strings.TrimSpace(src.Ref)
+	if strings.HasPrefix(rawRef, "-") {
+		return fmt.Errorf("invalid bootstrap source ref %q: cannot start with '-'", rawRef)
+	}
+
+	rawCommitSHA := strings.TrimSpace(src.CommitSHA)
+	if strings.HasPrefix(rawCommitSHA, "-") {
+		return fmt.Errorf("invalid bootstrap commit SHA %q: cannot start with '-'", rawCommitSHA)
+	}
+	if rawCommitSHA != "" && !drevtypes.IsCommitSHA(rawCommitSHA) {
+		return fmt.Errorf("invalid bootstrap commit SHA %q: must be a 40-character (SHA-1) or 64-character (SHA-256) hexadecimal hash", rawCommitSHA)
+	}
+
+	if src.PRNumber < 0 {
+		return fmt.Errorf("invalid bootstrap PR number %d: cannot be negative", src.PRNumber)
+	}
+
+	// A bootstrap specification must provide at least one usable checkout target
+	if rawRef == "" && rawCommitSHA == "" {
+		return errors.New("bootstrap pipeline source must specify at least one checkout target (Ref or CommitSHA)")
+	}
+
+	// PR pipelines must have a mandatory valid CommitSHA
+	if src.PRNumber > 0 {
+		if rawCommitSHA == "" {
+			return fmt.Errorf("bootstrap PR pipeline (PR #%d) must specify a CommitSHA", src.PRNumber)
+		}
+		if !drevtypes.IsCommitSHA(rawCommitSHA) {
+			return fmt.Errorf("invalid bootstrap commit SHA %q for PR #%d: must be a 40-character (SHA-1) or 64-character (SHA-256) hexadecimal hash", rawCommitSHA, src.PRNumber)
 		}
 	}
 

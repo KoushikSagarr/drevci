@@ -60,6 +60,7 @@ type Store interface {
 	ListRuns(ctx context.Context, limit int) ([]*drevtypes.Run, error)
 	ListRunsByOrg(ctx context.Context, orgID string, limit int) ([]*drevtypes.Run, error)
 	CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error
+	CreateRunJobs(ctx context.Context, runID string, jobs []*drevtypes.RunJob) error
 	UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
@@ -528,6 +529,94 @@ func (s *SQLiteStore) CreateRunJob(ctx context.Context, job *drevtypes.RunJob) e
 		nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
 	)
 	return err
+}
+
+// validateRunJobsBatch validates the batch parameters for CreateRunJobs.
+func validateRunJobsBatch(runID string, jobs []*drevtypes.RunJob) error {
+	if strings.TrimSpace(runID) == "" {
+		return errors.New("runID cannot be empty")
+	}
+	if jobs == nil {
+		return errors.New("jobs slice cannot be nil")
+	}
+	if len(jobs) == 0 {
+		return errors.New("jobs slice cannot be empty")
+	}
+
+	seenIDs := make(map[string]bool, len(jobs))
+	seenNames := make(map[string]bool, len(jobs))
+
+	for i, job := range jobs {
+		if job == nil {
+			return fmt.Errorf("job at index %d cannot be nil", i)
+		}
+		if strings.TrimSpace(job.ID) == "" {
+			return fmt.Errorf("job at index %d has blank ID", i)
+		}
+		if strings.TrimSpace(job.JobName) == "" {
+			return fmt.Errorf("job at index %d has blank JobName", i)
+		}
+		if job.RunID != runID {
+			return fmt.Errorf("job %s has mismatched RunID: expected %s, got %s", job.ID, runID, job.RunID)
+		}
+		if seenIDs[job.ID] {
+			return fmt.Errorf("duplicate job ID %s in batch", job.ID)
+		}
+		seenIDs[job.ID] = true
+
+		if seenNames[job.JobName] {
+			return fmt.Errorf("duplicate job name %s in batch", job.JobName)
+		}
+		seenNames[job.JobName] = true
+	}
+
+	return nil
+}
+
+// CreateRunJobs atomically inserts a batch of jobs for a run in a single transaction.
+// If any job insertion or validation fails, zero newly inserted jobs are committed.
+func (s *SQLiteStore) CreateRunJobs(ctx context.Context, runID string, jobs []*drevtypes.RunJob) error {
+	if err := validateRunJobsBatch(runID, jobs); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning sqlite transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Verify target run exists
+	var exists int
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE id = ?`, runID).Scan(&exists)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("run %s not found: %w", runID, sql.ErrNoRows)
+		}
+		return fmt.Errorf("verifying run %s: %w", runID, err)
+	}
+
+	for _, job := range jobs {
+		status := job.Status
+		if status == "" {
+			status = drevtypes.StatusPending
+		}
+
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			job.ID, runID, job.JobName, string(status),
+			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting run job %s: %w", job.JobName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing sqlite transaction: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
