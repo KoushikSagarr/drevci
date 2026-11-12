@@ -133,6 +133,507 @@ func TestClone_InvalidURL(t *testing.T) {
 	}
 }
 
+func createMultiCommitRepo(t *testing.T) (repoDir string, commit1 string, commit2 string) {
+	t.Helper()
+
+	repo := filepath.Join(t.TempDir(), "source")
+	if err := os.MkdirAll(filepath.Join(repo, "hello"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	gitCmd := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+		return strings.TrimSpace(string(output))
+	}
+
+	gitCmd("init", "-b", "main")
+	gitCmd("config", "user.email", "test@example.com")
+	gitCmd("config", "user.name", "Drev Test")
+
+	file := filepath.Join(repo, "hello", "hello.go")
+	if err := os.WriteFile(file, []byte("package hello\n// version 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd("add", ".")
+	gitCmd("commit", "-m", "commit 1")
+	commit1 = gitCmd("rev-parse", "HEAD")
+
+	if err := os.WriteFile(file, []byte("package hello\n// version 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd("add", ".")
+	gitCmd("commit", "-m", "commit 2")
+	commit2 = gitCmd("rev-parse", "HEAD")
+
+	return repo, commit1, commit2
+}
+
+func getRepoHeadSHA(t *testing.T, dir string) string {
+	t.Helper()
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "HEAD")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in %s: %v\n%s", dir, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestClone_ExactCommitSHA(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, commit1, _ := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	src := drevtypes.Source{
+		Type: "git",
+		URL:  repo,
+		Ref:  commit1,
+	}
+
+	var buf bytes.Buffer
+	if err := w.Clone(context.Background(), src, &buf); err != nil {
+		t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+	}
+
+	head := getRepoHeadSHA(t, w.SourceDir())
+	if !strings.EqualFold(head, commit1) {
+		t.Errorf("expected HEAD %s, got %s", commit1, head)
+	}
+
+	content, err := os.ReadFile(filepath.Join(w.SourceDir(), "hello", "hello.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "// version 1") {
+		t.Errorf("expected version 1 content, got: %s", string(content))
+	}
+}
+
+func TestClone_BranchDrift(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	// Repo main branch is advanced to commit2, but we request the historical commit1
+	repo, commit1, commit2 := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	src := drevtypes.Source{
+		Type: "git",
+		URL:  repo,
+		Ref:  commit1,
+	}
+
+	var buf bytes.Buffer
+	if err := w.Clone(context.Background(), src, &buf); err != nil {
+		t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+	}
+
+	head := getRepoHeadSHA(t, w.SourceDir())
+	if !strings.EqualFold(head, commit1) {
+		t.Errorf("expected HEAD to remain at target commit %s, got %s (branch tip was %s)", commit1, head, commit2)
+	}
+
+	content, err := os.ReadFile(filepath.Join(w.SourceDir(), "hello", "hello.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(content), "// version 1") {
+		t.Errorf("expected version 1 content, got: %s", string(content))
+	}
+	if strings.Contains(string(content), "// version 2") {
+		t.Errorf("unexpectedly checked out latest branch tip version 2 instead of target commit 1")
+	}
+}
+
+func TestClone_BranchCompatibility(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, _, commit2 := createMultiCommitRepo(t)
+
+	t.Run("explicit branch name", func(t *testing.T) {
+		w, err := Create()
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+		defer w.Cleanup()
+
+		src := drevtypes.Source{
+			Type: "git",
+			URL:  repo,
+			Ref:  "main",
+		}
+
+		var buf bytes.Buffer
+		if err := w.Clone(context.Background(), src, &buf); err != nil {
+			t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+		}
+
+		head := getRepoHeadSHA(t, w.SourceDir())
+		if !strings.EqualFold(head, commit2) {
+			t.Errorf("expected branch tip HEAD %s, got %s", commit2, head)
+		}
+	})
+
+	t.Run("empty ref defaults to main", func(t *testing.T) {
+		w, err := Create()
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+		defer w.Cleanup()
+
+		src := drevtypes.Source{
+			Type: "git",
+			URL:  repo,
+			Ref:  "",
+		}
+
+		var buf bytes.Buffer
+		if err := w.Clone(context.Background(), src, &buf); err != nil {
+			t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+		}
+
+		head := getRepoHeadSHA(t, w.SourceDir())
+		if !strings.EqualFold(head, commit2) {
+			t.Errorf("expected default branch tip HEAD %s, got %s", commit2, head)
+		}
+	})
+}
+
+func TestClone_MissingOrInvalidSHA(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, _, _ := createMultiCommitRepo(t)
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	src := drevtypes.Source{
+		Type: "git",
+		URL:  repo,
+		Ref:  "0000000000000000000000000000000000000000",
+	}
+
+	var buf bytes.Buffer
+	err = w.Clone(context.Background(), src, &buf)
+	if err == nil {
+		t.Fatal("expected error for non-existent commit SHA, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "git clone failed") {
+		t.Errorf("expected error to contain 'git clone failed', got: %v", err)
+	}
+
+	// Verify cleanup: sourceDir must be removed on failure
+	if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+		t.Errorf("expected sourceDir to be cleaned up after failure, but it exists: %s", w.SourceDir())
+	}
+}
+
+func TestClone_FailedCleanup(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	src := drevtypes.Source{
+		Type: "git",
+		URL:  filepath.Join(t.TempDir(), "nonexistent-dir"),
+		Ref:  "main",
+	}
+
+	var buf bytes.Buffer
+	err = w.Clone(context.Background(), src, &buf)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+		t.Errorf("expected sourceDir to be removed on failure, got err: %v", statErr)
+	}
+}
+
+func TestClone_HEADVerification_Mismatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, commit1, commit2 := createMultiCommitRepo(t)
+
+	// In the remote repo, set up a ref pointing to commit1
+	cmd := exec.Command("git", "-C", repo, "update-ref", "refs/pull/42/head", commit1)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v\n%s", err, out)
+	}
+
+	w, err := Create()
+	if err != nil {
+		t.Fatalf("Create() error: %v", err)
+	}
+	defer w.Cleanup()
+
+	// Request refs/pull/42/head, but assert that it must match commit2 (which it does NOT)
+	src := drevtypes.Source{
+		Type: "git",
+		URL:  repo,
+		Ref:  "refs/pull/42/head@" + commit2,
+	}
+
+	var buf bytes.Buffer
+	err = w.Clone(context.Background(), src, &buf)
+	if err == nil {
+		t.Fatal("expected error on commit mismatch, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "commit mismatch") {
+		t.Errorf("expected error to contain 'commit mismatch', got: %v", err)
+	}
+
+	if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+		t.Errorf("expected sourceDir to be removed on verification failure")
+	}
+}
+
+func TestClone_PRRef(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, commit1, _ := createMultiCommitRepo(t)
+
+	// Create PR ref in remote
+	cmd := exec.Command("git", "-C", repo, "update-ref", "refs/pull/99/head", commit1)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v\n%s", err, out)
+	}
+
+	t.Run("PR ref without explicit SHA", func(t *testing.T) {
+		w, err := Create()
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+		defer w.Cleanup()
+
+		src := drevtypes.Source{
+			Type: "git",
+			URL:  repo,
+			Ref:  "refs/pull/99/head",
+		}
+
+		var buf bytes.Buffer
+		if err := w.Clone(context.Background(), src, &buf); err != nil {
+			t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+		}
+
+		head := getRepoHeadSHA(t, w.SourceDir())
+		if !strings.EqualFold(head, commit1) {
+			t.Errorf("expected PR HEAD %s, got %s", commit1, head)
+		}
+	})
+
+	t.Run("PR ref with matching explicit SHA", func(t *testing.T) {
+		w, err := Create()
+		if err != nil {
+			t.Fatalf("Create() error: %v", err)
+		}
+		defer w.Cleanup()
+
+		src := drevtypes.Source{
+			Type: "git",
+			URL:  repo,
+			Ref:  "refs/pull/99/head@" + commit1,
+		}
+
+		var buf bytes.Buffer
+		if err := w.Clone(context.Background(), src, &buf); err != nil {
+			t.Fatalf("Clone() error: %v\noutput: %s", err, buf.String())
+		}
+
+		head := getRepoHeadSHA(t, w.SourceDir())
+		if !strings.EqualFold(head, commit1) {
+			t.Errorf("expected PR HEAD %s, got %s", commit1, head)
+		}
+	})
+}
+
+func TestClone_OptionInjectionRejected(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	repo, commit1, _ := createMultiCommitRepo(t)
+
+	tests := []struct {
+		name string
+		ref  string
+	}{
+		{
+			name: "double dash flag",
+			ref:  "--upload-pack=touch /tmp/evil",
+		},
+		{
+			name: "single dash flag",
+			ref:  "-u",
+		},
+		{
+			name: "depth option flag",
+			ref:  "--depth=1",
+		},
+		{
+			name: "flag in prefix before @sha",
+			ref:  "--upload-pack@" + commit1,
+		},
+		{
+			name: "flag in target after @",
+			ref:  "main@--upload-pack",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := Create()
+			if err != nil {
+				t.Fatalf("Create() error: %v", err)
+			}
+			defer w.Cleanup()
+
+			src := drevtypes.Source{
+				Type: "git",
+				URL:  repo,
+				Ref:  tc.ref,
+			}
+
+			var buf bytes.Buffer
+			err = w.Clone(context.Background(), src, &buf)
+			if err == nil {
+				t.Fatalf("expected error for option-like ref %q, got nil", tc.ref)
+			}
+
+			if !strings.Contains(err.Error(), "ref name cannot start with '-'") {
+				t.Errorf("expected error to mention 'ref name cannot start with \"-\"', got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "git clone failed") {
+				t.Errorf("expected error to contain 'git clone failed', got: %v", err)
+			}
+
+			// Verify sourceDir is cleaned up on validation failure
+			if _, statErr := os.Stat(w.SourceDir()); !os.IsNotExist(statErr) {
+				t.Errorf("expected sourceDir to be cleaned up after validation failure: %s", w.SourceDir())
+			}
+		})
+	}
+}
+
+func TestClone_CredentialMasking(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	testCases := []struct {
+		name        string
+		url         string
+		secretParts []string
+	}{
+		{
+			name:        "standard token",
+			url:         "https://ghp_superSecretToken12345XYZ:x-oauth-basic@invalid.internal.domain/org/repo.git",
+			secretParts: []string{"ghp_superSecretToken12345XYZ", "x-oauth-basic"},
+		},
+		{
+			name:        "unencoded at in userinfo",
+			url:         "https://user@sub.domain.com:mySecretPassword999@invalid.internal.domain/org/repo.git",
+			secretParts: []string{"user@sub.domain.com", "mySecretPassword999"},
+		},
+		{
+			name:        "colons in password",
+			url:         "https://admin:p:a:s:s:w:o:r:d:777@invalid.internal.domain/org/repo.git",
+			secretParts: []string{"p:a:s:s:w:o:r:d:777"},
+		},
+		{
+			name:        "percent-encoded characters in password",
+			url:         "https://user:p%40ss%20word%21@invalid.internal.domain/org/repo.git",
+			secretParts: []string{"p%40ss%20word%21"},
+		},
+		{
+			name:        "query and fragment characters in password",
+			url:         "https://token:secret?key=value#frag@invalid.internal.domain/org/repo.git",
+			secretParts: []string{"secret?key=value#frag"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := Create()
+			if err != nil {
+				t.Fatalf("Create() error: %v", err)
+			}
+			defer w.Cleanup()
+
+			src := drevtypes.Source{
+				Type: "git",
+				URL:  tc.url,
+				Ref:  "main",
+			}
+
+			var buf bytes.Buffer
+			err = w.Clone(context.Background(), src, &buf)
+			if err == nil {
+				t.Fatal("expected clone to fail for nonexistent host, got nil")
+			}
+
+			// Verify error does NOT contain any secret parts
+			for _, secret := range tc.secretParts {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("credential part %q leaked in returned error: %v", secret, err)
+				}
+			}
+			if !strings.Contains(err.Error(), "***@") {
+				t.Errorf("expected error to contain masked credentials '***@', got: %v", err)
+			}
+
+			// Verify logWriter output does NOT contain any secret parts
+			logOutput := buf.String()
+			for _, secret := range tc.secretParts {
+				if strings.Contains(logOutput, secret) {
+					t.Errorf("credential part %q leaked in logWriter output: %s", secret, logOutput)
+				}
+			}
+			if !strings.Contains(logOutput, "***@") {
+				t.Errorf("expected log output to contain masked credentials '***@', got: %s", logOutput)
+			}
+		})
+	}
+}
+
 func TestCreateJobWorkspace_RootJob(t *testing.T) {
 	w, err := Create()
 	if err != nil {

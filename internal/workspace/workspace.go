@@ -1,17 +1,53 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
 )
+
+var credentialURLPattern = regexp.MustCompile(`([a-zA-Z0-9+.-]+://)([^/\s]+@)`)
+
+// maskCredentials redacts userinfo/passwords from URL strings so they are never printed in logs or error messages.
+func maskCredentials(s string) string {
+	return credentialURLPattern.ReplaceAllString(s, "${1}***@")
+}
+
+type sanitizedWriter struct {
+	w io.Writer
+}
+
+func (sw *sanitizedWriter) Write(p []byte) (n int, err error) {
+	sanitized := maskCredentials(string(p))
+	_, err = sw.w.Write([]byte(sanitized))
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// isCommitSHA returns true if the string is a 40-character (SHA-1) or 64-character (SHA-256) hexadecimal hash.
+func isCommitSHA(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
 
 // Workspace manages the lifecycle of a build directory.
 type Workspace struct {
@@ -101,12 +137,17 @@ func (w *Workspace) CreateJobWorkspace(jobName string, parentJob string) (*Works
 }
 
 // Clone populates the central source directory w.SourceDir() from the repository source.
+// It supports exact commit SHAs, PR refs (refs/pull/<id>/head), and branch/tag names.
+// When an exact commit SHA is provided, it verifies that the checked-out HEAD matches
+// the requested SHA and fails explicitly on mismatch.
 // After checkout, the central source directory is treated as immutable.
-func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWriter io.Writer) error {
-	sourceDir := w.SourceDir()
-	if err := os.MkdirAll(sourceDir, 0755); err != nil {
-		return fmt.Errorf("creating source dir: %w", err)
+func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWriter io.Writer) (cloneErr error) {
+	if logWriter == nil {
+		logWriter = io.Discard
 	}
+	sw := &sanitizedWriter{w: logWriter}
+
+	sourceDir := w.SourceDir()
 
 	if source.URL == "" {
 		return nil
@@ -115,29 +156,159 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 	cloneCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 
-	ref := source.Ref
-	if ref == "" {
-		ref = "main"
-	}
-
 	// HYBRID LOGIC: If it's the Drev Self-Test (this repo), use Local Copy Bypass
 	localPath := os.Getenv("DREV_LOCAL_REPO")
 	if localPath != "" && strings.Contains(source.URL, "drevci") {
-		fmt.Fprintf(logWriter, "[drev] initializing workspace via Local Copy (Hybrid Mode: Self-Test detected)\n")
+		fmt.Fprintf(sw, "[drev] initializing workspace via Local Copy (Hybrid Mode: Self-Test detected)\n")
+		if err := os.MkdirAll(sourceDir, 0755); err != nil {
+			return fmt.Errorf("creating source dir: %w", err)
+		}
 		if err := copyLocalFiltered(localPath, sourceDir); err != nil {
 			return fmt.Errorf("local copy failed: %w", err)
 		}
 		return nil
 	}
 
-	// NORMAL LOGIC: Use standard Git clone for everything else
-	fmt.Fprintf(logWriter, "[drev] cloning %s @ %s (Hybrid Mode: Standard Pipeline)\n", source.URL, ref)
-	cmd := exec.CommandContext(cloneCtx, "git", "clone", "--depth", "1", "--branch", ref, source.URL, sourceDir)
-	cmd.Stdout = logWriter
-	cmd.Stderr = logWriter
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+	// Clean any previous or partially initialized directory before checkout
+	_ = os.RemoveAll(sourceDir)
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		return fmt.Errorf("creating source dir: %w", err)
 	}
+
+	// Always clean up sourceDir on failure
+	defer func() {
+		if cloneErr != nil {
+			_ = os.RemoveAll(sourceDir)
+			cloneErr = errors.New(maskCredentials(cloneErr.Error()))
+		}
+	}()
+
+	rawRef := strings.TrimSpace(source.Ref)
+	if strings.HasPrefix(rawRef, "-") {
+		cloneErr = fmt.Errorf("git clone failed: invalid ref %q: ref name cannot start with '-'", rawRef)
+		return cloneErr
+	}
+
+	var expectedSHA string
+	var fetchTarget string
+
+	if isCommitSHA(rawRef) {
+		expectedSHA = strings.ToLower(rawRef)
+		fetchTarget = rawRef
+	} else if atIdx := strings.Index(rawRef, "@"); atIdx != -1 {
+		prefix := strings.TrimSpace(rawRef[:atIdx])
+		target := strings.TrimSpace(rawRef[atIdx+1:])
+		if strings.HasPrefix(prefix, "-") || strings.HasPrefix(target, "-") {
+			cloneErr = fmt.Errorf("git clone failed: invalid ref %q: ref name cannot start with '-'", rawRef)
+			return cloneErr
+		}
+		if isCommitSHA(target) {
+			expectedSHA = strings.ToLower(target)
+			if prefix != "" {
+				fetchTarget = prefix
+			} else {
+				fetchTarget = target
+			}
+		} else {
+			fetchTarget = rawRef
+		}
+	} else if strings.HasPrefix(rawRef, "refs/") {
+		fetchTarget = rawRef
+	} else if rawRef != "" {
+		fetchTarget = rawRef
+	} else {
+		fetchTarget = "main"
+	}
+
+	if strings.HasPrefix(fetchTarget, "-") {
+		cloneErr = fmt.Errorf("git clone failed: invalid ref %q: ref name cannot start with '-'", fetchTarget)
+		return cloneErr
+	}
+
+	// 1. Initialize git repository
+	initCmd := exec.CommandContext(cloneCtx, "git", "init", "-q")
+	initCmd.Dir = sourceDir
+	var initErrBuf bytes.Buffer
+	initCmd.Stdout = sw
+	initCmd.Stderr = io.MultiWriter(sw, &initErrBuf)
+	if err := initCmd.Run(); err != nil {
+		cloneErr = fmt.Errorf("git clone failed: git init: %w (%s)", err, strings.TrimSpace(initErrBuf.String()))
+		return cloneErr
+	}
+
+	// 2. Add remote origin
+	remoteCmd := exec.CommandContext(cloneCtx, "git", "remote", "add", "origin", source.URL)
+	remoteCmd.Dir = sourceDir
+	var remoteErrBuf bytes.Buffer
+	remoteCmd.Stdout = sw
+	remoteCmd.Stderr = io.MultiWriter(sw, &remoteErrBuf)
+	if err := remoteCmd.Run(); err != nil {
+		cloneErr = fmt.Errorf("git clone failed: remote add: %w (%s)", err, strings.TrimSpace(remoteErrBuf.String()))
+		return cloneErr
+	}
+
+	// 3. Fetch target revision
+	if expectedSHA != "" {
+		fmt.Fprintf(sw, "[drev] fetching revision %s from %s (target SHA: %s)\n", fetchTarget, maskCredentials(source.URL), expectedSHA)
+	} else {
+		fmt.Fprintf(sw, "[drev] fetching %s from %s\n", fetchTarget, maskCredentials(source.URL))
+	}
+
+	var fetchErrBuf bytes.Buffer
+	fetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "--depth", "1", "origin", "--", fetchTarget)
+	fetchCmd.Dir = sourceDir
+	fetchCmd.Stdout = sw
+	fetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+	if err := fetchCmd.Run(); err != nil {
+		// Retry with full fetch if shallow fetch failed
+		fullFetchCmd := exec.CommandContext(cloneCtx, "git", "fetch", "origin", "--", fetchTarget)
+		fullFetchCmd.Dir = sourceDir
+		fullFetchCmd.Stdout = sw
+		fullFetchCmd.Stderr = io.MultiWriter(sw, &fetchErrBuf)
+		if err2 := fullFetchCmd.Run(); err2 != nil {
+			cloneErr = fmt.Errorf("git clone failed: fetch %s from %s: %w (%s)", fetchTarget, source.URL, err2, strings.TrimSpace(fetchErrBuf.String()))
+			return cloneErr
+		}
+	}
+
+	// 4. Checkout fetched commit in detached HEAD mode
+	checkoutCmd := exec.CommandContext(cloneCtx, "git", "checkout", "--detach", "-q", "FETCH_HEAD")
+	checkoutCmd.Dir = sourceDir
+	var checkoutErrBuf bytes.Buffer
+	checkoutCmd.Stdout = sw
+	checkoutCmd.Stderr = io.MultiWriter(sw, &checkoutErrBuf)
+	if err := checkoutCmd.Run(); err != nil {
+		cloneErr = fmt.Errorf("git clone failed: checkout: %w (%s)", err, strings.TrimSpace(checkoutErrBuf.String()))
+		return cloneErr
+	}
+
+	// 5. Verify resulting HEAD
+	revParseCmd := exec.CommandContext(cloneCtx, "git", "rev-parse", "HEAD")
+	revParseCmd.Dir = sourceDir
+	var revParseOut bytes.Buffer
+	var revParseErr bytes.Buffer
+	revParseCmd.Stdout = &revParseOut
+	revParseCmd.Stderr = &revParseErr
+	if err := revParseCmd.Run(); err != nil {
+		cloneErr = fmt.Errorf("git clone failed: rev-parse HEAD: %w (%s)", err, strings.TrimSpace(revParseErr.String()))
+		return cloneErr
+	}
+
+	actualSHA := strings.TrimSpace(revParseOut.String())
+	if expectedSHA != "" {
+		if !strings.EqualFold(actualSHA, expectedSHA) {
+			cloneErr = fmt.Errorf("git clone failed: commit mismatch: expected %s, got %s", expectedSHA, actualSHA)
+			return cloneErr
+		}
+		fmt.Fprintf(sw, "[drev] successfully checked out commit %s\n", actualSHA)
+	} else {
+		if !isCommitSHA(actualSHA) {
+			cloneErr = fmt.Errorf("git clone failed: invalid HEAD revision: %q", actualSHA)
+			return cloneErr
+		}
+		fmt.Fprintf(sw, "[drev] successfully checked out %s @ %s\n", fetchTarget, actualSHA)
+	}
+
 	return nil
 }
 
