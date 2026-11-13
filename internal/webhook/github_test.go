@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/drevci/drev/internal/parser"
+	"github.com/drevci/drev/internal/pool"
 	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
@@ -153,7 +154,7 @@ func TestGitHubWebhook_NoPipelineConfig(t *testing.T) {
 	payload.Repository.FullName = "octocat/hello-world"
 	payload.Repository.CloneURL = "https://github.com/octocat/hello-world.git"
 	payload.Ref = "refs/heads/main"
-	payload.HeadCommit.ID = "1234567890abcdef"
+	payload.HeadCommit.ID = "1234567890abcdef1234567890abcdef12345678"
 	body, _ := json.Marshal(payload)
 
 	h := setupTestHandler(t, "secret", t.TempDir())
@@ -166,8 +167,49 @@ func TestGitHubWebhook_NoPipelineConfig(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.Handle(rr, req)
 
-	if rr.Code != http.StatusNotFound {
-		t.Errorf("expected %v, got %v", http.StatusNotFound, rr.Code)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected %v, got %v: %s", http.StatusAccepted, rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	runID, ok := resp["run_id"].(string)
+	if !ok || runID == "" {
+		t.Fatalf("expected run_id in response, got %v", resp)
+	}
+
+	ctx := context.Background()
+	run, err := h.store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if run.Status != drevtypes.StatusPending {
+		t.Errorf("expected run status pending, got %v", run.Status)
+	}
+
+	jobs, err := h.store.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("expected 0 pre-registered jobs for bootstrap run, got %d", len(jobs))
+	}
+
+	select {
+	case job := <-h.queue.Drain():
+		if len(job.Pipeline.Jobs) != 0 {
+			t.Errorf("expected 0 jobs in enqueued pipeline, got %d", len(job.Pipeline.Jobs))
+		}
+		if job.Pipeline.Source.CommitSHA != "1234567890abcdef1234567890abcdef12345678" {
+			t.Errorf("expected job source CommitSHA, got %s", job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.Ref != "main" {
+			t.Errorf("expected job source Ref main, got %s", job.Pipeline.Source.Ref)
+		}
+	default:
+		t.Fatal("expected job to be enqueued")
 	}
 }
 
@@ -176,22 +218,12 @@ func TestGitHubWebhook_ValidPush(t *testing.T) {
 	repoDir := filepath.Join(configDir, "octocat", "hello-world")
 	os.MkdirAll(repoDir, 0755)
 
-	pipelineYAML := `
-name: test
-jobs:
-  - name: test
-    image: alpine
-    steps:
-      - name: test
-        run: echo "test"
-`
-	os.WriteFile(filepath.Join(repoDir, ".drev.yml"), []byte(pipelineYAML), 0644)
-
 	payload := PushPayload{}
 	payload.Repository.FullName = "octocat/hello-world"
 	payload.Repository.CloneURL = "https://github.com/octocat/hello-world.git"
 	payload.Ref = "refs/heads/main"
-	payload.HeadCommit.ID = "1234567890abcdef"
+	payload.HeadCommit.ID = "1234567890abcdef1234567890abcdef12345678"
+	payload.HeadCommit.Message = "Initial commit"
 	payload.Pusher.Name = "octocat"
 	body, _ := json.Marshal(payload)
 
@@ -206,7 +238,7 @@ jobs:
 	h.Handle(rr, req)
 
 	if rr.Code != http.StatusAccepted {
-		t.Errorf("expected %v, got %v", http.StatusAccepted, rr.Code)
+		t.Fatalf("expected %v, got %v: %s", http.StatusAccepted, rr.Code, rr.Body.String())
 	}
 
 	var resp map[string]string
@@ -215,6 +247,32 @@ jobs:
 	if resp["run_id"] == "" || resp["repo"] != "octocat/hello-world" {
 		t.Errorf("invalid response body: %v", resp)
 	}
+	if resp["commit"] != "1234567" {
+		t.Errorf("expected commit 1234567, got %s", resp["commit"])
+	}
+	if resp["branch"] != "main" {
+		t.Errorf("expected branch main, got %s", resp["branch"])
+	}
+
+	ctx := context.Background()
+	run, err := h.store.GetRun(ctx, resp["run_id"])
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if run.CommitSHA != "1234567890abcdef1234567890abcdef12345678" {
+		t.Errorf("expected run commit SHA, got %s", run.CommitSHA)
+	}
+	if run.Status != drevtypes.StatusPending {
+		t.Errorf("expected run status pending, got %s", run.Status)
+	}
+
+	jobs, err := h.store.GetRunJobs(ctx, resp["run_id"])
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("expected 0 jobs for bootstrap run, got %d", len(jobs))
+	}
 }
 
 func TestGitHubWebhook_QueueFull_MarksRunAndJobsFailed(t *testing.T) {
@@ -222,22 +280,11 @@ func TestGitHubWebhook_QueueFull_MarksRunAndJobsFailed(t *testing.T) {
 	repoDir := filepath.Join(configDir, "octocat", "queue-full-repo")
 	os.MkdirAll(repoDir, 0755)
 
-	pipelineYAML := `
-name: test-gh-queue-full
-jobs:
-  - name: test-job
-    image: alpine
-    steps:
-      - name: test
-        run: echo "test"
-`
-	os.WriteFile(filepath.Join(repoDir, ".drev.yml"), []byte(pipelineYAML), 0644)
-
 	payload := PushPayload{}
 	payload.Repository.FullName = "octocat/queue-full-repo"
 	payload.Repository.CloneURL = "https://github.com/octocat/queue-full-repo.git"
 	payload.Ref = "refs/heads/main"
-	payload.HeadCommit.ID = "1234567890abcdef"
+	payload.HeadCommit.ID = "1234567890abcdef1234567890abcdef12345678"
 	payload.Pusher.Name = "octocat"
 	body, _ := json.Marshal(payload)
 
@@ -274,7 +321,7 @@ jobs:
 	}
 	var targetRun *drevtypes.Run
 	for _, r := range runs {
-		if r.PipelineID == "test-gh-queue-full" {
+		if r.PipelineID == "octocat/queue-full-repo" {
 			targetRun = r
 			break
 		}
@@ -289,19 +336,13 @@ jobs:
 		t.Errorf("expected finished_at to be populated for failed run")
 	}
 
-	// Verify jobs are StatusFailed with finished_at
+	// In bootstrap mode, zero jobs are pre-registered
 	jobs, err := h.store.GetRunJobs(context.Background(), targetRun.ID)
 	if err != nil {
 		t.Fatalf("getting run jobs: %v", err)
 	}
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 job, got %d", len(jobs))
-	}
-	if jobs[0].Status != drevtypes.StatusFailed {
-		t.Errorf("expected job status %q, got %q", drevtypes.StatusFailed, jobs[0].Status)
-	}
-	if jobs[0].FinishedAt.IsZero() {
-		t.Errorf("expected job finished_at to be populated")
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs for bootstrap run, got %d", len(jobs))
 	}
 
 	// Verify rejection reason is recorded in streamer log
@@ -642,9 +683,9 @@ func TestGitHubWebhook_PullRequest_PropagatesSourceRevisionMetadata(t *testing.T
 				t.Fatalf("expected 1 outbox item, got %d", len(outbox))
 			}
 
-			parsed, err := parser.ParseBytes([]byte(outbox[0].PipelineSpec))
-			if err != nil {
-				t.Fatalf("parsing outbox spec: %v", err)
+			var parsed drevtypes.Pipeline
+			if err := json.Unmarshal([]byte(outbox[0].PipelineSpec), &parsed); err != nil {
+				t.Fatalf("unmarshaling outbox spec: %v", err)
 			}
 			if parsed.Source.URL != cloneURL {
 				t.Errorf("outbox Source.URL mismatch: expected %s, got %s", cloneURL, parsed.Source.URL)
@@ -920,7 +961,13 @@ func TestGitHubWebhook_MalformedPayloads(t *testing.T) {
 		{
 			name:       "path_traversal_in_repo_name",
 			event:      "push",
-			body:       `{"ref":"refs/heads/main","repository":{"full_name":"../../etc/passwd","clone_url":"https://github.com/a/b.git"},"head_commit":{"id":"abc1234"}}`,
+			body:       `{"ref":"refs/heads/main","repository":{"full_name":"../../etc/passwd","clone_url":"https://github.com/a/b.git"},"head_commit":{"id":"1234567890abcdef1234567890abcdef12345678"}}`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "push_malformed_head_commit_sha",
+			event:      "push",
+			body:       `{"ref":"refs/heads/main","repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"head_commit":{"id":"abc1234"}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
@@ -932,19 +979,19 @@ func TestGitHubWebhook_MalformedPayloads(t *testing.T) {
 		{
 			name:       "push_missing_repo_fullname",
 			event:      "push",
-			body:       `{"ref":"refs/heads/main","repository":{"clone_url":"https://github.com/octocat/hello-world.git"},"head_commit":{"id":"abc1234"}}`,
+			body:       `{"ref":"refs/heads/main","repository":{"clone_url":"https://github.com/octocat/hello-world.git"},"head_commit":{"id":"1234567890abcdef1234567890abcdef12345678"}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "push_missing_clone_url",
 			event:      "push",
-			body:       `{"ref":"refs/heads/main","repository":{"full_name":"octocat/hello-world"},"head_commit":{"id":"abc1234"}}`,
+			body:       `{"ref":"refs/heads/main","repository":{"full_name":"octocat/hello-world"},"head_commit":{"id":"1234567890abcdef1234567890abcdef12345678"}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "push_missing_ref",
 			event:      "push",
-			body:       `{"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"head_commit":{"id":"abc1234"}}`,
+			body:       `{"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"head_commit":{"id":"1234567890abcdef1234567890abcdef12345678"}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
@@ -956,19 +1003,19 @@ func TestGitHubWebhook_MalformedPayloads(t *testing.T) {
 		{
 			name:       "pr_missing_head_ref",
 			event:      "pull_request",
-			body:       `{"action":"opened","number":1,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":1,"head":{"sha":"abc1234","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
+			body:       `{"action":"opened","number":1,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":1,"head":{"sha":"1234567890abcdef1234567890abcdef12345678","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "pr_missing_number",
 			event:      "pull_request",
-			body:       `{"action":"opened","number":0,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":0,"head":{"ref":"main","sha":"abc1234","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
+			body:       `{"action":"opened","number":0,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":0,"head":{"ref":"main","sha":"1234567890abcdef1234567890abcdef12345678","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "pr_negative_number",
 			event:      "pull_request",
-			body:       `{"action":"opened","number":-5,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":-5,"head":{"ref":"main","sha":"abc1234","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
+			body:       `{"action":"opened","number":-5,"repository":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"},"pull_request":{"number":-5,"head":{"ref":"main","sha":"1234567890abcdef1234567890abcdef12345678","repo":{"full_name":"octocat/hello-world","clone_url":"https://github.com/octocat/hello-world.git"}}}}`,
 			wantStatus: http.StatusBadRequest,
 		},
 	}
@@ -1181,7 +1228,7 @@ func TestGitHubWebhook_PushWithAfterFallback(t *testing.T) {
 	// Payload with empty head_commit.id but valid after
 	payload := PushPayload{
 		Ref:   "refs/heads/feature-x",
-		After: "after98765432101234567890abcdef12345678",
+		After: "a1b2c3d4e5f678901234567890abcdef12345678",
 	}
 	payload.Repository.FullName = "octocat/hello-world"
 	payload.Repository.CloneURL = "https://github.com/octocat/hello-world.git"
@@ -1205,7 +1252,7 @@ func TestGitHubWebhook_PushWithAfterFallback(t *testing.T) {
 	runID := resp["run_id"].(string)
 
 	run, _ := h.store.GetRun(context.Background(), runID)
-	if run.CommitSHA != "after98765432101234567890abcdef12345678" {
+	if run.CommitSHA != "a1b2c3d4e5f678901234567890abcdef12345678" {
 		t.Errorf("expected CommitSHA from after, got %q", run.CommitSHA)
 	}
 	if run.Branch != "feature-x" {
@@ -1593,19 +1640,14 @@ func TestGitHubWebhook_AtomicFailureCleanup_QueueRejection(t *testing.T) {
 		t.Errorf("outbox entry must be deleted on queue rejection, got: %d items", len(outbox))
 	}
 
-	// 3. Run and its jobs must be marked StatusFailed
+	// 3. Run must be marked StatusFailed, with zero pre-registered jobs
 	runs, _ := s.ListRuns(context.Background(), 10)
 	if len(runs) != 1 || runs[0].Status != drevtypes.StatusFailed {
 		t.Fatalf("expected 1 failed run, got: %+v", runs)
 	}
 	jobs, _ := s.GetRunJobs(context.Background(), runs[0].ID)
-	if len(jobs) == 0 {
-		t.Fatalf("expected jobs to exist for run")
-	}
-	for _, j := range jobs {
-		if j.Status != drevtypes.StatusFailed {
-			t.Errorf("job %s should be StatusFailed, got %s", j.JobName, j.Status)
-		}
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs for bootstrap run, got: %d", len(jobs))
 	}
 }
 
@@ -1777,5 +1819,321 @@ func TestGitHubWebhook_StreamerFailure_FailRunWithDeliveryError_Returns500(t *te
 	// Even if FailRunWithDelivery fails, handler must preserve 500 response
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500 on streamer failure, got %v", rr.Code)
+	}
+}
+
+func TestGitHubWebhook_Push_BootstrapSpec_ZeroJobs(t *testing.T) {
+	h := setupTestHandler(t, "secret", t.TempDir())
+
+	headSHA := "1234567890abcdef1234567890abcdef12345678"
+	payload := PushPayload{}
+	payload.Repository.FullName = "org/my-bootstrap-repo"
+	payload.Repository.CloneURL = "https://github.com/org/my-bootstrap-repo.git"
+	payload.Ref = "refs/heads/feature-branch"
+	payload.HeadCommit.ID = headSHA
+	payload.HeadCommit.Message = "feat: bootstrap testing"
+	payload.Pusher.Name = "committer"
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-GitHub-Delivery", "delivery-push-bootstrap-1")
+
+	rr := httptest.NewRecorder()
+	h.Handle(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	runID, ok := resp["run_id"].(string)
+	if !ok || runID == "" {
+		t.Fatalf("expected run_id in response, got %v", resp)
+	}
+	if resp["repo"] != "org/my-bootstrap-repo" {
+		t.Errorf("expected repo org/my-bootstrap-repo, got %v", resp["repo"])
+	}
+	if resp["branch"] != "feature-branch" {
+		t.Errorf("expected branch feature-branch, got %v", resp["branch"])
+	}
+	if resp["commit"] != "1234567" {
+		t.Errorf("expected commit short SHA 1234567, got %v", resp["commit"])
+	}
+	if resp["triggered_by"] != "committer" {
+		t.Errorf("expected triggered_by committer, got %v", resp["triggered_by"])
+	}
+
+	// 1. Run in DB must be StatusPending with CommitSHA
+	ctx := context.Background()
+	run, err := h.store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("getting run: %v", err)
+	}
+	if run.Status != drevtypes.StatusPending {
+		t.Errorf("expected run status pending, got %v", run.Status)
+	}
+	if run.CommitSHA != headSHA {
+		t.Errorf("expected run CommitSHA %s, got %s", headSHA, run.CommitSHA)
+	}
+	if run.PipelineID != "org/my-bootstrap-repo" {
+		t.Errorf("expected run PipelineID org/my-bootstrap-repo, got %s", run.PipelineID)
+	}
+
+	// 2. Pre-registered jobs in DB must be exactly 0
+	jobs, err := h.store.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 pre-registered jobs in DB, got %d", len(jobs))
+	}
+
+	// 3. Enqueued job must have 0 jobs and populated Source metadata
+	select {
+	case job := <-h.queue.Drain():
+		if len(job.Pipeline.Jobs) != 0 {
+			t.Errorf("expected 0 jobs in enqueued pipeline, got %d", len(job.Pipeline.Jobs))
+		}
+		if job.Pipeline.Name != "org/my-bootstrap-repo" {
+			t.Errorf("expected pipeline name org/my-bootstrap-repo, got %s", job.Pipeline.Name)
+		}
+		if job.Pipeline.Source.URL != "https://github.com/org/my-bootstrap-repo.git" {
+			t.Errorf("expected source URL, got %s", job.Pipeline.Source.URL)
+		}
+		if job.Pipeline.Source.Ref != "feature-branch" {
+			t.Errorf("expected source Ref feature-branch, got %s", job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.CommitSHA != headSHA {
+			t.Errorf("expected source CommitSHA %s, got %s", headSHA, job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.PRNumber != 0 {
+			t.Errorf("expected source PRNumber 0, got %d", job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected job to be enqueued")
+	}
+
+	// 4. Outbox record must store valid bootstrap spec with zero jobs
+	outboxItems, err := h.store.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outboxItems) != 1 {
+		t.Fatalf("expected 1 outbox item, got %d", len(outboxItems))
+	}
+	var outboxPipeline drevtypes.Pipeline
+	if err := json.Unmarshal([]byte(outboxItems[0].PipelineSpec), &outboxPipeline); err != nil {
+		t.Fatalf("unmarshaling outbox spec: %v", err)
+	}
+	if len(outboxPipeline.Jobs) != 0 {
+		t.Errorf("expected 0 jobs in outbox pipeline, got %d", len(outboxPipeline.Jobs))
+	}
+	if outboxPipeline.Source.CommitSHA != headSHA {
+		t.Errorf("expected outbox CommitSHA %s, got %s", headSHA, outboxPipeline.Source.CommitSHA)
+	}
+	if outboxPipeline.Source.Ref != "feature-branch" {
+		t.Errorf("expected outbox Ref feature-branch, got %s", outboxPipeline.Source.Ref)
+	}
+	if outboxPipeline.Source.URL != "https://github.com/org/my-bootstrap-repo.git" {
+		t.Errorf("expected outbox URL, got %s", outboxPipeline.Source.URL)
+	}
+}
+
+func TestGitHubWebhook_PullRequest_BootstrapSpec_ZeroJobs(t *testing.T) {
+	h := setupTestHandler(t, "secret", t.TempDir())
+
+	headSHA := "fedcba9876543210fedcba9876543210fedcba98"
+	payload := makePRPayload(
+		"opened", 99,
+		"org/pr-bootstrap-repo", "https://github.com/org/pr-bootstrap-repo.git",
+		"pr-feature", headSHA,
+		"Add feature", "pr-user",
+		false, "org/pr-bootstrap-repo",
+	)
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+	req.Header.Set("X-GitHub-Event", "pull_request")
+	req.Header.Set("X-GitHub-Delivery", "delivery-pr-bootstrap-1")
+
+	rr := httptest.NewRecorder()
+	h.Handle(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	runID, ok := resp["run_id"].(string)
+	if !ok || runID == "" {
+		t.Fatalf("expected run_id in response, got %v", resp)
+	}
+
+	ctx := context.Background()
+
+	// 1. Verify zero jobs in DB
+	jobs, err := h.store.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("getting run jobs: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 pre-registered jobs in DB for PR bootstrap run, got %d", len(jobs))
+	}
+
+	// 2. Enqueued job must have 0 jobs and authoritative Source metadata
+	select {
+	case job := <-h.queue.Drain():
+		if len(job.Pipeline.Jobs) != 0 {
+			t.Errorf("expected 0 jobs in enqueued pipeline, got %d", len(job.Pipeline.Jobs))
+		}
+		if job.Pipeline.Source.CommitSHA != headSHA {
+			t.Errorf("expected source CommitSHA %s, got %s", headSHA, job.Pipeline.Source.CommitSHA)
+		}
+		if job.Pipeline.Source.Ref != "pr-feature" {
+			t.Errorf("expected source Ref pr-feature, got %s", job.Pipeline.Source.Ref)
+		}
+		if job.Pipeline.Source.PRNumber != 99 {
+			t.Errorf("expected source PRNumber 99, got %d", job.Pipeline.Source.PRNumber)
+		}
+	default:
+		t.Fatal("expected job to be enqueued")
+	}
+
+	// 3. Outbox record contains bootstrap spec
+	outboxItems, err := h.store.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outboxItems) != 1 {
+		t.Fatalf("expected 1 outbox item, got %d", len(outboxItems))
+	}
+	var outboxPipeline drevtypes.Pipeline
+	if err := json.Unmarshal([]byte(outboxItems[0].PipelineSpec), &outboxPipeline); err != nil {
+		t.Fatalf("unmarshaling outbox spec: %v", err)
+	}
+	if len(outboxPipeline.Jobs) != 0 {
+		t.Errorf("expected 0 jobs in outbox pipeline, got %d", len(outboxPipeline.Jobs))
+	}
+	if outboxPipeline.Source.CommitSHA != headSHA {
+		t.Errorf("expected outbox CommitSHA %s, got %s", headSHA, outboxPipeline.Source.CommitSHA)
+	}
+	if outboxPipeline.Source.PRNumber != 99 {
+		t.Errorf("expected outbox PRNumber 99, got %d", outboxPipeline.Source.PRNumber)
+	}
+}
+
+func TestGitHubWebhook_Push_MalformedCommitSHA_Rejected(t *testing.T) {
+	testCases := []struct {
+		name string
+		sha  string
+	}{
+		{name: "short 7 chars", sha: "1234567"},
+		{name: "short 16 chars", sha: "1234567890abcdef"},
+		{name: "non-hex 40 chars", sha: "g1b2c3d4e5f678901234567890abcdef12345678"},
+		{name: "dash prefix", sha: "-1b2c3d4e5f678901234567890abcdef12345678"},
+		{name: "spaces inside", sha: "1234567890abcdef 1234567890abcdef1234567"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := setupTestHandler(t, "secret", t.TempDir())
+
+			payload := PushPayload{}
+			payload.Repository.FullName = "octocat/hello-world"
+			payload.Repository.CloneURL = "https://github.com/octocat/hello-world.git"
+			payload.Ref = "refs/heads/main"
+			payload.HeadCommit.ID = tc.sha
+			body, _ := json.Marshal(payload)
+
+			req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+			req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+			req.Header.Set("X-GitHub-Event", "push")
+			req.Header.Set("X-GitHub-Delivery", "delivery-invalid-sha")
+
+			rr := httptest.NewRecorder()
+			h.Handle(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 Bad Request, got %v: %s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "malformed or invalid commit SHA") {
+				t.Errorf("expected error message containing 'malformed or invalid commit SHA', got: %s", rr.Body.String())
+			}
+
+			// Verify 0 runs recorded
+			runs, _ := h.store.ListRuns(context.Background(), 10)
+			if len(runs) != 0 {
+				t.Errorf("expected 0 runs created, got %d", len(runs))
+			}
+		})
+	}
+}
+
+func TestGitHubWebhook_BootstrapSpec_OutboxRecoveryRoundTrip(t *testing.T) {
+	configDir := t.TempDir()
+	dbPath := filepath.Join(t.TempDir(), "roundtrip.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	q := queue.New(10)
+	stream := streamer.New(t.TempDir())
+	h := New(s, q, parser.NewParser(), stream, "secret", configDir)
+
+	headSHA := "a1b2c3d4e5f678901234567890abcdef12345678"
+	payload := PushPayload{}
+	payload.Repository.FullName = "octocat/hello-world"
+	payload.Repository.CloneURL = "https://github.com/octocat/hello-world.git"
+	payload.Ref = "refs/heads/main"
+	payload.HeadCommit.ID = headSHA
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "/webhooks/github", bytes.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", signBody("secret", body))
+	req.Header.Set("X-GitHub-Event", "push")
+	req.Header.Set("X-GitHub-Delivery", "del-recovery-roundtrip-1")
+
+	rr := httptest.NewRecorder()
+	h.Handle(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %v: %s", rr.Code, rr.Body.String())
+	}
+
+	// Drain the initial enqueued job
+	select {
+	case <-q.Drain():
+	default:
+		t.Fatal("expected initially enqueued job")
+	}
+
+	// Now run OutboxRecoverer to verify the pending outbox entry deserializes cleanly and enqueues
+	recoverer := pool.NewOutboxRecoverer(s, q, stream)
+	if err := recoverer.Recover(context.Background()); err != nil {
+		t.Fatalf("recoverer.Recover failed: %v", err)
+	}
+
+	// Verify recovered job was reenqueued with 0 jobs and exact Source
+	select {
+	case recoveredJob := <-q.Drain():
+		if recoveredJob.Pipeline.Source.CommitSHA != headSHA {
+			t.Errorf("expected recovered CommitSHA %s, got %s", headSHA, recoveredJob.Pipeline.Source.CommitSHA)
+		}
+		if len(recoveredJob.Pipeline.Jobs) != 0 {
+			t.Errorf("expected 0 jobs in recovered pipeline, got %d", len(recoveredJob.Pipeline.Jobs))
+		}
+	default:
+		t.Fatal("expected recovered job to be enqueued in queue")
 	}
 }

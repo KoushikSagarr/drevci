@@ -11,8 +11,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -158,7 +156,6 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		cloneURL     string
 		branch       string
 		sourceRef    string
-		sourceSHA    string
 		commitSHA    string
 		commitMsg    string
 		triggeredBy  string
@@ -183,6 +180,11 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if !drevtypes.IsCommitSHA(commitSHA) {
+			http.Error(w, "malformed or invalid commit SHA", http.StatusBadRequest)
+			return
+		}
+
 		branch = strings.TrimPrefix(payload.Ref, "refs/heads/")
 		if branch == payload.Ref {
 			branch = strings.TrimPrefix(payload.Ref, "refs/tags/")
@@ -191,7 +193,6 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		repoFullName = payload.Repository.FullName
 		cloneURL = payload.Repository.CloneURL
 		sourceRef = branch
-		sourceSHA = ""
 		commitMsg = payload.HeadCommit.Message
 		triggeredBy = payload.Pusher.Name
 		if triggeredBy == "" {
@@ -259,7 +260,6 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 
 		branch = strings.TrimPrefix(payload.PullRequest.Head.Ref, "refs/heads/")
 		sourceRef = payload.PullRequest.Head.Ref
-		sourceSHA = payload.PullRequest.Head.SHA
 		commitSHA = payload.PullRequest.Head.SHA
 		commitMsg = strings.TrimSpace(payload.PullRequest.Title)
 		triggeredBy = payload.PullRequest.User.Login
@@ -273,23 +273,17 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	configPath := filepath.Join(h.configDir, repoFullName, ".drev.yml")
-	pipeline, err := parser.ParseFile(configPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file or directory") || strings.Contains(err.Error(), "cannot find the path") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "no pipeline configured for this repo"})
-			return
-		}
-		http.Error(w, fmt.Sprintf("failed to parse pipeline: %v", err), http.StatusInternalServerError)
-		return
+	pipeline := &drevtypes.Pipeline{
+		Name: repoFullName,
+		Source: drevtypes.Source{
+			Type:      "git",
+			URL:       cloneURL,
+			Ref:       sourceRef,
+			CommitSHA: commitSHA,
+			PRNumber:  prNumber,
+		},
+		Jobs: nil,
 	}
-
-	pipeline.Source.URL = cloneURL
-	pipeline.Source.Ref = sourceRef
-	pipeline.Source.CommitSHA = sourceSHA
-	pipeline.Source.PRNumber = prNumber
 
 	runID := uuid.New().String()
 
@@ -312,22 +306,15 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		TriggeredBy: triggeredBy,
 	}
 
-	runJobs := make([]*drevtypes.RunJob, 0, len(pipeline.Jobs))
-	createdJobIDs := make([]string, 0, len(pipeline.Jobs))
-	for _, job := range pipeline.Jobs {
-		rj := &drevtypes.RunJob{
-			ID:      uuid.New().String(),
-			RunID:   runID,
-			JobName: job.Name,
-			Status:  drevtypes.StatusPending,
-		}
-		runJobs = append(runJobs, rj)
-		createdJobIDs = append(createdJobIDs, rj.ID)
+	// Atomically persist delivery claim, run, zero jobs, and bootstrap pipeline outbox spec in a single database transaction
+	pipelineSpecBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		log.Printf("[webhook] failed to marshal pipeline spec: %v", err)
+		http.Error(w, "failed to marshal pipeline specification", http.StatusInternalServerError)
+		return
 	}
 
-	// Atomically persist delivery claim, run, jobs, and pipeline outbox spec in a single database transaction
-	pipelineSpecBytes, _ := json.Marshal(pipeline)
-	if err := h.store.CreateRunWithDelivery(r.Context(), delivery, run, runJobs, string(pipelineSpecBytes)); err != nil {
+	if err := h.store.CreateRunWithDelivery(r.Context(), delivery, run, nil, string(pipelineSpecBytes)); err != nil {
 		if errors.Is(err, store.ErrDuplicateDelivery) {
 			log.Printf("[webhook] duplicate delivery %s for %s event detected", deliveryID, event)
 			existing, err := h.store.GetDelivery(r.Context(), deliveryID)
@@ -363,7 +350,7 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	logW, err := h.streamer.Writer(runID)
 	if err != nil {
 		log.Printf("[webhook] failed to create log writer for run %s: %v", runID, err)
-		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, deliveryID); failErr != nil {
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, nil, deliveryID); failErr != nil {
 			log.Printf("[webhook] failed atomic cleanup for run %s after streamer error: %v", runID, failErr)
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -378,7 +365,7 @@ func (h *GitHubHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[webhook] run %s rejected: %v", runID, err)
 		fmt.Fprintf(logW, "[drev] pipeline rejected: %v\n", err)
 		logW.Close()
-		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, deliveryID); failErr != nil {
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, nil, deliveryID); failErr != nil {
 			log.Printf("[webhook] failed atomic cleanup for run %s after queue rejection: %v", runID, failErr)
 		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
