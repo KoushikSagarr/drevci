@@ -1732,3 +1732,204 @@ func TestPostgresStore_CreateRunWithDelivery_DuplicateDelivery_RollsBackRun(t *t
 		t.Fatalf("expected original run1 to remain pending, got: %+v (err: %v)", run1Check, err)
 	}
 }
+
+func TestPostgresStore_CreateRunWithLimit_ConcurrentRequests_CannotExceedLimit(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// Seed organization with real UUID
+	orgID := uuid.New().String()
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO organizations (id, name, slug)
+		VALUES ($1, $2, $3)`,
+		orgID, "Test Concurrent Org", "test-conc-"+uuid.New().String(),
+	); err != nil {
+		t.Fatalf("inserting test organization: %v", err)
+	}
+
+	workerLimit := 2
+	concurrency := 10
+
+	var wg sync.WaitGroup
+	var successCount int64
+	var limitExceededCount int64
+	var otherErrCount int64
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			runID := uuid.New().String()
+			run := &drevtypes.Run{
+				ID:          runID,
+				OrgID:       orgID,
+				PipelineID:  "ci",
+				Status:      drevtypes.StatusPending,
+				TriggeredBy: "api",
+			}
+			jobs := []*drevtypes.RunJob{
+				{ID: uuid.New().String(), RunID: runID, JobName: "build", Status: drevtypes.StatusPending},
+			}
+			err := s.CreateRunWithLimit(ctx, run, jobs, workerLimit)
+			if err == nil {
+				atomic.AddInt64(&successCount, 1)
+			} else if errors.Is(err, ErrWorkerLimitExceeded) {
+				atomic.AddInt64(&limitExceededCount, 1)
+			} else {
+				atomic.AddInt64(&otherErrCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if otherErrCount > 0 {
+		t.Fatalf("unexpected error during concurrent CreateRunWithLimit: %d", otherErrCount)
+	}
+	if successCount != int64(workerLimit) {
+		t.Errorf("expected %d successes, got %d", workerLimit, successCount)
+	}
+	if limitExceededCount != int64(concurrency-workerLimit) {
+		t.Errorf("expected %d limit exceeded, got %d", concurrency-workerLimit, limitExceededCount)
+	}
+
+	// Verify database state: exactly 2 runs exist for orgID
+	var activeCount int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM runs WHERE org_id = $1 AND status IN ('running', 'pending')`, orgID).Scan(&activeCount); err != nil {
+		t.Fatalf("counting active runs: %v", err)
+	}
+	if activeCount != workerLimit {
+		t.Errorf("expected %d active runs in database, got %d", workerLimit, activeCount)
+	}
+}
+
+func TestPostgresStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// Org A
+	orgA := uuid.New().String()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`, orgA, "Org A", "org-a-"+uuid.New().String()); err != nil {
+		t.Fatalf("inserting orgA: %v", err)
+	}
+	// Org B
+	orgB := uuid.New().String()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`, orgB, "Org B", "org-b-"+uuid.New().String()); err != nil {
+		t.Fatalf("inserting orgB: %v", err)
+	}
+
+	// Org A uses 2 runs (limit 2)
+	for i := 0; i < 2; i++ {
+		runID := uuid.New().String()
+		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+			ID: runID, OrgID: orgA, PipelineID: "pA", Status: drevtypes.StatusPending,
+		}, nil, 2)
+		if err != nil {
+			t.Fatalf("CreateRunWithLimit for orgA (%d) failed: %v", i, err)
+		}
+	}
+
+	// Org B uses 3 runs (limit 3) - completely unaffected by Org A
+	for i := 0; i < 3; i++ {
+		runID := uuid.New().String()
+		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+			ID: runID, OrgID: orgB, PipelineID: "pB", Status: drevtypes.StatusPending,
+		}, nil, 3)
+		if err != nil {
+			t.Fatalf("CreateRunWithLimit for orgB (%d) failed: %v", i, err)
+		}
+	}
+
+	// Org A next attempt fails with ErrWorkerLimitExceeded
+	errA := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: uuid.New().String(), OrgID: orgA, PipelineID: "pA", Status: drevtypes.StatusPending,
+	}, nil, 2)
+	if !errors.Is(errA, ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded for orgA, got: %v", errA)
+	}
+
+	// Org B next attempt fails with ErrWorkerLimitExceeded
+	errB := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: uuid.New().String(), OrgID: orgB, PipelineID: "pB", Status: drevtypes.StatusPending,
+	}, nil, 3)
+	if !errors.Is(errB, ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded for orgB, got: %v", errB)
+	}
+}
+
+func TestPostgresStore_CreateRunWithLimit_MissingOrgReturnsError(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	nonExistentOrg := uuid.New().String()
+	runID := uuid.New().String()
+	err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: runID, OrgID: nonExistentOrg, PipelineID: "p1", Status: drevtypes.StatusPending,
+	}, nil, 2)
+	if err == nil {
+		t.Fatalf("expected ErrOrgNotFound for missing org, got nil")
+	}
+	if !errors.Is(err, ErrOrgNotFound) {
+		t.Fatalf("expected ErrOrgNotFound, got: %v", err)
+	}
+}
+
+func TestPostgresStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	orgID := uuid.New().String()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`, orgID, "Org Term", "org-term-"+uuid.New().String()); err != nil {
+		t.Fatalf("inserting org: %v", err)
+	}
+
+	run1ID := uuid.New().String()
+	if err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: run1ID, OrgID: orgID, PipelineID: "pTerm", Status: drevtypes.StatusPending,
+	}, nil, 1); err != nil {
+		t.Fatalf("CreateRunWithLimit(1): %v", err)
+	}
+
+	// Next run rejected
+	run2ID := uuid.New().String()
+	err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: run2ID, OrgID: orgID, PipelineID: "pTerm", Status: drevtypes.StatusPending,
+	}, nil, 1)
+	if !errors.Is(err, ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded, got: %v", err)
+	}
+
+	// Mark run 1 as Success
+	if err := s.UpdateRunStatus(ctx, run1ID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+
+	// Capacity recovered; run 2 now succeeds
+	if err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: run2ID, OrgID: orgID, PipelineID: "pTerm", Status: drevtypes.StatusPending,
+	}, nil, 1); err != nil {
+		t.Fatalf("expected success after terminal status, got: %v", err)
+	}
+}
+
+func TestPostgresStore_CreateRunWithLimit_TenantSafety_EmptyOrgID(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// workerLimit > 0 with empty OrgID fails closed
+	err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: uuid.New().String(), OrgID: "", PipelineID: "pEmpty", Status: drevtypes.StatusPending,
+	}, nil, 2)
+	if err == nil {
+		t.Fatalf("expected error for empty OrgID with workerLimit > 0, got nil")
+	}
+
+	// workerLimit == 0 with empty OrgID succeeds (single tenant)
+	runSingleID := uuid.New().String()
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: runSingleID, OrgID: "", PipelineID: "pSingle", Status: drevtypes.StatusPending,
+	}, nil, 0)
+	if err != nil {
+		t.Fatalf("expected success for workerLimit == 0: %v", err)
+	}
+}

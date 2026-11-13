@@ -12,9 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/drevci/drev/internal/auth"
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/scheduler"
@@ -655,5 +657,595 @@ func TestAuth_QueryTokenAloneIsRejectedAtAPI(t *testing.T) {
 	}
 	if !strings.Contains(loggedOutput, "token=[REDACTED]") {
 		t.Errorf("expected token=[REDACTED] in log, got: %s", loggedOutput)
+	}
+}
+
+type saasTestStore struct {
+	store.Store
+	orgsByTokenHash map[string]*drevtypes.Org
+}
+
+func (m *saasTestStore) GetOrgFromToken(_ context.Context, tokenHash string) (*drevtypes.Org, error) {
+	if org, ok := m.orgsByTokenHash[tokenHash]; ok {
+		return org, nil
+	}
+	return nil, store.ErrOrgNotFound
+}
+
+func setupSaaSTestServer(t *testing.T, orgsByToken map[string]*drevtypes.Org) (*httptest.Server, *Handler, store.Store) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "drev.db")
+	logDir := filepath.Join(dir, "logs")
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+
+	orgsByTokenHash := make(map[string]*drevtypes.Org)
+	for token, org := range orgsByToken {
+		orgsByTokenHash[auth.HashToken(token)] = org
+	}
+	wrapper := &saasTestStore{
+		Store:           s,
+		orgsByTokenHash: orgsByTokenHash,
+	}
+
+	p := parser.NewParser()
+	sched := scheduler.New(nil, wrapper)
+	stream := streamer.New(logDir)
+
+	os.Setenv("DREV_API_TOKENS", "static-test-token")
+
+	q := queue.New(10)
+	wh := webhook.New(wrapper, q, p, stream, "", t.TempDir())
+	h := New(wrapper, sched, p, stream, q, 1, wh, logDir, false)
+
+	server := httptest.NewServer(h.Routes())
+
+	t.Cleanup(func() {
+		server.Close()
+		s.Close()
+		for {
+			select {
+			case job := <-q.Drain():
+				if job.LogWriter != nil {
+					job.LogWriter.Close()
+				}
+			default:
+				return
+			}
+		}
+	})
+
+	return server, h, s
+}
+
+func triggerTestPipeline(t *testing.T, srvURL, token, ymlPath string) (int, string) {
+	t.Helper()
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"pipeline_path": ymlPath,
+	})
+	req, err := http.NewRequest("POST", srvURL+"/api/v1/pipelines/trigger", bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("creating trigger request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("trigger request failed: %v", err)
+	}
+	defer res.Body.Close()
+
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	return res.StatusCode, string(bodyBytes)
+}
+
+func TestTrigger_ConcurrentRequests_EnforcesWorkerLimit(t *testing.T) {
+	org := &drevtypes.Org{
+		ID:          "org-limit-test",
+		Slug:        "org-limit",
+		Plan:        "pro",
+		WorkerLimit: 2,
+	}
+	srv, _, s := setupSaaSTestServer(t, map[string]*drevtypes.Org{
+		"token-limit-test": org,
+	})
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: concurrent-limit-pipeline
+jobs:
+  - name: job-1
+    image: alpine
+    steps:
+      - name: step-1
+        run: echo "test"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	const totalRequests = 10
+	type result struct {
+		statusCode int
+		body       string
+	}
+	results := make(chan result, totalRequests)
+
+	var startWg sync.WaitGroup
+	startWg.Add(1)
+	var doneWg sync.WaitGroup
+	doneWg.Add(totalRequests)
+
+	for i := 0; i < totalRequests; i++ {
+		go func() {
+			defer doneWg.Done()
+			startWg.Wait() // synchronize goroutines to hit endpoint concurrently
+
+			status, body := triggerTestPipeline(t, srv.URL, "token-limit-test", ymlPath)
+			results <- result{statusCode: status, body: body}
+		}()
+	}
+
+	startWg.Done()
+	doneWg.Wait()
+	close(results)
+
+	var acceptedCount, rejectedCount int
+	for res := range results {
+		switch res.statusCode {
+		case http.StatusAccepted:
+			acceptedCount++
+			var m map[string]string
+			if err := json.Unmarshal([]byte(res.body), &m); err != nil || m["run_id"] == "" {
+				t.Errorf("expected run_id in accepted response, got %s", res.body)
+			}
+		case http.StatusTooManyRequests:
+			rejectedCount++
+			if !strings.Contains(res.body, "worker limit reached for your plan (pro: 2 workers)") {
+				t.Errorf("expected 429 worker limit message, got %s", res.body)
+			}
+		default:
+			t.Errorf("unexpected status code: %d, body: %s", res.statusCode, res.body)
+		}
+	}
+
+	if acceptedCount != 2 {
+		t.Errorf("expected exactly 2 accepted requests for WorkerLimit=2, got %d", acceptedCount)
+	}
+	if rejectedCount != totalRequests-2 {
+		t.Errorf("expected exactly %d rejected requests, got %d", totalRequests-2, rejectedCount)
+	}
+
+	// Verify store state: exactly 2 runs created, both belonging to the tenant
+	runs, err := s.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("expected exactly 2 runs in store, found %d", len(runs))
+	}
+	for _, r := range runs {
+		if r.OrgID != org.ID {
+			t.Errorf("expected run.OrgID %q, got %q", org.ID, r.OrgID)
+		}
+		if r.Status != drevtypes.StatusPending {
+			t.Errorf("expected run status %q, got %q", drevtypes.StatusPending, r.Status)
+		}
+	}
+}
+
+func TestTrigger_MultiTenant_IndependentAllowances(t *testing.T) {
+	orgA := &drevtypes.Org{
+		ID:          "org-alpha",
+		Slug:        "alpha",
+		Plan:        "starter",
+		WorkerLimit: 2,
+	}
+	orgB := &drevtypes.Org{
+		ID:          "org-beta",
+		Slug:        "beta",
+		Plan:        "pro",
+		WorkerLimit: 3,
+	}
+	srv, _, s := setupSaaSTestServer(t, map[string]*drevtypes.Org{
+		"token-alpha": orgA,
+		"token-beta":  orgB,
+	})
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: multi-tenant-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	// 1. Org B exhausts all 3 available workers
+	for i := 1; i <= 3; i++ {
+		status, body := triggerTestPipeline(t, srv.URL, "token-beta", ymlPath)
+		if status != http.StatusAccepted {
+			t.Fatalf("Org B run %d: expected 202, got %d (body: %s)", i, status, body)
+		}
+	}
+	// Org B 4th run must be rejected with 429
+	statusB, bodyB := triggerTestPipeline(t, srv.URL, "token-beta", ymlPath)
+	if statusB != http.StatusTooManyRequests {
+		t.Fatalf("Org B 4th run: expected 429, got %d (body: %s)", statusB, bodyB)
+	}
+	if !strings.Contains(bodyB, "worker limit reached for your plan (pro: 3 workers)") {
+		t.Errorf("unexpected error message for Org B: %s", bodyB)
+	}
+
+	// 2. Org A must be completely unaffected by Org B's queue saturation
+	for i := 1; i <= 2; i++ {
+		status, body := triggerTestPipeline(t, srv.URL, "token-alpha", ymlPath)
+		if status != http.StatusAccepted {
+			t.Fatalf("Org A run %d: expected 202 despite Org B being full, got %d (body: %s)", i, status, body)
+		}
+	}
+	// Org A 3rd run exceeds Org A's limit (2)
+	statusA, bodyA := triggerTestPipeline(t, srv.URL, "token-alpha", ymlPath)
+	if statusA != http.StatusTooManyRequests {
+		t.Fatalf("Org A 3rd run: expected 429, got %d (body: %s)", statusA, bodyA)
+	}
+	if !strings.Contains(bodyA, "worker limit reached for your plan (starter: 2 workers)") {
+		t.Errorf("unexpected error message for Org A: %s", bodyA)
+	}
+
+	// 3. Verify runs in store: 3 for Org B, 2 for Org A
+	runs, err := s.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	var countA, countB int
+	for _, r := range runs {
+		if r.OrgID == orgA.ID {
+			countA++
+		} else if r.OrgID == orgB.ID {
+			countB++
+		}
+	}
+	if countA != 2 {
+		t.Errorf("expected 2 runs for Org A, got %d", countA)
+	}
+	if countB != 3 {
+		t.Errorf("expected 3 runs for Org B, got %d", countB)
+	}
+}
+
+func TestTrigger_EmptyOrgID_FailsClosed(t *testing.T) {
+	emptyOrg := &drevtypes.Org{
+		ID:          "",
+		Slug:        "empty-org",
+		Plan:        "pro",
+		WorkerLimit: 2,
+	}
+	spaceOrg := &drevtypes.Org{
+		ID:          "   ",
+		Slug:        "space-org",
+		Plan:        "pro",
+		WorkerLimit: 2,
+	}
+	srv, _, s := setupSaaSTestServer(t, map[string]*drevtypes.Org{
+		"token-empty": emptyOrg,
+		"token-space": spaceOrg,
+	})
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: empty-org-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	// Test empty OrgID
+	status, body := triggerTestPipeline(t, srv.URL, "token-empty", ymlPath)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for empty OrgID, got %d (body: %s)", status, body)
+	}
+	if !strings.Contains(body, "invalid tenant credentials: empty organization id") {
+		t.Errorf("expected empty organization id error, got %s", body)
+	}
+
+	// Test whitespace-only OrgID
+	statusSpace, bodySpace := triggerTestPipeline(t, srv.URL, "token-space", ymlPath)
+	if statusSpace != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for whitespace OrgID, got %d (body: %s)", statusSpace, bodySpace)
+	}
+	if !strings.Contains(bodySpace, "invalid tenant credentials: empty organization id") {
+		t.Errorf("expected empty organization id error, got %s", bodySpace)
+	}
+
+	// Verify no runs were created
+	runs, err := s.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("expected 0 runs in store, found %d", len(runs))
+	}
+}
+
+func TestTrigger_CapacityRecovery_AfterRunCompletion(t *testing.T) {
+	org := &drevtypes.Org{
+		ID:          "org-recovery",
+		Slug:        "recovery",
+		Plan:        "solo",
+		WorkerLimit: 1,
+	}
+	srv, _, s := setupSaaSTestServer(t, map[string]*drevtypes.Org{
+		"token-recovery": org,
+	})
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: recovery-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. First trigger succeeds
+	status1, body1 := triggerTestPipeline(t, srv.URL, "token-recovery", ymlPath)
+	if status1 != http.StatusAccepted {
+		t.Fatalf("run 1: expected 202, got %d (body: %s)", status1, body1)
+	}
+	var resp1 map[string]string
+	if err := json.Unmarshal([]byte(body1), &resp1); err != nil {
+		t.Fatalf("unmarshaling run 1 response: %v", err)
+	}
+	run1ID := resp1["run_id"]
+	if run1ID == "" {
+		t.Fatal("expected run_id in response 1")
+	}
+
+	// 2. Second trigger is rejected (limit = 1)
+	status2, body2 := triggerTestPipeline(t, srv.URL, "token-recovery", ymlPath)
+	if status2 != http.StatusTooManyRequests {
+		t.Fatalf("run 2: expected 429, got %d (body: %s)", status2, body2)
+	}
+
+	// 3. Mark run 1 as Success -> frees active capacity
+	if err := s.UpdateRunStatus(ctx, run1ID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("updating run 1 to success: %v", err)
+	}
+
+	// 4. Trigger succeeds now
+	status3, body3 := triggerTestPipeline(t, srv.URL, "token-recovery", ymlPath)
+	if status3 != http.StatusAccepted {
+		t.Fatalf("run 3: expected 202 after run 1 succeeded, got %d (body: %s)", status3, body3)
+	}
+	var resp3 map[string]string
+	if err := json.Unmarshal([]byte(body3), &resp3); err != nil {
+		t.Fatalf("unmarshaling run 3 response: %v", err)
+	}
+	run3ID := resp3["run_id"]
+	if run3ID == "" {
+		t.Fatal("expected run_id in response 3")
+	}
+
+	// 5. Subsequent trigger is rejected again
+	status4, _ := triggerTestPipeline(t, srv.URL, "token-recovery", ymlPath)
+	if status4 != http.StatusTooManyRequests {
+		t.Fatalf("run 4: expected 429, got %d", status4)
+	}
+
+	// 6. Mark run 3 as Failed -> frees active capacity
+	if err := s.UpdateRunStatus(ctx, run3ID, drevtypes.StatusFailed); err != nil {
+		t.Fatalf("updating run 3 to failed: %v", err)
+	}
+
+	// 7. Trigger succeeds again
+	status5, _ := triggerTestPipeline(t, srv.URL, "token-recovery", ymlPath)
+	if status5 != http.StatusAccepted {
+		t.Fatalf("run 5: expected 202 after run 3 failed, got %d", status5)
+	}
+}
+
+func TestTrigger_SingleTenant_StaticToken_NoLimit(t *testing.T) {
+	srv, _ := setupTestServer(t)
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: static-token-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	// Single-tenant static token should allow triggering multiple runs without tenant worker limit
+	for i := 1; i <= 5; i++ {
+		status, body := triggerTestPipeline(t, srv.URL, "test-token", ymlPath)
+		if status != http.StatusAccepted {
+			t.Fatalf("static token run %d: expected 202, got %d (body: %s)", i, status, body)
+		}
+	}
+}
+
+func TestTrigger_GlobalQueueFull_SaaS_FailsRunAndReleasesCapacity(t *testing.T) {
+	org := &drevtypes.Org{
+		ID:          "org-queue-full",
+		Slug:        "queue-full",
+		Plan:        "pro",
+		WorkerLimit: 2,
+	}
+	srv, h, s := setupSaaSTestServer(t, map[string]*drevtypes.Org{
+		"token-qfull": org,
+	})
+
+	// Fill the global queue to capacity (10 jobs)
+	for i := 0; i < 10; i++ {
+		if err := h.queue.Enqueue(&queue.Job{
+			RunID:      fmt.Sprintf("fill-%d", i),
+			Pipeline:   &drevtypes.Pipeline{Name: "fill"},
+			LogWriter:  nopWriteCloser{io.Discard},
+			EnqueuedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("filling queue at %d: %v", i, err)
+		}
+	}
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: qfull-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	// Trigger request while global queue is full -> must return 503
+	status, body := triggerTestPipeline(t, srv.URL, "token-qfull", ymlPath)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable, got %d (body: %s)", status, body)
+	}
+	if !strings.Contains(body, "queue is full") {
+		t.Errorf("expected 'queue is full' in 503 response, got %s", body)
+	}
+
+	// Check store: the rejected run must be marked StatusFailed so it doesn't leak tenant capacity
+	runs, err := s.ListRuns(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	var rejectedRun *drevtypes.Run
+	for _, r := range runs {
+		if r.OrgID == org.ID {
+			rejectedRun = r
+			break
+		}
+	}
+	if rejectedRun == nil {
+		t.Fatal("expected rejected run to exist in store")
+	}
+	if rejectedRun.Status != drevtypes.StatusFailed {
+		t.Fatalf("expected rejected run to have status %q, got %q", drevtypes.StatusFailed, rejectedRun.Status)
+	}
+
+	// Drain 1 item from the global queue
+	select {
+	case job := <-h.queue.Drain():
+		if job.LogWriter != nil {
+			job.LogWriter.Close()
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out draining 1 job from queue")
+	}
+
+	// Now trigger again. Because the rejected run was marked StatusFailed,
+	// Org's active count is 0, so this trigger should succeed with 202!
+	status2, body2 := triggerTestPipeline(t, srv.URL, "token-qfull", ymlPath)
+	if status2 != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted after queue freed slot, got %d (body: %s)", status2, body2)
+	}
+}
+
+type orgNotFoundStore struct {
+	store.Store
+}
+
+func (m *orgNotFoundStore) CreateRunWithLimit(_ context.Context, _ *drevtypes.Run, _ []*drevtypes.RunJob, _ int) error {
+	return store.ErrOrgNotFound
+}
+
+func TestTrigger_OrgNotFound_Returns401(t *testing.T) {
+	org := &drevtypes.Org{
+		ID:          "org-not-found",
+		Slug:        "missing",
+		Plan:        "pro",
+		WorkerLimit: 2,
+	}
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "drev.db")
+	logDir := filepath.Join(dir, "logs")
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+
+	tokenHash := auth.HashToken("token-missing")
+	wrapper := &saasTestStore{
+		Store: &orgNotFoundStore{Store: s},
+		orgsByTokenHash: map[string]*drevtypes.Org{
+			tokenHash: org,
+		},
+	}
+
+	p := parser.NewParser()
+	sched := scheduler.New(nil, wrapper)
+	stream := streamer.New(logDir)
+	q := queue.New(10)
+	wh := webhook.New(wrapper, q, p, stream, "", t.TempDir())
+	h := New(wrapper, sched, p, stream, q, 1, wh, logDir, false)
+
+	server := httptest.NewServer(h.Routes())
+	defer func() {
+		server.Close()
+		s.Close()
+	}()
+
+	ymlPath := filepath.Join(t.TempDir(), "pipeline.yml")
+	pipelineYAML := `
+name: test-pipeline
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "ok"
+`
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	status, body := triggerTestPipeline(t, server.URL, "token-missing", ymlPath)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for ErrOrgNotFound, got %d (body: %s)", status, body)
+	}
+	if !strings.Contains(body, "organization not found") {
+		t.Errorf("expected 'organization not found' in response, got %s", body)
 	}
 }

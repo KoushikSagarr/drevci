@@ -208,6 +208,86 @@ func (s *PostgresStore) CreateRun(ctx context.Context, run *drevtypes.Run) error
 	return err
 }
 
+// CreateRunWithLimit atomically checks organization capacity with row-level locking
+// and creates a run with its jobs in a single transaction.
+func (s *PostgresStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int) error {
+	if run == nil || strings.TrimSpace(run.ID) == "" {
+		return errors.New("run or run.ID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning postgres transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if workerLimit > 0 {
+		if strings.TrimSpace(run.OrgID) == "" {
+			return errors.New("cannot enforce worker limit without valid org_id")
+		}
+
+		// 1. Lock the organization row for update to serialize concurrent reservations for this tenant.
+		// Unrelated organizations are not locked and proceed in parallel.
+		var lockedOrgID string
+		err := tx.QueryRowContext(ctx, `
+			SELECT id FROM organizations WHERE id = $1 FOR UPDATE`, run.OrgID).Scan(&lockedOrgID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrOrgNotFound
+			}
+			return fmt.Errorf("locking organization for capacity check: %w", err)
+		}
+
+		// 2. Count active runs (pending or running) for this organization.
+		var activeRuns int
+		err = tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM runs
+			WHERE org_id = $1 AND status IN ('running', 'pending')`, run.OrgID).Scan(&activeRuns)
+		if err != nil {
+			return fmt.Errorf("counting active runs for organization: %w", err)
+		}
+
+		// 3. Enforce limit: fail closed if limit reached.
+		if activeRuns >= workerLimit {
+			return ErrWorkerLimitExceeded
+		}
+	}
+
+	// 4. Insert parent run
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO runs
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
+		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
+		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting postgres run: %w", err)
+	}
+
+	// 5. Insert run jobs
+	for _, job := range jobs {
+		if job == nil || strings.TrimSpace(job.ID) == "" {
+			return errors.New("job or job.ID cannot be empty")
+		}
+		status := job.Status
+		if status == "" {
+			status = drevtypes.StatusPending
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO run_jobs (id, run_id, job_name, status)
+			VALUES ($1, $2, $3, $4)`,
+			job.ID, run.ID, job.JobName, string(status),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting postgres run job: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (s *PostgresStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,

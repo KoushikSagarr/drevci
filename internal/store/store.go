@@ -51,6 +51,12 @@ var ErrDuplicateDelivery = errors.New("duplicate webhook delivery")
 // ErrRunAlreadyClaimed indicates that a run is no longer pending or has already been claimed by another worker.
 var ErrRunAlreadyClaimed = errors.New("run already claimed or not pending")
 
+// ErrWorkerLimitExceeded indicates that an organization has reached its maximum allowed active runs.
+var ErrWorkerLimitExceeded = errors.New("worker limit reached for plan")
+
+// ErrOrgNotFound indicates that the specified organization does not exist.
+var ErrOrgNotFound = errors.New("organization not found")
+
 // Store defines the persistence interface for pipeline runs and SaaS tenancy.
 type Store interface {
 	// ── Core pipeline methods ──────────────────────────────────────────────
@@ -65,6 +71,7 @@ type Store interface {
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 	GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error)
+	CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int) error
 
 	// ── Webhook delivery idempotency & durable outbox ─────────────────────
 	CreateRunWithDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery, run *drevtypes.Run, jobs []*drevtypes.RunJob, pipelineSpec string) error
@@ -244,9 +251,14 @@ func migrateSQLite(ctx context.Context, db *sql.DB) error {
 func Open(dbPath string) (*SQLiteStore, error) {
 	dsn := dbPath
 	if !strings.Contains(dsn, "?") {
-		dsn += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	} else if !strings.Contains(dsn, "busy_timeout") {
-		dsn += "&_pragma=busy_timeout(5000)"
+		dsn += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_txlock=immediate"
+	} else {
+		if !strings.Contains(dsn, "busy_timeout") {
+			dsn += "&_pragma=busy_timeout(5000)"
+		}
+		if !strings.Contains(dsn, "_txlock") {
+			dsn += "&_txlock=immediate"
+		}
 	}
 
 	db, err := sql.Open("sqlite", dsn)
@@ -449,6 +461,71 @@ func (s *SQLiteStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
 	)
 	return err
+}
+
+// CreateRunWithLimit atomically checks organization capacity and creates a run with its jobs.
+func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int) error {
+	if run == nil || strings.TrimSpace(run.ID) == "" {
+		return errors.New("run or run.ID cannot be empty")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning sqlite transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if workerLimit > 0 {
+		if strings.TrimSpace(run.OrgID) == "" {
+			return errors.New("cannot enforce worker limit without valid org_id")
+		}
+
+		var activeRuns int
+		err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM runs
+			WHERE org_id = ? AND status IN ('running', 'pending')`, run.OrgID).Scan(&activeRuns)
+		if err != nil {
+			return fmt.Errorf("counting active runs for organization: %w", err)
+		}
+
+		if activeRuns >= workerLimit {
+			return ErrWorkerLimitExceeded
+		}
+	}
+
+	// 1. Insert parent run
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.OrgID, run.PipelineID, string(run.Status),
+		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
+		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting sqlite run: %w", err)
+	}
+
+	// 2. Insert run jobs
+	for _, job := range jobs {
+		if job == nil || strings.TrimSpace(job.ID) == "" {
+			return errors.New("job or job.ID cannot be empty")
+		}
+		status := job.Status
+		if status == "" {
+			status = drevtypes.StatusPending
+		}
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			job.ID, run.ID, job.JobName, string(status),
+			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("inserting sqlite run job: %w", err)
+		}
+	}
+
+	return tx.Commit()
 }
 
 func nullStr(s string) interface{} {

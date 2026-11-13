@@ -2395,3 +2395,220 @@ func TestStore_CreateRunWithDelivery_DuplicateDelivery_RollsBackRun(t *testing.T
 		t.Fatalf("expected original run1 to remain intact, got: %+v (err: %v)", gotRun1, err)
 	}
 }
+
+func TestStore_CreateRunWithLimit_ConcurrentRequests_CannotExceedLimit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent_limit.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-concurrency-test"
+	workerLimit := 2
+	concurrency := 10
+
+	var wg sync.WaitGroup
+	var successCount int64
+	var limitExceededCount int64
+	var otherErrCount int64
+
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			runID := fmt.Sprintf("run-conc-%d", idx)
+			run := &drevtypes.Run{
+				ID:          runID,
+				OrgID:       orgID,
+				PipelineID:  "p1",
+				Status:      drevtypes.StatusPending,
+				TriggeredBy: "api",
+			}
+			jobs := []*drevtypes.RunJob{
+				{ID: fmt.Sprintf("job-conc-%d", idx), RunID: runID, JobName: "build", Status: drevtypes.StatusPending},
+			}
+			err := s.CreateRunWithLimit(ctx, run, jobs, workerLimit)
+			if err == nil {
+				atomic.AddInt64(&successCount, 1)
+			} else if errors.Is(err, store.ErrWorkerLimitExceeded) {
+				atomic.AddInt64(&limitExceededCount, 1)
+			} else {
+				atomic.AddInt64(&otherErrCount, 1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if otherErrCount > 0 {
+		t.Fatalf("unexpected errors during concurrent CreateRunWithLimit: %d", otherErrCount)
+	}
+	if successCount != int64(workerLimit) {
+		t.Errorf("expected exactly %d successes, got %d", workerLimit, successCount)
+	}
+	if limitExceededCount != int64(concurrency-workerLimit) {
+		t.Errorf("expected exactly %d limit exceeded errors, got %d", concurrency-workerLimit, limitExceededCount)
+	}
+
+	// Verify database state: exactly 2 runs exist for orgID
+	runs, err := s.ListRunsByOrg(ctx, orgID, 50)
+	if err != nil {
+		t.Fatalf("ListRunsByOrg: %v", err)
+	}
+	activeCount := 0
+	for _, r := range runs {
+		if r.OrgID == orgID && (r.Status == drevtypes.StatusPending || r.Status == drevtypes.StatusRunning) {
+			activeCount++
+		}
+	}
+	if activeCount != workerLimit {
+		t.Errorf("expected %d active runs in database, got %d", workerLimit, activeCount)
+	}
+}
+
+func TestStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "indep_allowances.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Tenant A (limit 2)
+	for i := 1; i <= 2; i++ {
+		runID := fmt.Sprintf("run-a-%d", i)
+		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+			ID: runID, OrgID: "org-A", PipelineID: "pA", Status: drevtypes.StatusPending,
+		}, nil, 2)
+		if err != nil {
+			t.Fatalf("CreateRunWithLimit for org-A (%d) failed: %v", i, err)
+		}
+	}
+
+	// Tenant B (limit 3) can still use its full capacity independently
+	for i := 1; i <= 3; i++ {
+		runID := fmt.Sprintf("run-b-%d", i)
+		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+			ID: runID, OrgID: "org-B", PipelineID: "pB", Status: drevtypes.StatusPending,
+		}, nil, 3)
+		if err != nil {
+			t.Fatalf("CreateRunWithLimit for org-B (%d) failed: %v", i, err)
+		}
+	}
+
+	// Tenant A is at capacity: next attempt fails with ErrWorkerLimitExceeded
+	errA := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-a-overflow", OrgID: "org-A", PipelineID: "pA", Status: drevtypes.StatusPending,
+	}, nil, 2)
+	if !errors.Is(errA, store.ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded for org-A, got: %v", errA)
+	}
+
+	// Tenant B is at capacity: next attempt fails with ErrWorkerLimitExceeded
+	errB := s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-b-overflow", OrgID: "org-B", PipelineID: "pB", Status: drevtypes.StatusPending,
+	}, nil, 3)
+	if !errors.Is(errB, store.ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded for org-B, got: %v", errB)
+	}
+}
+
+func TestStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "terminal_free.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Fill capacity (limit 1)
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-term-1", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
+	}, nil, 1)
+	if err != nil {
+		t.Fatalf("CreateRunWithLimit: %v", err)
+	}
+
+	// Next attempt fails
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-term-2", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
+	}, nil, 1)
+	if !errors.Is(err, store.ErrWorkerLimitExceeded) {
+		t.Fatalf("expected ErrWorkerLimitExceeded, got: %v", err)
+	}
+
+	// Mark run-term-1 as Success (terminal)
+	if err := s.UpdateRunStatus(ctx, "run-term-1", drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+
+	// Capacity is freed; run-term-2 now succeeds
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-term-2", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
+	}, nil, 1)
+	if err != nil {
+		t.Fatalf("expected CreateRunWithLimit to succeed after terminal transition: %v", err)
+	}
+}
+
+func TestStore_CreateRunWithLimit_TenantSafety_EmptyOrgID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "empty_org.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// workerLimit > 0 with empty OrgID must fail closed
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-empty-org", OrgID: "", PipelineID: "pEmpty", Status: drevtypes.StatusPending,
+	}, nil, 2)
+	if err == nil {
+		t.Fatalf("expected error when workerLimit > 0 and OrgID is empty, got nil")
+	}
+
+	// workerLimit <= 0 with empty OrgID is single-tenant mode and succeeds
+	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
+		ID: "run-single-tenant", OrgID: "", PipelineID: "pSingle", Status: drevtypes.StatusPending,
+	}, nil, 0)
+	if err != nil {
+		t.Fatalf("expected CreateRunWithLimit to succeed when workerLimit == 0: %v", err)
+	}
+}
+
+func TestStore_CreateRunWithLimit_RollbackOnJobFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "rollback_job.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID: "run-fail-job", OrgID: "org-Fail", PipelineID: "pFail", Status: drevtypes.StatusPending,
+	}
+	invalidJobs := []*drevtypes.RunJob{
+		{ID: "job-ok", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+		{ID: "", JobName: "broken"}, // empty job ID triggers error
+	}
+
+	err = s.CreateRunWithLimit(ctx, run, invalidJobs, 2)
+	if err == nil {
+		t.Fatalf("expected error on invalid job ID, got nil")
+	}
+
+	// Verify parent run was rolled back
+	gotRun, err := s.GetRun(ctx, run.ID)
+	if err == nil && gotRun != nil {
+		t.Fatalf("expected run to be rolled back, found in store: %+v", gotRun)
+	}
+}

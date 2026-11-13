@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -176,16 +177,20 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 	// ── Multi-tenant: extract org context ─────────────────────────────────
 	org := auth.GetOrgContext(r)
 
-	// Check worker limit for SaaS plans
-	if org != nil && org.WorkerLimit > 0 {
-		if h.queue.Depth() >= org.WorkerLimit {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error": fmt.Sprintf("worker limit reached for your plan (%s: %d workers)", org.Plan, org.WorkerLimit),
-			})
-			return
-		}
+	workerLimit := 0
+	if org != nil {
+		workerLimit = org.WorkerLimit
+	}
+
+	// Fail closed if authenticated SaaS context has empty OrgID when worker limit is configured
+	if org != nil && workerLimit > 0 && strings.TrimSpace(org.OrgID) == "" {
+		log.Printf("[api] reject trigger: authenticated SaaS context has empty OrgID")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "invalid tenant credentials: empty organization id",
+		})
+		return
 	}
 
 	runID := uuid.New().String()
@@ -199,33 +204,48 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		run.OrgID = org.OrgID
 	}
 
-	if err := h.store.CreateRun(r.Context(), run); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
 	createdJobIDs := make([]string, 0, len(pipeline.Jobs))
+	runJobs := make([]*drevtypes.RunJob, 0, len(pipeline.Jobs))
 	for _, job := range pipeline.Jobs {
+		jobID := uuid.New().String()
 		rj := &drevtypes.RunJob{
-			ID:      uuid.New().String(),
+			ID:      jobID,
 			RunID:   runID,
 			JobName: job.Name,
 			Status:  drevtypes.StatusPending,
 		}
-		if err := h.store.CreateRunJob(r.Context(), rj); err != nil {
-			log.Printf("[api] failed to create run job %s for run %s: %v", job.Name, runID, err)
-			_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		runJobs = append(runJobs, rj)
+		createdJobIDs = append(createdJobIDs, jobID)
+	}
+
+	// Atomic capacity reservation and creation
+	if err := h.store.CreateRunWithLimit(r.Context(), run, runJobs, workerLimit); err != nil {
+		if errors.Is(err, store.ErrWorkerLimitExceeded) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("worker limit reached for your plan (%s: %d workers)", org.Plan, org.WorkerLimit),
+			})
 			return
 		}
-		createdJobIDs = append(createdJobIDs, rj.ID)
+		if errors.Is(err, store.ErrOrgNotFound) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "organization not found",
+			})
+			return
+		}
+		log.Printf("[api] failed to create run with limit for org %q: %v", run.OrgID, err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
 	}
 
 	logW, err := h.streamer.Writer(runID)
 	if err != nil {
 		log.Printf("[api] failed to create log writer for run %s: %v", runID, err)
 		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
 	if err := h.queue.Enqueue(&queue.Job{
