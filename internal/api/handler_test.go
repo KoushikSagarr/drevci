@@ -18,11 +18,13 @@ import (
 
 	"github.com/drevci/drev/internal/auth"
 	"github.com/drevci/drev/internal/parser"
+	"github.com/drevci/drev/internal/pool"
 	"github.com/drevci/drev/internal/queue"
 	"github.com/drevci/drev/internal/scheduler"
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 	"github.com/drevci/drev/internal/webhook"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/drevci/drev/pkg/drevtypes"
 )
 
@@ -1185,7 +1187,7 @@ type orgNotFoundStore struct {
 	store.Store
 }
 
-func (m *orgNotFoundStore) CreateRunWithLimit(_ context.Context, _ *drevtypes.Run, _ []*drevtypes.RunJob, _ int) error {
+func (m *orgNotFoundStore) CreateRunWithLimit(_ context.Context, _ *drevtypes.Run, _ []*drevtypes.RunJob, _ int, _ string) error {
 	return store.ErrOrgNotFound
 }
 
@@ -1247,5 +1249,376 @@ jobs:
 	}
 	if !strings.Contains(body, "organization not found") {
 		t.Errorf("expected 'organization not found' in response, got %s", body)
+	}
+}
+
+func TestTrigger_OutboxPersistence(t *testing.T) {
+	srv, h := setupTestServer(t)
+
+	pipelineYAML := `
+name: test-outbox-pipeline
+jobs:
+  - name: build
+    image: alpine
+    steps:
+      - name: compile
+        run: echo "building"
+`
+	ymlPath := filepath.Join(t.TempDir(), "outbox_pipe.yml")
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	status, body := triggerTestPipeline(t, srv.URL, "test-token", ymlPath)
+	if status != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d (body: %s)", status, body)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshaling response: %v", err)
+	}
+	runID := resp["run_id"]
+	if runID == "" {
+		t.Fatal("expected non-empty run_id in response")
+	}
+
+	// Verify outbox entry exists in store for this run
+	outboxItems, err := h.store.GetPendingOutbox(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox failed: %v", err)
+	}
+	var targetItem *drevtypes.OutboxItem
+	for _, item := range outboxItems {
+		if item.RunID == runID {
+			targetItem = item
+			break
+		}
+	}
+	if targetItem == nil {
+		t.Fatalf("expected outbox entry for run %s, got none (outbox items: %+v)", runID, outboxItems)
+	}
+
+	// Verify pipeline_spec deserializes into a valid pipeline with matching name and jobs
+	var parsed drevtypes.Pipeline
+	if err := json.Unmarshal([]byte(targetItem.PipelineSpec), &parsed); err != nil {
+		t.Fatalf("unmarshaling stored pipeline_spec: %v", err)
+	}
+	if parsed.Name != "test-outbox-pipeline" {
+		t.Errorf("pipeline name = %q, want test-outbox-pipeline", parsed.Name)
+	}
+	if len(parsed.Jobs) != 1 || parsed.Jobs[0].Name != "build" {
+		t.Errorf("unexpected jobs in parsed pipeline: %+v", parsed.Jobs)
+	}
+}
+
+type mockRecoveryRunner struct{}
+
+func (m *mockRecoveryRunner) RunJob(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+	return nil
+}
+
+func TestTrigger_CrashRecovery_ReenqueuesRun(t *testing.T) {
+	srv, h := setupTestServer(t)
+	ctx := context.Background()
+
+	pipelineYAML := `
+name: test-crash-recovery
+jobs:
+  - name: worker-job
+    image: alpine
+    steps:
+      - name: step1
+        run: echo "survived crash"
+`
+	ymlPath := filepath.Join(t.TempDir(), "recovery_pipe.yml")
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	status, body := triggerTestPipeline(t, srv.URL, "test-token", ymlPath)
+	if status != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d (body: %s)", status, body)
+	}
+
+	var resp map[string]string
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("unmarshaling response: %v", err)
+	}
+	runID := resp["run_id"]
+
+	// Simulate crash: drain in-memory queue so the enqueued run is lost in memory
+	select {
+	case drainedJob := <-h.queue.Drain():
+		if drainedJob.RunID != runID {
+			t.Fatalf("drained unexpected job: %s", drainedJob.RunID)
+		}
+		if drainedJob.LogWriter != nil {
+			drainedJob.LogWriter.Close()
+		}
+	default:
+		t.Fatal("expected job in queue to drain")
+	}
+
+	// Simulate daemon startup:
+	// 1. ResetGhostRuns is run. It must NOT mark this pending API run as failed because it has an active outbox record!
+	interrupted, err := h.store.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	for _, id := range interrupted {
+		if id == runID {
+			t.Fatalf("pending API run %s with outbox record was improperly interrupted by ResetGhostRuns", runID)
+		}
+	}
+
+	runBeforeRecov, err := h.store.GetRun(ctx, runID)
+	if err != nil || runBeforeRecov == nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if runBeforeRecov.Status != drevtypes.StatusPending {
+		t.Fatalf("expected run to remain pending, got: %s", runBeforeRecov.Status)
+	}
+
+	// 2. Setup real scheduler and worker pool using recovered queue and mock runner
+	freshQ := queue.New(10)
+	mr := &mockRecoveryRunner{}
+	sched := scheduler.New(mr, h.store)
+	wp := pool.New(1, freshQ, sched, h.store, nil)
+
+	poolCtx, cancelPool := context.WithCancel(ctx)
+	defer func() {
+		cancelPool()
+		wp.Stop()
+	}()
+	wp.Start(poolCtx)
+
+	// 3. OutboxRecoverer recovers pending runs from durable outbox storage into freshQ
+	recoverer := pool.NewOutboxRecoverer(h.store, freshQ, h.streamer)
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("OutboxRecoverer.Recover failed: %v", err)
+	}
+
+	// 4. Bounded polling for worker to claim, execute, and mark run StatusSuccess
+	deadline := time.Now().Add(5 * time.Second)
+	var finalRun *drevtypes.Run
+	for time.Now().Before(deadline) {
+		r, err := h.store.GetRun(ctx, runID)
+		if err == nil && r != nil && r.Status == drevtypes.StatusSuccess {
+			finalRun = r
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if finalRun == nil {
+		lastRun, _ := h.store.GetRun(ctx, runID)
+		t.Fatalf("timed out waiting for recovered run %s to reach %s; last state: %+v", runID, drevtypes.StatusSuccess, lastRun)
+	}
+
+	// 5. Cancel pool and stop workers cleanly before making final assertions
+	cancelPool()
+	wp.Stop()
+
+	// 6. Assertions:
+	// - Run reaches StatusSuccess with non-zero StartedAt and FinishedAt
+	if finalRun.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected run status %s, got %s", drevtypes.StatusSuccess, finalRun.Status)
+	}
+	if finalRun.StartedAt.IsZero() {
+		t.Errorf("expected run started_at to be non-zero")
+	}
+	if finalRun.FinishedAt.IsZero() {
+		t.Errorf("expected run finished_at to be non-zero")
+	}
+	if !finalRun.FinishedAt.After(finalRun.StartedAt) && !finalRun.FinishedAt.Equal(finalRun.StartedAt) {
+		t.Errorf("expected finished_at (%v) >= started_at (%v)", finalRun.FinishedAt, finalRun.StartedAt)
+	}
+
+	// - Job reaches StatusSuccess with non-zero StartedAt and FinishedAt
+	jobs, err := h.store.GetRunJobs(ctx, runID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected 1 job for run %s, got %d (err: %v)", runID, len(jobs), err)
+	}
+	if jobs[0].Status != drevtypes.StatusSuccess {
+		t.Errorf("expected job status %s, got %s", drevtypes.StatusSuccess, jobs[0].Status)
+	}
+	if jobs[0].StartedAt.IsZero() {
+		t.Errorf("expected job started_at to be non-zero")
+	}
+	if jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected job finished_at to be non-zero")
+	}
+
+	// - Outbox entry is gone
+	outboxAfterExecution, err := h.store.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox after execution: %v", err)
+	}
+	for _, item := range outboxAfterExecution {
+		if item.RunID == runID {
+			t.Errorf("outbox item for completed run %s was not deleted: %+v", runID, item)
+		}
+	}
+}
+
+func TestTrigger_QueueRejection_ClearsOutbox(t *testing.T) {
+	srv, h := setupTestServer(t)
+
+	// Fill queue to capacity
+	for i := 0; i < 10; i++ {
+		if err := h.queue.Enqueue(&queue.Job{
+			RunID:      fmt.Sprintf("fill-%d", i),
+			Pipeline:   &drevtypes.Pipeline{Name: "fill"},
+			LogWriter:  nopWriteCloser{io.Discard},
+			EnqueuedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("filling queue: %v", err)
+		}
+	}
+
+	pipelineYAML := `
+name: test-qfull-outbox
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "test"
+`
+	ymlPath := filepath.Join(t.TempDir(), "qfull_outbox.yml")
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	status, body := triggerTestPipeline(t, srv.URL, "test-token", ymlPath)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable, got %d (body: %s)", status, body)
+	}
+
+	// Find the failed run in store
+	runs, err := h.store.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	var targetRun *drevtypes.Run
+	for _, r := range runs {
+		if r.PipelineID == "test-qfull-outbox" {
+			targetRun = r
+			break
+		}
+	}
+	if targetRun == nil {
+		t.Fatal("expected run record in store for rejected pipeline, got none")
+	}
+	if targetRun.Status != drevtypes.StatusFailed || targetRun.FinishedAt.IsZero() {
+		t.Errorf("expected failed run with finished_at, got: %+v", targetRun)
+	}
+
+	// Verify all jobs in run are StatusFailed
+	jobs, err := h.store.GetRunJobs(context.Background(), targetRun.ID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d (err: %v)", len(jobs), err)
+	}
+	if jobs[0].Status != drevtypes.StatusFailed || jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected failed job with finished_at, got: %+v", jobs[0])
+	}
+
+	// PROVE OUTBOX CLEARED: pipeline_outbox record must NOT exist
+	outboxItems, err := h.store.GetPendingOutbox(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("getting outbox: %v", err)
+	}
+	for _, item := range outboxItems {
+		if item.RunID == targetRun.ID {
+			t.Fatalf("outbox record for rejected run %s was not cleaned up", targetRun.ID)
+		}
+	}
+}
+
+func TestTrigger_StreamerFailure_ClearsOutbox(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "drev.db")
+	// Create a regular file where the log directory is expected to cause streamer.Writer to fail
+	badLogPath := filepath.Join(dir, "bad_logs")
+	if err := os.WriteFile(badLogPath, []byte("regular file"), 0644); err != nil {
+		t.Fatalf("creating bad log file: %v", err)
+	}
+
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+
+	p := parser.NewParser()
+	sched := scheduler.New(nil, s)
+	stream := streamer.New(badLogPath) // will fail on Writer(runID) because badLogPath is a file
+
+	t.Setenv("DREV_API_TOKENS", "test-token")
+
+	q := queue.New(10)
+	wh := webhook.New(s, q, p, stream, "", t.TempDir())
+	h := New(s, sched, p, stream, q, 1, wh, badLogPath, false)
+	server := httptest.NewServer(h.Routes())
+	t.Cleanup(func() {
+		server.Close()
+		s.Close()
+	})
+
+	pipelineYAML := `
+name: test-streamer-fail-pipe
+jobs:
+  - name: test-job
+    image: alpine
+    steps:
+      - name: test
+        run: echo "test"
+`
+	ymlPath := filepath.Join(t.TempDir(), "streamer_fail.yml")
+	if err := os.WriteFile(ymlPath, []byte(pipelineYAML), 0644); err != nil {
+		t.Fatalf("writing pipeline yaml: %v", err)
+	}
+
+	status, body := triggerTestPipeline(t, server.URL, "test-token", ymlPath)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error, got %d (body: %s)", status, body)
+	}
+
+	// Verify the run was marked failed
+	runs, err := s.ListRuns(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("listing runs: %v", err)
+	}
+	var targetRun *drevtypes.Run
+	for _, r := range runs {
+		if r.PipelineID == "test-streamer-fail-pipe" {
+			targetRun = r
+			break
+		}
+	}
+	if targetRun == nil {
+		t.Fatal("expected run in store for streamer failure, got none")
+	}
+	if targetRun.Status != drevtypes.StatusFailed || targetRun.FinishedAt.IsZero() {
+		t.Errorf("expected failed run with finished_at, got: %+v", targetRun)
+	}
+
+	// Verify all jobs in run are StatusFailed
+	jobs, err := s.GetRunJobs(context.Background(), targetRun.ID)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d (err: %v)", len(jobs), err)
+	}
+	if jobs[0].Status != drevtypes.StatusFailed || jobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected failed job with finished_at, got: %+v", jobs[0])
+	}
+
+	// PROVE OUTBOX CLEARED: pipeline_outbox record must NOT exist
+	outboxItems, err := s.GetPendingOutbox(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("getting outbox: %v", err)
+	}
+	for _, item := range outboxItems {
+		if item.RunID == targetRun.ID {
+			t.Fatalf("outbox record for run %s with streamer failure was not cleaned up", targetRun.ID)
+		}
 	}
 }

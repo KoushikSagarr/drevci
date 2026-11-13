@@ -218,8 +218,15 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		createdJobIDs = append(createdJobIDs, jobID)
 	}
 
-	// Atomic capacity reservation and creation
-	if err := h.store.CreateRunWithLimit(r.Context(), run, runJobs, workerLimit); err != nil {
+	pipelineSpecBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		log.Printf("[api] failed to marshal pipeline spec for run %s: %v", runID, err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	// Atomic capacity reservation and creation with durable outbox record
+	if err := h.store.CreateRunWithLimit(r.Context(), run, runJobs, workerLimit, string(pipelineSpecBytes)); err != nil {
 		if errors.Is(err, store.ErrWorkerLimitExceeded) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -244,7 +251,9 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 	logW, err := h.streamer.Writer(runID)
 	if err != nil {
 		log.Printf("[api] failed to create log writer for run %s: %v", runID, err)
-		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, ""); failErr != nil {
+			log.Printf("[api] failed atomic cleanup for run %s after streamer error: %v", runID, failErr)
+		}
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -257,7 +266,9 @@ func (h *Handler) trigger(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[api] run %s rejected: %v", runID, err)
 		fmt.Fprintf(logW, "[drev] pipeline rejected: %v\n", err)
 		logW.Close()
-		_ = store.FailRun(context.Background(), h.store, runID, createdJobIDs)
+		if failErr := h.store.FailRunWithDelivery(context.Background(), runID, createdJobIDs, ""); failErr != nil {
+			log.Printf("[api] failed atomic cleanup for run %s after queue rejection: %v", runID, failErr)
+		}
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}

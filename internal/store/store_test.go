@@ -2429,7 +2429,7 @@ func TestStore_CreateRunWithLimit_ConcurrentRequests_CannotExceedLimit(t *testin
 			jobs := []*drevtypes.RunJob{
 				{ID: fmt.Sprintf("job-conc-%d", idx), RunID: runID, JobName: "build", Status: drevtypes.StatusPending},
 			}
-			err := s.CreateRunWithLimit(ctx, run, jobs, workerLimit)
+			err := s.CreateRunWithLimit(ctx, run, jobs, workerLimit, "")
 			if err == nil {
 				atomic.AddInt64(&successCount, 1)
 			} else if errors.Is(err, store.ErrWorkerLimitExceeded) {
@@ -2482,7 +2482,7 @@ func TestStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
 		runID := fmt.Sprintf("run-a-%d", i)
 		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
 			ID: runID, OrgID: "org-A", PipelineID: "pA", Status: drevtypes.StatusPending,
-		}, nil, 2)
+		}, nil, 2, "")
 		if err != nil {
 			t.Fatalf("CreateRunWithLimit for org-A (%d) failed: %v", i, err)
 		}
@@ -2493,7 +2493,7 @@ func TestStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
 		runID := fmt.Sprintf("run-b-%d", i)
 		err := s.CreateRunWithLimit(ctx, &drevtypes.Run{
 			ID: runID, OrgID: "org-B", PipelineID: "pB", Status: drevtypes.StatusPending,
-		}, nil, 3)
+		}, nil, 3, "")
 		if err != nil {
 			t.Fatalf("CreateRunWithLimit for org-B (%d) failed: %v", i, err)
 		}
@@ -2502,7 +2502,7 @@ func TestStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
 	// Tenant A is at capacity: next attempt fails with ErrWorkerLimitExceeded
 	errA := s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-a-overflow", OrgID: "org-A", PipelineID: "pA", Status: drevtypes.StatusPending,
-	}, nil, 2)
+	}, nil, 2, "")
 	if !errors.Is(errA, store.ErrWorkerLimitExceeded) {
 		t.Fatalf("expected ErrWorkerLimitExceeded for org-A, got: %v", errA)
 	}
@@ -2510,7 +2510,7 @@ func TestStore_CreateRunWithLimit_IndependentTenantAllowances(t *testing.T) {
 	// Tenant B is at capacity: next attempt fails with ErrWorkerLimitExceeded
 	errB := s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-b-overflow", OrgID: "org-B", PipelineID: "pB", Status: drevtypes.StatusPending,
-	}, nil, 3)
+	}, nil, 3, "")
 	if !errors.Is(errB, store.ErrWorkerLimitExceeded) {
 		t.Fatalf("expected ErrWorkerLimitExceeded for org-B, got: %v", errB)
 	}
@@ -2529,7 +2529,7 @@ func TestStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
 	// Fill capacity (limit 1)
 	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-term-1", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
-	}, nil, 1)
+	}, nil, 1, "")
 	if err != nil {
 		t.Fatalf("CreateRunWithLimit: %v", err)
 	}
@@ -2537,7 +2537,7 @@ func TestStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
 	// Next attempt fails
 	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-term-2", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
-	}, nil, 1)
+	}, nil, 1, "")
 	if !errors.Is(err, store.ErrWorkerLimitExceeded) {
 		t.Fatalf("expected ErrWorkerLimitExceeded, got: %v", err)
 	}
@@ -2550,7 +2550,7 @@ func TestStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
 	// Capacity is freed; run-term-2 now succeeds
 	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-term-2", OrgID: "org-T", PipelineID: "pT", Status: drevtypes.StatusPending,
-	}, nil, 1)
+	}, nil, 1, "")
 	if err != nil {
 		t.Fatalf("expected CreateRunWithLimit to succeed after terminal transition: %v", err)
 	}
@@ -2569,7 +2569,7 @@ func TestStore_CreateRunWithLimit_TenantSafety_EmptyOrgID(t *testing.T) {
 	// workerLimit > 0 with empty OrgID must fail closed
 	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-empty-org", OrgID: "", PipelineID: "pEmpty", Status: drevtypes.StatusPending,
-	}, nil, 2)
+	}, nil, 2, "")
 	if err == nil {
 		t.Fatalf("expected error when workerLimit > 0 and OrgID is empty, got nil")
 	}
@@ -2577,7 +2577,7 @@ func TestStore_CreateRunWithLimit_TenantSafety_EmptyOrgID(t *testing.T) {
 	// workerLimit <= 0 with empty OrgID is single-tenant mode and succeeds
 	err = s.CreateRunWithLimit(ctx, &drevtypes.Run{
 		ID: "run-single-tenant", OrgID: "", PipelineID: "pSingle", Status: drevtypes.StatusPending,
-	}, nil, 0)
+	}, nil, 0, "")
 	if err != nil {
 		t.Fatalf("expected CreateRunWithLimit to succeed when workerLimit == 0: %v", err)
 	}
@@ -2601,7 +2601,7 @@ func TestStore_CreateRunWithLimit_RollbackOnJobFailure(t *testing.T) {
 		{ID: "", JobName: "broken"}, // empty job ID triggers error
 	}
 
-	err = s.CreateRunWithLimit(ctx, run, invalidJobs, 2)
+	err = s.CreateRunWithLimit(ctx, run, invalidJobs, 2, "")
 	if err == nil {
 		t.Fatalf("expected error on invalid job ID, got nil")
 	}
@@ -3024,5 +3024,381 @@ func TestStore_UpdateRunStatus_MissingRowCompatible(t *testing.T) {
 	err = s.UpdateRunJobStatus(ctx, "nonexistent-job", drevtypes.StatusRunning)
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expected sql.ErrNoRows for nonexistent job, got: %v", err)
+	}
+}
+
+func TestStore_CreateRunWithLimit_InsertsOutbox(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "outbox_limit.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-outbox-test"
+
+	run := &drevtypes.Run{
+		ID:         "run-api-outbox-01",
+		OrgID:      orgID,
+		PipelineID: "pipe-api-outbox",
+		Status:     drevtypes.StatusPending,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "job-api-outbox-01", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+	}
+	spec := `{"name":"test-spec","jobs":[{"name":"build","image":"alpine","steps":[{"name":"step1","run":"echo 1"}]}]}`
+
+	if err := s.CreateRunWithLimit(ctx, run, jobs, 2, spec); err != nil {
+		t.Fatalf("CreateRunWithLimit failed: %v", err)
+	}
+
+	r, err := s.GetRun(ctx, run.ID)
+	if err != nil || r == nil {
+		t.Fatalf("GetRun failed: %v", err)
+	}
+	if r.Status != drevtypes.StatusPending {
+		t.Fatalf("expected pending status, got %s", r.Status)
+	}
+
+	outboxItems, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outboxItems) != 1 {
+		t.Fatalf("expected 1 outbox item, got %d", len(outboxItems))
+	}
+	if outboxItems[0].RunID != run.ID || outboxItems[0].PipelineSpec != spec {
+		t.Errorf("mismatched outbox item: %+v", outboxItems[0])
+	}
+}
+
+func TestStore_CreateRunWithLimit_RollbackLeavesNoOutbox(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "outbox_rollback.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-rollback-test"
+
+	// Seed existing run
+	runExisting := &drevtypes.Run{
+		ID:         "run-existing-id",
+		OrgID:      orgID,
+		PipelineID: "pipe-existing",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRunWithLimit(ctx, runExisting, nil, 5, ""); err != nil {
+		t.Fatalf("seed existing run: %v", err)
+	}
+
+	// Attempt CreateRunWithLimit with duplicate run ID and non-empty spec
+	runDup := &drevtypes.Run{
+		ID:         "run-existing-id",
+		OrgID:      orgID,
+		PipelineID: "pipe-dup",
+		Status:     drevtypes.StatusPending,
+	}
+	spec := `{"name":"duplicate-spec"}`
+	err = s.CreateRunWithLimit(ctx, runDup, nil, 5, spec)
+	if err == nil {
+		t.Fatal("expected error on duplicate run ID, got nil")
+	}
+
+	// PROVE ROLLBACK: No outbox entry exists
+	outboxItems, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outboxItems) != 0 {
+		t.Fatalf("expected 0 outbox items after rollback, got %d", len(outboxItems))
+	}
+}
+
+func TestStore_FailRunWithDelivery_EmptyDeliveryID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_empty_del.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-empty-del"
+
+	run := &drevtypes.Run{
+		ID:         "run-empty-del-01",
+		OrgID:      orgID,
+		PipelineID: "pipe-empty-del",
+		Status:     drevtypes.StatusPending,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "job-empty-del-01", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+	}
+	spec := `{"name":"spec-empty-del"}`
+	if err := s.CreateRunWithLimit(ctx, run, jobs, 2, spec); err != nil {
+		t.Fatalf("CreateRunWithLimit failed: %v", err)
+	}
+
+	// Call FailRunWithDelivery with empty deliveryID (API trigger failure path)
+	if err := s.FailRunWithDelivery(ctx, run.ID, []string{"job-empty-del-01"}, ""); err != nil {
+		t.Fatalf("FailRunWithDelivery failed: %v", err)
+	}
+
+	r, err := s.GetRun(ctx, run.ID)
+	if err != nil || r == nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if r.Status != drevtypes.StatusFailed || r.FinishedAt.IsZero() {
+		t.Errorf("expected failed run with finished_at, got: %+v", r)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, run.ID)
+	if err != nil || len(gotJobs) != 1 {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if gotJobs[0].Status != drevtypes.StatusFailed || gotJobs[0].FinishedAt.IsZero() {
+		t.Errorf("expected failed job with finished_at, got: %+v", gotJobs[0])
+	}
+
+	outbox, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outbox) != 0 {
+		t.Errorf("expected outbox entry to be deleted, got %d items", len(outbox))
+	}
+}
+
+func TestStore_FailRunWithDelivery_ClaimedRunProtected(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_claimed_protect.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-claimed-protect"
+
+	run := &drevtypes.Run{
+		ID:         "run-claimed-protect-01",
+		OrgID:      orgID,
+		PipelineID: "pipe-claimed-protect",
+		Status:     drevtypes.StatusPending,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "job-claimed-protect-01", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+	}
+	spec := `{"name":"spec-claimed-protect"}`
+	if err := s.CreateRunWithLimit(ctx, run, jobs, 2, spec); err != nil {
+		t.Fatalf("CreateRunWithLimit failed: %v", err)
+	}
+
+	// 1. Worker claims the run for execution
+	if err := s.ClaimRunForExecution(ctx, run.ID); err != nil {
+		t.Fatalf("ClaimRunForExecution failed: %v", err)
+	}
+
+	runAfterClaim, err := s.GetRun(ctx, run.ID)
+	if err != nil || runAfterClaim == nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if runAfterClaim.Status != drevtypes.StatusRunning || runAfterClaim.StartedAt.IsZero() {
+		t.Fatalf("expected running run with started_at, got: %+v", runAfterClaim)
+	}
+
+	// 2. Late FailRunWithDelivery attempts to fail the claimed run
+	err = s.FailRunWithDelivery(ctx, run.ID, []string{"job-claimed-protect-01"}, "")
+	if !errors.Is(err, store.ErrRunAlreadyClaimed) {
+		t.Fatalf("expected ErrRunAlreadyClaimed on running run, got: %v", err)
+	}
+
+	// 3. Verify running run and jobs were NOT corrupted/overwritten
+	runAfterFailAttempt, err := s.GetRun(ctx, run.ID)
+	if err != nil || runAfterFailAttempt == nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if runAfterFailAttempt.Status != drevtypes.StatusRunning {
+		t.Errorf("run status overwritten to %s", runAfterFailAttempt.Status)
+	}
+	if !runAfterFailAttempt.StartedAt.Equal(runAfterClaim.StartedAt) {
+		t.Errorf("run started_at mutated: %v != %v", runAfterFailAttempt.StartedAt, runAfterClaim.StartedAt)
+	}
+
+	gotJobs, err := s.GetRunJobs(ctx, run.ID)
+	if err != nil || len(gotJobs) != 1 {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if gotJobs[0].Status != drevtypes.StatusPending {
+		t.Errorf("job status overwritten to %s", gotJobs[0].Status)
+	}
+}
+
+func TestStore_FailRunWithDelivery_ClaimVsCleanup_Concurrency(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "claim_vs_cleanup.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-concurrent"
+
+	run := &drevtypes.Run{
+		ID:         "run-concurrent-race-01",
+		OrgID:      orgID,
+		PipelineID: "pipe-concurrent",
+		Status:     drevtypes.StatusPending,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "job-concurrent-race-01", RunID: run.ID, JobName: "build", Status: drevtypes.StatusPending},
+	}
+	spec := `{"name":"spec-concurrent"}`
+	if err := s.CreateRunWithLimit(ctx, run, jobs, 2, spec); err != nil {
+		t.Fatalf("CreateRunWithLimit failed: %v", err)
+	}
+
+	var claimErr, cleanupErr error
+	var wg sync.WaitGroup
+	startGate := make(chan struct{})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-startGate
+		claimErr = s.ClaimRunForExecution(ctx, run.ID)
+	}()
+	go func() {
+		defer wg.Done()
+		<-startGate
+		cleanupErr = s.FailRunWithDelivery(ctx, run.ID, []string{"job-concurrent-race-01"}, "")
+	}()
+
+	close(startGate)
+	wg.Wait()
+
+	// Exactly one must succeed, and the other must fail with ErrRunAlreadyClaimed
+	if claimErr == nil {
+		if !errors.Is(cleanupErr, store.ErrRunAlreadyClaimed) {
+			t.Fatalf("claim succeeded but cleanup returned unexpected error: %v", cleanupErr)
+		}
+	} else if cleanupErr == nil {
+		if !errors.Is(claimErr, store.ErrRunAlreadyClaimed) {
+			t.Fatalf("cleanup succeeded but claim returned unexpected error: %v", claimErr)
+		}
+	} else {
+		t.Fatalf("both claim and cleanup failed: claimErr=%v, cleanupErr=%v", claimErr, cleanupErr)
+	}
+
+	// Verify the final state is internally consistent and outbox is cleared in either case
+	finalRun, err := s.GetRun(ctx, run.ID)
+	if err != nil || finalRun == nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if finalRun.Status != drevtypes.StatusRunning && finalRun.Status != drevtypes.StatusFailed {
+		t.Errorf("unexpected final run status: %s", finalRun.Status)
+	}
+
+	outbox, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox: %v", err)
+	}
+	if len(outbox) != 0 {
+		t.Errorf("expected outbox to be cleared, found: %+v", outbox)
+	}
+}
+
+func TestStore_FailRunWithDelivery_TerminalRunSemantics(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fail_del_terminal.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	orgID := "org-terminal"
+
+	// 1. Success run: FailRunWithDelivery returns ErrRunAlreadyTerminal and does not overwrite
+	runSuccess := &drevtypes.Run{
+		ID:         "run-term-success",
+		OrgID:      orgID,
+		PipelineID: "pipe-success",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRunWithLimit(ctx, runSuccess, nil, 5, ""); err != nil {
+		t.Fatalf("CreateRunWithLimit: %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runSuccess.ID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	succRunBefore, _ := s.GetRun(ctx, runSuccess.ID)
+
+	err = s.FailRunWithDelivery(ctx, runSuccess.ID, nil, "")
+	if !errors.Is(err, store.ErrRunAlreadyTerminal) {
+		t.Fatalf("expected ErrRunAlreadyTerminal on successful run, got: %v", err)
+	}
+	succRunAfter, _ := s.GetRun(ctx, runSuccess.ID)
+	if succRunAfter.Status != drevtypes.StatusSuccess || !succRunAfter.FinishedAt.Equal(succRunBefore.FinishedAt) {
+		t.Errorf("success run was corrupted: %+v", succRunAfter)
+	}
+
+	// 2. Cancelled run: FailRunWithDelivery returns ErrRunAlreadyTerminal and does not overwrite
+	runCancelled := &drevtypes.Run{
+		ID:         "run-term-cancelled",
+		OrgID:      orgID,
+		PipelineID: "pipe-cancelled",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRunWithLimit(ctx, runCancelled, nil, 5, ""); err != nil {
+		t.Fatalf("CreateRunWithLimit: %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runCancelled.ID, drevtypes.StatusCancelled); err != nil {
+		t.Fatalf("UpdateRunStatus: %v", err)
+	}
+	cancRunBefore, _ := s.GetRun(ctx, runCancelled.ID)
+
+	err = s.FailRunWithDelivery(ctx, runCancelled.ID, nil, "")
+	if !errors.Is(err, store.ErrRunAlreadyTerminal) {
+		t.Fatalf("expected ErrRunAlreadyTerminal on cancelled run, got: %v", err)
+	}
+	cancRunAfter, _ := s.GetRun(ctx, runCancelled.ID)
+	if cancRunAfter.Status != drevtypes.StatusCancelled || !cancRunAfter.FinishedAt.Equal(cancRunBefore.FinishedAt) {
+		t.Errorf("cancelled run was corrupted: %+v", cancRunAfter)
+	}
+
+	// 3. Failed run: repeated FailRunWithDelivery preserves finished_at
+	runFailed := &drevtypes.Run{
+		ID:         "run-term-failed",
+		OrgID:      orgID,
+		PipelineID: "pipe-failed",
+		Status:     drevtypes.StatusPending,
+	}
+	jobFailed := &drevtypes.RunJob{
+		ID:      "job-term-failed",
+		RunID:   runFailed.ID,
+		JobName: "job1",
+		Status:  drevtypes.StatusPending,
+	}
+	if err := s.CreateRunWithLimit(ctx, runFailed, []*drevtypes.RunJob{jobFailed}, 5, `{"name":"failed-spec"}`); err != nil {
+		t.Fatalf("CreateRunWithLimit: %v", err)
+	}
+	if err := s.FailRunWithDelivery(ctx, runFailed.ID, []string{jobFailed.ID}, ""); err != nil {
+		t.Fatalf("first FailRunWithDelivery: %v", err)
+	}
+	failedRunBefore, _ := s.GetRun(ctx, runFailed.ID)
+
+	time.Sleep(10 * time.Millisecond)
+	if err := s.FailRunWithDelivery(ctx, runFailed.ID, []string{jobFailed.ID}, ""); err != nil {
+		t.Fatalf("repeated FailRunWithDelivery on failed run: %v", err)
+	}
+	failedRunAfter, _ := s.GetRun(ctx, runFailed.ID)
+	if failedRunAfter.Status != drevtypes.StatusFailed || !failedRunAfter.FinishedAt.Equal(failedRunBefore.FinishedAt) {
+		t.Errorf("repeat FailRunWithDelivery mutated finished_at: %v != %v", failedRunAfter.FinishedAt, failedRunBefore.FinishedAt)
 	}
 }

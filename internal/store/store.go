@@ -77,7 +77,7 @@ type Store interface {
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 	GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error)
-	CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int) error
+	CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int, pipelineSpec string) error
 
 	// ── Webhook delivery idempotency & durable outbox ─────────────────────
 	CreateRunWithDelivery(ctx context.Context, delivery *drevtypes.WebhookDelivery, run *drevtypes.Run, jobs []*drevtypes.RunJob, pipelineSpec string) error
@@ -469,8 +469,8 @@ func (s *SQLiteStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 	return err
 }
 
-// CreateRunWithLimit atomically checks organization capacity and creates a run with its jobs.
-func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int) error {
+// CreateRunWithLimit atomically checks organization capacity and creates a run with its jobs and outbox record.
+func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run, jobs []*drevtypes.RunJob, workerLimit int, pipelineSpec string) error {
 	if run == nil || strings.TrimSpace(run.ID) == "" {
 		return errors.New("run or run.ID cannot be empty")
 	}
@@ -498,6 +498,8 @@ func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run
 			return ErrWorkerLimitExceeded
 		}
 	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
 
 	// 1. Insert parent run
 	_, err = tx.ExecContext(ctx, `
@@ -528,6 +530,18 @@ func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run
 		)
 		if err != nil {
 			return fmt.Errorf("inserting sqlite run job: %w", err)
+		}
+	}
+
+	// 3. Insert into pipeline_outbox if pipelineSpec is provided
+	if strings.TrimSpace(pipelineSpec) != "" {
+		_, err = tx.ExecContext(ctx, `
+			INSERT INTO pipeline_outbox (run_id, pipeline_spec, created_at)
+			VALUES (?, ?, ?)`,
+			run.ID, pipelineSpec, now,
+		)
+		if err != nil {
+			return fmt.Errorf("inserting sqlite pipeline outbox: %w", err)
 		}
 	}
 
@@ -1141,7 +1155,7 @@ func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, job
 		UPDATE runs
 		SET status = 'failed',
 		    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-		WHERE id = ?`, now, runID,
+		WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled', 'running') OR status = 'failed')`, now, runID,
 	)
 	if err != nil {
 		return fmt.Errorf("updating run %s to failed: %w", runID, err)
@@ -1151,7 +1165,18 @@ func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, job
 		return fmt.Errorf("checking rows affected on run failure: %w", err)
 	}
 	if n == 0 {
-		return fmt.Errorf("run %s not found", runID)
+		var currentStatus string
+		err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&currentStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("run %s not found", runID)
+		}
+		if err != nil {
+			return fmt.Errorf("checking run status for %s: %w", runID, err)
+		}
+		if currentStatus == string(drevtypes.StatusRunning) {
+			return fmt.Errorf("%w: cannot fail run %s in running state", ErrRunAlreadyClaimed, runID)
+		}
+		return fmt.Errorf("%w: cannot fail run %s in %s state", ErrRunAlreadyTerminal, runID, currentStatus)
 	}
 
 	// 2. Mark relevant jobs failed
@@ -1161,7 +1186,7 @@ func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, job
 				UPDATE run_jobs
 				SET status = 'failed',
 				    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-				WHERE id = ? AND run_id = ?`, now, jid, runID)
+				WHERE id = ? AND run_id = ? AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = 'failed')`, now, jid, runID)
 			if err != nil {
 				return fmt.Errorf("updating run job %s to failed: %w", jid, err)
 			}
@@ -1170,7 +1195,15 @@ func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, job
 				return fmt.Errorf("checking rows affected for job %s: %w", jid, err)
 			}
 			if n == 0 {
-				return fmt.Errorf("run job %s not found for run %s", jid, runID)
+				var jobRunID, jobStatus string
+				err := tx.QueryRowContext(ctx, `SELECT run_id, status FROM run_jobs WHERE id = ?`, jid).Scan(&jobRunID, &jobStatus)
+				if errors.Is(err, sql.ErrNoRows) || jobRunID != runID {
+					return fmt.Errorf("run job %s not found for run %s", jid, runID)
+				}
+				if jobStatus == string(drevtypes.StatusSuccess) || jobStatus == string(drevtypes.StatusCancelled) || jobStatus == string(drevtypes.StatusSkipped) {
+					continue
+				}
+				return fmt.Errorf("cannot update job %s from %s to failed", jid, jobStatus)
 			}
 		}
 	} else {
@@ -1178,7 +1211,7 @@ func (s *SQLiteStore) FailRunWithDelivery(ctx context.Context, runID string, job
 			UPDATE run_jobs
 			SET status = 'failed',
 			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-			WHERE run_id = ?`, now, runID); err != nil {
+			WHERE run_id = ? AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = 'failed')`, now, runID); err != nil {
 			return fmt.Errorf("updating run jobs for run %s to failed: %w", runID, err)
 		}
 	}
