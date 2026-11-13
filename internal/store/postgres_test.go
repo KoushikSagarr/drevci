@@ -1933,3 +1933,389 @@ func TestPostgresStore_CreateRunWithLimit_TenantSafety_EmptyOrgID(t *testing.T) 
 		t.Fatalf("expected success for workerLimit == 0: %v", err)
 	}
 }
+
+func TestPostgresStore_TerminalRunStatus_CannotBeOverwritten(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// 1. Cancelled run cannot become successful
+	runCancelled := &drevtypes.Run{
+		ID:         uuid.New().String(),
+		PipelineID: "p1",
+		Status:     drevtypes.StatusCancelled,
+	}
+	if err := s.CreateRun(ctx, runCancelled); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	err := s.UpdateRunStatus(ctx, runCancelled.ID, drevtypes.StatusSuccess)
+	if err == nil || !errors.Is(err, ErrRunAlreadyTerminal) {
+		t.Fatalf("expected ErrRunAlreadyTerminal when transitioning cancelled -> success, got: %v", err)
+	}
+	got, _ := s.GetRun(ctx, runCancelled.ID)
+	if got.Status != drevtypes.StatusCancelled {
+		t.Errorf("status was overwritten! got %s, want %s", got.Status, drevtypes.StatusCancelled)
+	}
+
+	// 2. Failed run cannot become successful
+	runFailed := &drevtypes.Run{
+		ID:         uuid.New().String(),
+		PipelineID: "p1",
+		Status:     drevtypes.StatusFailed,
+	}
+	if err := s.CreateRun(ctx, runFailed); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	err = s.UpdateRunStatus(ctx, runFailed.ID, drevtypes.StatusSuccess)
+	if err == nil || !errors.Is(err, ErrRunAlreadyTerminal) {
+		t.Fatalf("expected ErrRunAlreadyTerminal when transitioning failed -> success, got: %v", err)
+	}
+	got, _ = s.GetRun(ctx, runFailed.ID)
+	if got.Status != drevtypes.StatusFailed {
+		t.Errorf("status was overwritten! got %s, want %s", got.Status, drevtypes.StatusFailed)
+	}
+
+	// 3. Successful run cannot become failed
+	runSuccess := &drevtypes.Run{
+		ID:         uuid.New().String(),
+		PipelineID: "p1",
+		Status:     drevtypes.StatusSuccess,
+	}
+	if err := s.CreateRun(ctx, runSuccess); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	err = s.UpdateRunStatus(ctx, runSuccess.ID, drevtypes.StatusFailed)
+	if err == nil || !errors.Is(err, ErrRunAlreadyTerminal) {
+		t.Fatalf("expected ErrRunAlreadyTerminal when transitioning success -> failed, got: %v", err)
+	}
+	got, _ = s.GetRun(ctx, runSuccess.ID)
+	if got.Status != drevtypes.StatusSuccess {
+		t.Errorf("status was overwritten! got %s, want %s", got.Status, drevtypes.StatusSuccess)
+	}
+}
+
+func TestPostgresStore_TerminalRunStatus_IdempotentUpdatesPreserveTimestamps(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	run := &drevtypes.Run{
+		ID:         uuid.New().String(),
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	// First transition to cancelled
+	if err := s.UpdateRunStatus(ctx, run.ID, drevtypes.StatusCancelled); err != nil {
+		t.Fatalf("UpdateRunStatus to cancelled: %v", err)
+	}
+	initial, _ := s.GetRun(ctx, run.ID)
+	if initial.FinishedAt.IsZero() {
+		t.Fatal("expected finished_at to be set on cancelled")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Idempotent transition to cancelled must succeed and not overwrite finished_at
+	if err := s.UpdateRunStatus(ctx, run.ID, drevtypes.StatusCancelled); err != nil {
+		t.Fatalf("idempotent UpdateRunStatus failed: %v", err)
+	}
+	after, _ := s.GetRun(ctx, run.ID)
+	if !after.FinishedAt.Equal(initial.FinishedAt) {
+		t.Errorf("finished_at timestamp changed on idempotent update: before %v, after %v", initial.FinishedAt, after.FinishedAt)
+	}
+}
+
+func TestPostgresStore_LegitimateRunLifecycleTransitions(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// Path 1: pending -> running -> success
+	r1ID := uuid.New().String()
+	r1 := &drevtypes.Run{ID: r1ID, PipelineID: "p", Status: drevtypes.StatusPending}
+	_ = s.CreateRun(ctx, r1)
+	if err := s.UpdateRunStatus(ctx, r1.ID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("pending -> running: %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, r1.ID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("running -> success: %v", err)
+	}
+	g1, _ := s.GetRun(ctx, r1.ID)
+	if g1.Status != drevtypes.StatusSuccess || g1.StartedAt.IsZero() || g1.FinishedAt.IsZero() {
+		t.Errorf("invalid state or timestamps: %+v", g1)
+	}
+
+	// Path 2: pending -> running -> failed
+	r2ID := uuid.New().String()
+	r2 := &drevtypes.Run{ID: r2ID, PipelineID: "p", Status: drevtypes.StatusPending}
+	_ = s.CreateRun(ctx, r2)
+	if err := s.UpdateRunStatus(ctx, r2.ID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("pending -> running: %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, r2.ID, drevtypes.StatusFailed); err != nil {
+		t.Fatalf("running -> failed: %v", err)
+	}
+	g2, _ := s.GetRun(ctx, r2.ID)
+	if g2.Status != drevtypes.StatusFailed || g2.StartedAt.IsZero() || g2.FinishedAt.IsZero() {
+		t.Errorf("invalid state or timestamps: %+v", g2)
+	}
+
+	// Path 3: pending -> cancelled
+	r3ID := uuid.New().String()
+	r3 := &drevtypes.Run{ID: r3ID, PipelineID: "p", Status: drevtypes.StatusPending}
+	_ = s.CreateRun(ctx, r3)
+	if err := s.UpdateRunStatus(ctx, r3.ID, drevtypes.StatusCancelled); err != nil {
+		t.Fatalf("pending -> cancelled: %v", err)
+	}
+	g3, _ := s.GetRun(ctx, r3.ID)
+	if g3.Status != drevtypes.StatusCancelled || g3.FinishedAt.IsZero() {
+		t.Errorf("invalid state or timestamps: %+v", g3)
+	}
+}
+
+func TestPostgresStore_TerminalJobStatus_CannotBeOverwritten(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := uuid.New().String()
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p", Status: drevtypes.StatusRunning})
+
+	// 1. Cancelled job cannot become successful
+	jobCancelledID := uuid.New().String()
+	jobCancelled := &drevtypes.RunJob{ID: jobCancelledID, RunID: runID, JobName: "build", Status: drevtypes.StatusCancelled}
+	_ = s.CreateRunJob(ctx, jobCancelled)
+	err := s.UpdateRunJobStatus(ctx, jobCancelled.ID, drevtypes.StatusSuccess)
+	if err == nil || !errors.Is(err, ErrJobAlreadyTerminal) {
+		t.Fatalf("expected ErrJobAlreadyTerminal when transitioning cancelled -> success, got: %v", err)
+	}
+
+	// 2. Skipped job cannot become successful
+	jobSkippedID := uuid.New().String()
+	jobSkipped := &drevtypes.RunJob{ID: jobSkippedID, RunID: runID, JobName: "deploy", Status: drevtypes.StatusSkipped}
+	_ = s.CreateRunJob(ctx, jobSkipped)
+	err = s.UpdateRunJobStatus(ctx, jobSkipped.ID, drevtypes.StatusSuccess)
+	if err == nil || !errors.Is(err, ErrJobAlreadyTerminal) {
+		t.Fatalf("expected ErrJobAlreadyTerminal when transitioning skipped -> success, got: %v", err)
+	}
+
+	// 3. Idempotent update to same terminal status succeeds
+	if err := s.UpdateRunJobStatus(ctx, jobCancelled.ID, drevtypes.StatusCancelled); err != nil {
+		t.Fatalf("idempotent update failed: %v", err)
+	}
+}
+
+func TestPostgresStore_CancellationRacingWithCompletion_DeterministicPersistedState(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	runID := uuid.New().String()
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runID, PipelineID: "p", Status: drevtypes.StatusRunning})
+
+	var startWg sync.WaitGroup
+	startWg.Add(1)
+	var doneWg sync.WaitGroup
+	doneWg.Add(2)
+
+	var errCancel, errSuccess error
+	go func() {
+		defer doneWg.Done()
+		startWg.Wait()
+		errCancel = s.UpdateRunStatus(ctx, runID, drevtypes.StatusCancelled)
+	}()
+
+	go func() {
+		defer doneWg.Done()
+		startWg.Wait()
+		errSuccess = s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess)
+	}()
+
+	startWg.Done()
+	doneWg.Wait()
+
+	if errCancel == nil && errSuccess == nil {
+		t.Fatal("SAFETY VIOLATION: both cancellation and success updates succeeded concurrently!")
+	}
+	if errCancel != nil && errSuccess != nil {
+		t.Fatalf("unexpected both updates failed: cancel=%v, success=%v", errCancel, errSuccess)
+	}
+
+	run, _ := s.GetRun(ctx, runID)
+	if errCancel == nil {
+		if run.Status != drevtypes.StatusCancelled {
+			t.Errorf("cancel won but status is %s", run.Status)
+		}
+		if !errors.Is(errSuccess, ErrRunAlreadyTerminal) {
+			t.Errorf("expected ErrRunAlreadyTerminal for success, got %v", errSuccess)
+		}
+	} else {
+		if run.Status != drevtypes.StatusSuccess {
+			t.Errorf("success won but status is %s", run.Status)
+		}
+		if !errors.Is(errCancel, ErrRunAlreadyTerminal) {
+			t.Errorf("expected ErrRunAlreadyTerminal for cancel, got %v", errCancel)
+		}
+	}
+}
+
+func TestPostgresStore_FailRun_TerminalRunSemantics(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// 1. Already-failed run: pending job becomes failed; terminal jobs remain unchanged
+	runFailedID := uuid.New().String()
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runFailedID, PipelineID: "p", Status: drevtypes.StatusFailed})
+	_ = s.UpdateRunStatus(ctx, runFailedID, drevtypes.StatusFailed)
+	initialFailedRun, _ := s.GetRun(ctx, runFailedID)
+
+	jobFPendingID := uuid.New().String()
+	jobFSuccessID := uuid.New().String()
+	jobFPending := &drevtypes.RunJob{ID: jobFPendingID, RunID: runFailedID, JobName: "pending-step", Status: drevtypes.StatusPending}
+	jobFSuccess := &drevtypes.RunJob{ID: jobFSuccessID, RunID: runFailedID, JobName: "success-step", Status: drevtypes.StatusSuccess}
+	_ = s.CreateRunJob(ctx, jobFPending)
+	_ = s.CreateRunJob(ctx, jobFSuccess)
+
+	if err := FailRun(ctx, s, runFailedID, nil); err != nil {
+		t.Fatalf("FailRun on failed run returned error: %v", err)
+	}
+
+	runF, _ := s.GetRun(ctx, runFailedID)
+	if runF.Status != drevtypes.StatusFailed {
+		t.Errorf("run status changed: got %s, want failed", runF.Status)
+	}
+	if !runF.FinishedAt.Equal(initialFailedRun.FinishedAt) {
+		t.Errorf("finished_at timestamp changed on FailRun: before %v, after %v", initialFailedRun.FinishedAt, runF.FinishedAt)
+	}
+
+	jobsF, _ := s.GetRunJobs(ctx, runFailedID)
+	for _, j := range jobsF {
+		if j.ID == jobFPendingID {
+			if j.Status != drevtypes.StatusFailed {
+				t.Errorf("expected pending job in failed run to become failed, got %s", j.Status)
+			}
+			if j.FinishedAt.IsZero() {
+				t.Errorf("expected finished_at to be populated for finalized job")
+			}
+		} else if j.ID == jobFSuccessID {
+			if j.Status != drevtypes.StatusSuccess {
+				t.Errorf("expected successful job in failed run to remain success, got %s", j.Status)
+			}
+		}
+	}
+
+	// 2. Already-successful run: pending job remains pending; successful jobs remain unchanged
+	runSuccessID := uuid.New().String()
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runSuccessID, PipelineID: "p", Status: drevtypes.StatusSuccess})
+	_ = s.UpdateRunStatus(ctx, runSuccessID, drevtypes.StatusSuccess)
+	initialSuccessRun, _ := s.GetRun(ctx, runSuccessID)
+
+	jobSPendingID := uuid.New().String()
+	jobSSuccessID := uuid.New().String()
+	jobSPending := &drevtypes.RunJob{ID: jobSPendingID, RunID: runSuccessID, JobName: "pending-step", Status: drevtypes.StatusPending}
+	jobSSuccess := &drevtypes.RunJob{ID: jobSSuccessID, RunID: runSuccessID, JobName: "success-step", Status: drevtypes.StatusSuccess}
+	_ = s.CreateRunJob(ctx, jobSPending)
+	_ = s.CreateRunJob(ctx, jobSSuccess)
+
+	if err := FailRun(ctx, s, runSuccessID, nil); err != nil {
+		t.Fatalf("FailRun on successful run returned error: %v", err)
+	}
+
+	runS, _ := s.GetRun(ctx, runSuccessID)
+	if runS.Status != drevtypes.StatusSuccess {
+		t.Errorf("run status changed: got %s, want success", runS.Status)
+	}
+	if !runS.FinishedAt.Equal(initialSuccessRun.FinishedAt) {
+		t.Errorf("finished_at timestamp changed on FailRun: before %v, after %v", initialSuccessRun.FinishedAt, runS.FinishedAt)
+	}
+
+	jobsS, _ := s.GetRunJobs(ctx, runSuccessID)
+	for _, j := range jobsS {
+		if j.ID == jobSPendingID {
+			if j.Status != drevtypes.StatusPending {
+				t.Errorf("expected pending job in successful run to remain pending, got %s", j.Status)
+			}
+		} else if j.ID == jobSSuccessID {
+			if j.Status != drevtypes.StatusSuccess {
+				t.Errorf("expected successful job in successful run to remain success, got %s", j.Status)
+			}
+		}
+	}
+
+	// 3. Already-cancelled run: pending job remains pending; cancelled jobs remain unchanged
+	runCancelledID := uuid.New().String()
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runCancelledID, PipelineID: "p", Status: drevtypes.StatusCancelled})
+	_ = s.UpdateRunStatus(ctx, runCancelledID, drevtypes.StatusCancelled)
+	initialCancelledRun, _ := s.GetRun(ctx, runCancelledID)
+
+	jobCPendingID := uuid.New().String()
+	jobCCancelledID := uuid.New().String()
+	jobCPending := &drevtypes.RunJob{ID: jobCPendingID, RunID: runCancelledID, JobName: "pending-step", Status: drevtypes.StatusPending}
+	jobCCancelled := &drevtypes.RunJob{ID: jobCCancelledID, RunID: runCancelledID, JobName: "cancelled-step", Status: drevtypes.StatusCancelled}
+	_ = s.CreateRunJob(ctx, jobCPending)
+	_ = s.CreateRunJob(ctx, jobCCancelled)
+
+	if err := FailRun(ctx, s, runCancelledID, nil); err != nil {
+		t.Fatalf("FailRun on cancelled run returned error: %v", err)
+	}
+
+	runC, _ := s.GetRun(ctx, runCancelledID)
+	if runC.Status != drevtypes.StatusCancelled {
+		t.Errorf("run status changed: got %s, want cancelled", runC.Status)
+	}
+	if !runC.FinishedAt.Equal(initialCancelledRun.FinishedAt) {
+		t.Errorf("finished_at timestamp changed on FailRun: before %v, after %v", initialCancelledRun.FinishedAt, runC.FinishedAt)
+	}
+
+	jobsC, _ := s.GetRunJobs(ctx, runCancelledID)
+	for _, j := range jobsC {
+		if j.ID == jobCPendingID {
+			if j.Status != drevtypes.StatusPending {
+				t.Errorf("expected pending job in cancelled run to remain pending, got %s", j.Status)
+			}
+		} else if j.ID == jobCCancelledID {
+			if j.Status != drevtypes.StatusCancelled {
+				t.Errorf("expected cancelled job in cancelled run to remain cancelled, got %s", j.Status)
+			}
+		}
+	}
+
+	// 4. Repeated FailRun calls preserve run/job statuses and timestamps
+	time.Sleep(10 * time.Millisecond)
+	if err := FailRun(ctx, s, runFailedID, nil); err != nil {
+		t.Fatalf("repeated FailRun on failed run failed: %v", err)
+	}
+	if err := FailRun(ctx, s, runSuccessID, nil); err != nil {
+		t.Fatalf("repeated FailRun on success run failed: %v", err)
+	}
+	if err := FailRun(ctx, s, runCancelledID, nil); err != nil {
+		t.Fatalf("repeated FailRun on cancelled run failed: %v", err)
+	}
+
+	repeatRunF, _ := s.GetRun(ctx, runFailedID)
+	if !repeatRunF.FinishedAt.Equal(initialFailedRun.FinishedAt) {
+		t.Errorf("repeat FailRun changed failed run finished_at: %v != %v", repeatRunF.FinishedAt, initialFailedRun.FinishedAt)
+	}
+	repeatRunS, _ := s.GetRun(ctx, runSuccessID)
+	if !repeatRunS.FinishedAt.Equal(initialSuccessRun.FinishedAt) {
+		t.Errorf("repeat FailRun changed success run finished_at: %v != %v", repeatRunS.FinishedAt, initialSuccessRun.FinishedAt)
+	}
+	repeatRunC, _ := s.GetRun(ctx, runCancelledID)
+	if !repeatRunC.FinishedAt.Equal(initialCancelledRun.FinishedAt) {
+		t.Errorf("repeat FailRun changed cancelled run finished_at: %v != %v", repeatRunC.FinishedAt, initialCancelledRun.FinishedAt)
+	}
+}
+
+func TestPostgresStore_UpdateRunStatus_MissingRowCompatible(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	err := s.UpdateRunStatus(ctx, uuid.New().String(), drevtypes.StatusRunning)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for nonexistent run, got: %v", err)
+	}
+
+	err = s.UpdateRunJobStatus(ctx, uuid.New().String(), drevtypes.StatusRunning)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected sql.ErrNoRows for nonexistent job, got: %v", err)
+	}
+}

@@ -3209,6 +3209,9 @@ func TestDynamicScheduler_RunJobsLookupFailure(t *testing.T) {
 }
 
 func TestDynamicScheduler_WorkspaceCleanupAfterPreparationFailure(t *testing.T) {
+	isolatedTmp := t.TempDir()
+	t.Setenv("TMPDIR", isolatedTmp)
+
 	repoDir, sha := createTestGitRepo(t, map[string]string{
 		".drev.yml": `::: malformed yaml syntax :::`,
 	})

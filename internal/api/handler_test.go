@@ -48,7 +48,7 @@ func setupTestServerWithLogger(t *testing.T, logger *log.Logger) (*httptest.Serv
 	sched := scheduler.New(nil, s) // Mock scheduler with nil runner
 	stream := streamer.New(logDir)
 
-	os.Setenv("DREV_API_TOKENS", "test-token")
+	t.Setenv("DREV_API_TOKENS", "test-token")
 
 	q := queue.New(10)
 	wh := webhook.New(s, q, p, stream, "", t.TempDir())
@@ -695,7 +695,7 @@ func setupSaaSTestServer(t *testing.T, orgsByToken map[string]*drevtypes.Org) (*
 	sched := scheduler.New(nil, wrapper)
 	stream := streamer.New(logDir)
 
-	os.Setenv("DREV_API_TOKENS", "static-test-token")
+	t.Setenv("DREV_API_TOKENS", "static-test-token")
 
 	q := queue.New(10)
 	wh := webhook.New(wrapper, q, p, stream, "", t.TempDir())

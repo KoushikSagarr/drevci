@@ -316,9 +316,9 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status d
 		UPDATE runs SET
 		  status      = $1,
 		  started_at  = CASE WHEN $2 = 'running'  AND started_at  IS NULL THEN $3 ELSE started_at  END,
-		  finished_at = CASE WHEN $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END
-		WHERE id = $5`,
-		string(status), string(status), now, string(status), id,
+		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END
+		WHERE id = $5 AND (status NOT IN ('success', 'failed', 'cancelled') OR status = $6)`,
+		string(status), string(status), now, string(status), id, string(status),
 	)
 	if err != nil {
 		return err
@@ -328,7 +328,15 @@ func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status d
 		return err
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		var currentStatus string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = $1`, id).Scan(&currentStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return fmt.Errorf("checking run status for %s: %w", id, err)
+		}
+		return fmt.Errorf("%w: cannot transition run %s from %s to %s", ErrRunAlreadyTerminal, id, currentStatus, status)
 	}
 	return nil
 }
@@ -444,9 +452,9 @@ func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, statu
 		UPDATE run_jobs SET
 		  status      = $1,
 		  started_at  = CASE WHEN $2 = 'running'  AND started_at  IS NULL THEN $3 ELSE started_at  END,
-		  finished_at = CASE WHEN $4 IN ('success','failed','cancelled','skipped') THEN $3 ELSE finished_at END
-		WHERE id = $5`,
-		string(status), string(status), now, string(status), id,
+		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled','skipped') THEN $3 ELSE finished_at END
+		WHERE id = $5 AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = $6)`,
+		string(status), string(status), now, string(status), id, string(status),
 	)
 	if err != nil {
 		return err
@@ -456,7 +464,15 @@ func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, statu
 		return err
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		var currentStatus string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM run_jobs WHERE id = $1`, id).Scan(&currentStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return fmt.Errorf("checking run job status for %s: %w", id, err)
+		}
+		return fmt.Errorf("%w: cannot transition job %s from %s to %s", ErrJobAlreadyTerminal, id, currentStatus, status)
 	}
 	return nil
 }

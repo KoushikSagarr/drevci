@@ -57,6 +57,12 @@ var ErrWorkerLimitExceeded = errors.New("worker limit reached for plan")
 // ErrOrgNotFound indicates that the specified organization does not exist.
 var ErrOrgNotFound = errors.New("organization not found")
 
+// ErrRunAlreadyTerminal indicates that a run is in a terminal state and cannot transition to a different status.
+var ErrRunAlreadyTerminal = errors.New("run is in a terminal state")
+
+// ErrJobAlreadyTerminal indicates that a job is in a terminal state and cannot transition to a different status.
+var ErrJobAlreadyTerminal = errors.New("job is in a terminal state")
+
 // Store defines the persistence interface for pipeline runs and SaaS tenancy.
 type Store interface {
 	// ── Core pipeline methods ──────────────────────────────────────────────
@@ -326,8 +332,8 @@ func (s *SQLiteStore) prepare() error {
 	s.stmtUpdateRunStatus, err = s.db.Prepare(
 		`UPDATE runs SET status = ?,
 		 started_at  = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
-		 WHERE id = ?`)
+		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
+		 WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled') OR status = ?)`)
 	if err != nil {
 		return err
 	}
@@ -348,8 +354,8 @@ func (s *SQLiteStore) prepare() error {
 	s.stmtUpdateRunJobStatus, err = s.db.Prepare(
 		`UPDATE run_jobs SET status = ?,
 		 started_at  = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-		 finished_at = CASE WHEN ? IN ('success', 'failed', 'cancelled', 'skipped') THEN ? ELSE finished_at END
-		 WHERE id = ?`)
+		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled', 'skipped') THEN ? ELSE finished_at END
+		 WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = ?)`)
 	if err != nil {
 		return err
 	}
@@ -555,7 +561,7 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, er
 func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.stmtUpdateRunStatus.ExecContext(ctx,
-		string(status), string(status), now, string(status), now, id)
+		string(status), string(status), now, string(status), now, id, string(status))
 	if err != nil {
 		return err
 	}
@@ -564,7 +570,15 @@ func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, id string, status dre
 		return err
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		var currentStatus string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, id).Scan(&currentStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return fmt.Errorf("checking run status for %s: %w", id, err)
+		}
+		return fmt.Errorf("%w: cannot transition run %s from %s to %s", ErrRunAlreadyTerminal, id, currentStatus, status)
 	}
 	return nil
 }
@@ -699,7 +713,7 @@ func (s *SQLiteStore) CreateRunJobs(ctx context.Context, runID string, jobs []*d
 func (s *SQLiteStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.stmtUpdateRunJobStatus.ExecContext(ctx,
-		string(status), string(status), now, string(status), now, id)
+		string(status), string(status), now, string(status), now, id, string(status))
 	if err != nil {
 		return err
 	}
@@ -708,7 +722,15 @@ func (s *SQLiteStore) UpdateRunJobStatus(ctx context.Context, id string, status 
 		return err
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		var currentStatus string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM run_jobs WHERE id = ?`, id).Scan(&currentStatus)
+		if errors.Is(err, sql.ErrNoRows) {
+			return sql.ErrNoRows
+		}
+		if err != nil {
+			return fmt.Errorf("checking run job status for %s: %w", id, err)
+		}
+		return fmt.Errorf("%w: cannot transition job %s from %s to %s", ErrJobAlreadyTerminal, id, currentStatus, status)
 	}
 	return nil
 }
@@ -1229,7 +1251,10 @@ func (s *SQLiteStore) GetDelivery(ctx context.Context, deliveryID string) (*drev
 
 // FailRun marks a run and its jobs as failed with terminal timestamps.
 // If jobIDs is empty, it queries the store for any existing jobs belonging to the run.
-// It logs any update failures and returns an aggregate error if any updates failed.
+// If the run has already reached a conflicting terminal status (such as cancelled or success),
+// FailRun preserves the run and all its jobs as-is, returning nil immediately.
+// If the run is transitioned to or already in failed status, any unfinished jobs are finalized to failed.
+// It logs any unexpected update failures and returns an aggregate error if any updates failed.
 func FailRun(ctx context.Context, s Store, runID string, jobIDs []string) error {
 	if s == nil {
 		return nil
@@ -1238,6 +1263,11 @@ func FailRun(ctx context.Context, s Store, runID string, jobIDs []string) error 
 	var errs []error
 
 	if err := s.UpdateRunStatus(bgCtx, runID, drevtypes.StatusFailed); err != nil {
+		if errors.Is(err, ErrRunAlreadyTerminal) {
+			// The run is already in a conflicting terminal state (such as success or cancelled).
+			// Preserve all jobs as-is; do not mutate them to failed.
+			return nil
+		}
 		log.Printf("[store] failed to update run %s status to failed: %v", runID, err)
 		errs = append(errs, fmt.Errorf("updating run %s status: %w", runID, err))
 	}
@@ -1255,8 +1285,10 @@ func FailRun(ctx context.Context, s Store, runID string, jobIDs []string) error 
 
 	for _, jid := range jobIDs {
 		if err := s.UpdateRunJobStatus(bgCtx, jid, drevtypes.StatusFailed); err != nil {
-			log.Printf("[store] failed to update run job %s status to failed: %v", jid, err)
-			errs = append(errs, fmt.Errorf("updating job %s status: %w", jid, err))
+			if !errors.Is(err, ErrJobAlreadyTerminal) {
+				log.Printf("[store] failed to update run job %s status to failed: %v", jid, err)
+				errs = append(errs, fmt.Errorf("updating job %s status: %w", jid, err))
+			}
 		}
 	}
 
