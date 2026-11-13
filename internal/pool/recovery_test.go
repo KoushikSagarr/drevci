@@ -954,3 +954,183 @@ func TestNormalParser_StillRejectsZeroJobs(t *testing.T) {
 		t.Errorf("expected ParseError on field 'jobs', got %v", err)
 	}
 }
+
+func TestOutboxRecoverer_SurvivesAndRecoversAfterResetGhostRuns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "recovery_after_reset.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	pipeline := &drevtypes.Pipeline{
+		Name: "test-pipeline-reset-recover",
+		Jobs: []drevtypes.Job{
+			{
+				Name:  "step-1",
+				Image: "alpine:latest",
+				Steps: []drevtypes.Step{
+					{Name: "run-step-1", Run: "echo step1"},
+				},
+			},
+			{
+				Name:      "step-2",
+				Image:     "alpine:latest",
+				DependsOn: []string{"step-1"},
+				Steps: []drevtypes.Step{
+					{Name: "run-step-2", Run: "echo step2"},
+				},
+			},
+		},
+	}
+	specBytes, err := json.Marshal(pipeline)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	spec := string(specBytes)
+
+	runID := "run-restart-recover-001"
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-restart-recover-001",
+		EventType:  "push",
+		Repo:       "acme/repo",
+		RunID:      runID,
+	}
+	run := &drevtypes.Run{
+		ID:         runID,
+		PipelineID: pipeline.Name,
+		Status:     drevtypes.StatusPending,
+	}
+	jobs := []*drevtypes.RunJob{
+		{ID: "j-step-1", RunID: runID, JobName: "step-1", Status: drevtypes.StatusPending},
+		{ID: "j-step-2", RunID: runID, JobName: "step-2", Status: drevtypes.StatusPending},
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, jobs, spec); err != nil {
+		t.Fatalf("CreateRunWithDelivery: %v", err)
+	}
+
+	// Verify outbox entry exists before restart
+	outboxBefore, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxBefore) != 1 {
+		t.Fatalf("expected 1 outbox entry before restart, got %d (err: %v)", len(outboxBefore), err)
+	}
+
+	// ── SIMULATE DAEMON RESTART ─────────────────────────────────────────────────
+	// 1. ResetGhostRuns is invoked on daemon startup
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	for _, id := range interrupted {
+		if id == runID {
+			t.Fatalf("CRITICAL DEFECT: pending run with durable outbox was incorrectly marked as ghost run")
+		}
+	}
+
+	// 2. Verify run remains StatusPending
+	runAfterReset, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if runAfterReset.Status != drevtypes.StatusPending {
+		t.Fatalf("expected run to remain pending after ResetGhostRuns, got %s", runAfterReset.Status)
+	}
+
+	// 3. Verify outbox entry was NOT deleted or modified by ResetGhostRuns
+	outboxAfterReset, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxAfterReset) != 1 {
+		t.Fatalf("expected outbox entry to remain after ResetGhostRuns, got %d", len(outboxAfterReset))
+	}
+
+	// ── SIMULATE DAEMON RECOVERY & WORKER EXECUTION ──────────────────────────────
+	freshQueue := queue.New(10)
+	recoverer := NewOutboxRecoverer(s, freshQueue, nil)
+
+	if err := recoverer.Recover(ctx); err != nil {
+		t.Fatalf("recoverer.Recover failed: %v", err)
+	}
+
+	if freshQueue.Depth() != 1 {
+		t.Fatalf("expected 1 job recovered into fresh queue, got %d", freshQueue.Depth())
+	}
+
+	var execMu atomic.Pointer[[]string]
+	initialSlice := []string{}
+	execMu.Store(&initialSlice)
+
+	mr := &poolMockRunner{
+		runFunc: func(ctx context.Context, run *drevtypes.Run, job *drevtypes.Job, w *workspace.Workspace, logWriter io.Writer) error {
+			for {
+				oldPtr := execMu.Load()
+				newSlice := append(append([]string{}, *oldPtr...), job.Name)
+				if execMu.CompareAndSwap(oldPtr, &newSlice) {
+					break
+				}
+			}
+			return nil
+		},
+	}
+
+	sched := scheduler.New(mr, s)
+	p := New(1, freshQueue, sched, s, nil)
+
+	poolCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(func() {
+		cancel()
+		p.Stop()
+	})
+	p.Start(poolCtx)
+
+	// Wait for run to reach terminal StatusSuccess
+	deadline := time.Now().Add(5 * time.Second)
+	var finalRun *drevtypes.Run
+	for time.Now().Before(deadline) {
+		r, err := s.GetRun(ctx, runID)
+		if err == nil && r != nil && r.Status == drevtypes.StatusSuccess {
+			finalRun = r
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if finalRun == nil {
+		r, _ := s.GetRun(ctx, runID)
+		t.Fatalf("timed out waiting for run to succeed; current run status: %v", r)
+	}
+
+	// 4. Verify outbox entry was deleted upon claim
+	outboxFinal, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox failed: %v", err)
+	}
+	if len(outboxFinal) != 0 {
+		t.Errorf("expected outbox entry to be deleted after claim, found %d items", len(outboxFinal))
+	}
+
+	// 5. Verify database job records
+	dbJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs failed: %v", err)
+	}
+	if len(dbJobs) != 2 {
+		t.Fatalf("expected 2 jobs in DB, got %d", len(dbJobs))
+	}
+	for _, j := range dbJobs {
+		if j.Status != drevtypes.StatusSuccess {
+			t.Errorf("job %s status %s, want success", j.JobName, j.Status)
+		}
+	}
+
+	// 6. Verify runner executed jobs exactly once in topological order
+	executed := *execMu.Load()
+	if len(executed) != 2 {
+		t.Fatalf("expected exactly 2 jobs executed, got %d: %v", len(executed), executed)
+	}
+	if executed[0] != "step-1" || executed[1] != "step-2" {
+		t.Errorf("expected execution order [step-1, step-2], got %v", executed)
+	}
+}

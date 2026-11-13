@@ -1488,8 +1488,8 @@ func TestGitHubWebhook_DaemonRecovery_RetriesInterruptedDelivery(t *testing.T) {
 	)
 	body, _ := json.Marshal(payload)
 
-	// Simulate Step 1: CreateRunWithDelivery committed (delivery + run + jobs in pending state)
-	// but process crashes before queue enqueue
+	// Simulate worker claimed run (status running, outbox cleared),
+	// but process crashes mid-execution
 	crashedRunID := "crashed-run-1"
 	crashedDelivery := &drevtypes.WebhookDelivery{
 		DeliveryID: deliveryID,
@@ -1511,6 +1511,9 @@ func TestGitHubWebhook_DaemonRecovery_RetriesInterruptedDelivery(t *testing.T) {
 	}
 	if err := s.CreateRunWithDelivery(context.Background(), crashedDelivery, crashedRun, crashedJobs, "{}"); err != nil {
 		t.Fatalf("simulating crash state: %v", err)
+	}
+	if err := s.ClaimRunForExecution(context.Background(), crashedRunID); err != nil {
+		t.Fatalf("simulating run claim: %v", err)
 	}
 
 	// Daemon restarts: ResetGhostRuns executes upon startup

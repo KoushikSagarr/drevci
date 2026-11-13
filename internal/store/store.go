@@ -661,7 +661,10 @@ func (s *SQLiteStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtype
 }
 
 func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id FROM runs WHERE status IN ('running', 'pending')`)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id FROM runs
+		WHERE status = 'running'
+		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))`)
 	if err != nil {
 		return nil, err
 	}
@@ -690,20 +693,19 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	defer tx.Rollback()
 
 	now := time.Now().UTC().Format(time.RFC3339)
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE runs SET status = 'failed', finished_at = ?
-		WHERE status IN ('running', 'pending')`, now); err != nil {
-		return nil, fmt.Errorf("updating ghost runs: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE run_jobs SET status = 'failed', finished_at = ?
-		WHERE status IN ('running', 'pending')`, now); err != nil {
-		return nil, fmt.Errorf("updating ghost run jobs: %w", err)
-	}
-
-	// Release webhook delivery claims for interrupted runs so that GitHub redeliveries can be accepted
 	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE runs SET status = 'failed', finished_at = ?
+			WHERE id = ?`, now, id); err != nil {
+			return nil, fmt.Errorf("updating ghost run %s: %w", id, err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs SET status = 'failed', finished_at = ?
+			WHERE run_id = ? AND status IN ('running', 'pending')`, now, id); err != nil {
+			return nil, fmt.Errorf("updating ghost run jobs for %s: %w", id, err)
+		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, id); err != nil {
 			return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", id, err)
 		}

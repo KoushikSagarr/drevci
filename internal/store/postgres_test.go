@@ -458,19 +458,37 @@ func TestPostgresStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Seed interrupted runs (pending, running) and terminal run (success)
-	runPending := &drevtypes.Run{
-		ID:         "run-pg-ghost-pending",
+	runPendingOutbox := &drevtypes.Run{
+		ID:         "run-pg-ghost-pending-outbox",
 		PipelineID: "p-ghost",
 		Status:     drevtypes.StatusPending,
 	}
-	delPending := &drevtypes.WebhookDelivery{
-		DeliveryID: "del-pg-ghost-pending",
+	delPendingOutbox := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-pg-ghost-pending-outbox",
 		EventType:  "pull_request",
 		Repo:       "octocat/hello-world",
-		RunID:      runPending.ID,
+		RunID:      runPendingOutbox.ID,
 	}
-	if err := s.CreateRunWithDelivery(ctx, delPending, runPending, nil, "{}"); err != nil {
-		t.Fatalf("CreateRunWithDelivery(pending): %v", err)
+	if err := s.CreateRunWithDelivery(ctx, delPendingOutbox, runPendingOutbox, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery(pending-outbox): %v", err)
+	}
+
+	runPendingNoOutbox := &drevtypes.Run{
+		ID:         "run-pg-ghost-pending-no-outbox",
+		PipelineID: "p-ghost",
+		Status:     drevtypes.StatusPending,
+	}
+	delPendingNoOutbox := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-pg-ghost-pending-no-outbox",
+		EventType:  "pull_request",
+		Repo:       "octocat/hello-world",
+		RunID:      runPendingNoOutbox.ID,
+	}
+	if err := s.CreateRun(ctx, runPendingNoOutbox); err != nil {
+		t.Fatalf("CreateRun(pending-no-outbox): %v", err)
+	}
+	if err := s.RecordDelivery(ctx, delPendingNoOutbox); err != nil {
+		t.Fatalf("RecordDelivery(pending-no-outbox): %v", err)
 	}
 
 	runRunning := &drevtypes.Run{
@@ -503,7 +521,7 @@ func TestPostgresStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
 		t.Fatalf("CreateRunWithDelivery(success): %v", err)
 	}
 
-	// 2. Call ResetGhostRuns
+	// 2. Call ResetGhostRuns: only runPendingNoOutbox and runRunning are ghost runs
 	interrupted, err := s.ResetGhostRuns(ctx)
 	if err != nil {
 		t.Fatalf("ResetGhostRuns failed: %v", err)
@@ -513,23 +531,35 @@ func TestPostgresStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
 	}
 
 	// 3. Verify interrupted runs are now failed
-	r1, _ := s.GetRun(ctx, runPending.ID)
-	if r1.Status != drevtypes.StatusFailed || r1.FinishedAt.IsZero() {
-		t.Errorf("expected runPending to be failed with finished_at, got: %+v", r1)
+	rNoOutbox, _ := s.GetRun(ctx, runPendingNoOutbox.ID)
+	if rNoOutbox.Status != drevtypes.StatusFailed || rNoOutbox.FinishedAt.IsZero() {
+		t.Errorf("expected runPendingNoOutbox to be failed with finished_at, got: %+v", rNoOutbox)
 	}
 	r2, _ := s.GetRun(ctx, runRunning.ID)
 	if r2.Status != drevtypes.StatusFailed || r2.FinishedAt.IsZero() {
 		t.Errorf("expected runRunning to be failed with finished_at, got: %+v", r2)
 	}
 
+	// Pending run with outbox entry must SURVIVE as pending
+	rOutbox, _ := s.GetRun(ctx, runPendingOutbox.ID)
+	if rOutbox.Status != drevtypes.StatusPending {
+		t.Errorf("expected runPendingOutbox to remain pending, got: %s", rOutbox.Status)
+	}
+
 	// 4. Verify webhook delivery records for interrupted runs are RELEASED
-	dPending, err := s.GetDelivery(ctx, delPending.DeliveryID)
-	if err != nil || dPending != nil {
-		t.Errorf("expected del-pg-ghost-pending to be released, got: %+v", dPending)
+	dNoOutbox, err := s.GetDelivery(ctx, delPendingNoOutbox.DeliveryID)
+	if err != nil || dNoOutbox != nil {
+		t.Errorf("expected del-pg-ghost-pending-no-outbox to be released, got: %+v", dNoOutbox)
 	}
 	dRunning, err := s.GetDelivery(ctx, delRunning.DeliveryID)
 	if err != nil || dRunning != nil {
 		t.Errorf("expected del-pg-ghost-running to be released, got: %+v", dRunning)
+	}
+
+	// Delivery for surviving pending run with outbox is NOT released
+	dOutbox, err := s.GetDelivery(ctx, delPendingOutbox.DeliveryID)
+	if err != nil || dOutbox == nil {
+		t.Errorf("expected del-pg-ghost-pending-outbox to remain intact, got: %+v (err: %v)", dOutbox, err)
 	}
 
 	// 5. Verify webhook delivery records for SUCCESSFUL runs are NOT touched
@@ -548,7 +578,7 @@ func TestPostgresStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
 		Status:     drevtypes.StatusPending,
 	}
 	delRetried := &drevtypes.WebhookDelivery{
-		DeliveryID: delPending.DeliveryID, // Reusing interrupted delivery ID
+		DeliveryID: delRunning.DeliveryID, // Reusing interrupted delivery ID
 		EventType:  "pull_request",
 		Repo:       "octocat/hello-world",
 		RunID:      runRetried.ID,
@@ -556,7 +586,7 @@ func TestPostgresStore_ResetGhostRuns_ReleasesWebhookDeliveries(t *testing.T) {
 	if err := s.CreateRunWithDelivery(ctx, delRetried, runRetried, nil, "{}"); err != nil {
 		t.Fatalf("CreateRunWithDelivery after recovery failed: %v", err)
 	}
-	dFinal, _ := s.GetDelivery(ctx, delPending.DeliveryID)
+	dFinal, _ := s.GetDelivery(ctx, delRunning.DeliveryID)
 	if dFinal == nil || dFinal.RunID != runRetried.ID {
 		t.Errorf("retried delivery not pointing to new run: %+v", dFinal)
 	}
@@ -1127,5 +1157,164 @@ func TestPostgresStore_CreateRunJob_Compatible(t *testing.T) {
 	}
 	if gotJobs[0].ID != "pg-single-1" {
 		t.Errorf("expected pg-single-1, got %s", gotJobs[0].ID)
+	}
+}
+
+func TestPostgresStore_ResetGhostRuns_OutboxAwareness(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// 1. Pending run WITH outbox entry
+	runPendingWithOutbox := &drevtypes.Run{
+		ID:         "run-pg-pending-with-outbox",
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	del1 := &drevtypes.WebhookDelivery{DeliveryID: "del-pg-1", RunID: runPendingWithOutbox.ID}
+	if err := s.CreateRunWithDelivery(ctx, del1, runPendingWithOutbox, nil, `{"name":"p1"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery(pending-with-outbox): %v", err)
+	}
+
+	// 2. Pending run WITHOUT outbox entry (e.g. legacy/API trigger)
+	runPendingNoOutbox := &drevtypes.Run{
+		ID:         "run-pg-pending-no-outbox",
+		PipelineID: "p2",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRun(ctx, runPendingNoOutbox); err != nil {
+		t.Fatalf("CreateRun(pending-no-outbox): %v", err)
+	}
+
+	// 3. Running run WITH outbox entry (e.g. claim interrupted before outbox delete)
+	runRunningWithOutbox := &drevtypes.Run{
+		ID:         "run-pg-running-with-outbox",
+		PipelineID: "p3",
+		Status:     drevtypes.StatusRunning,
+		StartedAt:  time.Now(),
+	}
+	del3 := &drevtypes.WebhookDelivery{DeliveryID: "del-pg-3", RunID: runRunningWithOutbox.ID}
+	if err := s.CreateRunWithDelivery(ctx, del3, runRunningWithOutbox, nil, `{"name":"p3"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery(running-with-outbox): %v", err)
+	}
+
+	// 4. Running run WITHOUT outbox entry (standard claimed executing run)
+	runRunningNoOutbox := &drevtypes.Run{
+		ID:         "run-pg-running-no-outbox",
+		PipelineID: "p4",
+		Status:     drevtypes.StatusRunning,
+		StartedAt:  time.Now(),
+	}
+	if err := s.CreateRun(ctx, runRunningNoOutbox); err != nil {
+		t.Fatalf("CreateRun(running-no-outbox): %v", err)
+	}
+
+	// 5. Terminal runs: success, failed, cancelled
+	runSuccess := &drevtypes.Run{
+		ID:         "run-pg-terminal-success",
+		PipelineID: "p5",
+		Status:     drevtypes.StatusSuccess,
+		StartedAt:  time.Now().Add(-10 * time.Minute),
+		FinishedAt: time.Now().Add(-5 * time.Minute),
+	}
+	runFailed := &drevtypes.Run{
+		ID:         "run-pg-terminal-failed",
+		PipelineID: "p6",
+		Status:     drevtypes.StatusFailed,
+		StartedAt:  time.Now().Add(-10 * time.Minute),
+		FinishedAt: time.Now().Add(-5 * time.Minute),
+	}
+	runCancelled := &drevtypes.Run{
+		ID:         "run-pg-terminal-cancelled",
+		PipelineID: "p7",
+		Status:     drevtypes.StatusCancelled,
+		StartedAt:  time.Now().Add(-10 * time.Minute),
+		FinishedAt: time.Now().Add(-5 * time.Minute),
+	}
+	for _, term := range []*drevtypes.Run{runSuccess, runFailed, runCancelled} {
+		if err := s.CreateRun(ctx, term); err != nil {
+			t.Fatalf("CreateRun(%s): %v", term.ID, err)
+		}
+	}
+
+	// Execute ResetGhostRuns
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+
+	// Verify exact returned IDs:
+	// - runPendingNoOutbox (pending, no outbox) -> must be reset
+	// - runRunningWithOutbox (running, with outbox) -> must be reset
+	// - runRunningNoOutbox (running, no outbox) -> must be reset
+	// - runPendingWithOutbox (pending, with outbox) -> MUST SURVIVE (not reset)
+	// - terminal runs -> MUST SURVIVE (not reset)
+	if len(interrupted) != 3 {
+		t.Fatalf("expected 3 interrupted runs, got %d: %v", len(interrupted), interrupted)
+	}
+
+	interruptedSet := make(map[string]bool)
+	for _, id := range interrupted {
+		interruptedSet[id] = true
+	}
+
+	if interruptedSet["run-pg-pending-with-outbox"] {
+		t.Errorf("INVARIANT VIOLATION: pending run with outbox was marked as interrupted")
+	}
+	if !interruptedSet["run-pg-pending-no-outbox"] {
+		t.Errorf("expected pending run without outbox to be interrupted")
+	}
+	if !interruptedSet["run-pg-running-with-outbox"] {
+		t.Errorf("expected running run with outbox to be interrupted")
+	}
+	if !interruptedSet["run-pg-running-no-outbox"] {
+		t.Errorf("expected running run without outbox to be interrupted")
+	}
+
+	// Verify DB statuses
+	r1, _ := s.GetRun(ctx, "run-pg-pending-with-outbox")
+	if r1.Status != drevtypes.StatusPending {
+		t.Errorf("expected run-pg-pending-with-outbox to remain pending, got: %s", r1.Status)
+	}
+
+	r2, _ := s.GetRun(ctx, "run-pg-pending-no-outbox")
+	if r2.Status != drevtypes.StatusFailed || r2.FinishedAt.IsZero() {
+		t.Errorf("expected run-pg-pending-no-outbox to be failed with finished_at, got: %+v", r2)
+	}
+
+	r3, _ := s.GetRun(ctx, "run-pg-running-with-outbox")
+	if r3.Status != drevtypes.StatusFailed || r3.FinishedAt.IsZero() {
+		t.Errorf("expected run-pg-running-with-outbox to be failed with finished_at, got: %+v", r3)
+	}
+
+	r4, _ := s.GetRun(ctx, "run-pg-running-no-outbox")
+	if r4.Status != drevtypes.StatusFailed || r4.FinishedAt.IsZero() {
+		t.Errorf("expected run-pg-running-no-outbox to be failed with finished_at, got: %+v", r4)
+	}
+
+	// Terminal runs must remain unchanged
+	rSucc, _ := s.GetRun(ctx, "run-pg-terminal-success")
+	if rSucc.Status != drevtypes.StatusSuccess {
+		t.Errorf("expected run-pg-terminal-success to remain success, got: %s", rSucc.Status)
+	}
+	rFail, _ := s.GetRun(ctx, "run-pg-terminal-failed")
+	if rFail.Status != drevtypes.StatusFailed {
+		t.Errorf("expected run-pg-terminal-failed to remain failed, got: %s", rFail.Status)
+	}
+	rCanc, _ := s.GetRun(ctx, "run-pg-terminal-cancelled")
+	if rCanc.Status != drevtypes.StatusCancelled {
+		t.Errorf("expected run-pg-terminal-cancelled to remain cancelled, got: %s", rCanc.Status)
+	}
+
+	// Outbox entries must be completely preserved
+	pendingOutbox, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil {
+		t.Fatalf("GetPendingOutbox failed: %v", err)
+	}
+	outboxRunIDs := make(map[string]bool)
+	for _, item := range pendingOutbox {
+		outboxRunIDs[item.RunID] = true
+	}
+	if !outboxRunIDs["run-pg-pending-with-outbox"] {
+		t.Errorf("outbox entry for run-pg-pending-with-outbox was unexpectedly removed")
 	}
 }
