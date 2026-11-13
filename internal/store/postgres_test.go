@@ -4,9 +4,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -15,7 +17,22 @@ import (
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
+	"github.com/google/uuid"
 )
+
+func setConnSearchPath(connStr, schema string) string {
+	searchPathVal := fmt.Sprintf("%s,public", schema)
+	if strings.HasPrefix(connStr, "postgres://") || strings.HasPrefix(connStr, "postgresql://") {
+		u, err := url.Parse(connStr)
+		if err == nil {
+			q := u.Query()
+			q.Set("search_path", searchPathVal)
+			u.RawQuery = q.Encode()
+			return u.String()
+		}
+	}
+	return connStr + fmt.Sprintf(" search_path='%s'", searchPathVal)
+}
 
 func testDB(t *testing.T) *PostgresStore {
 	t.Helper()
@@ -24,24 +41,32 @@ func testDB(t *testing.T) *PostgresStore {
 		t.Skip("DREV_DB_URL not set — skipping postgres integration tests")
 	}
 
-	s, err := OpenPostgres(connStr)
+	// 1. Generate unique schema name for isolation
+	schema := fmt.Sprintf("test_%d_%d", time.Now().UnixNano(), rand.Intn(10000))
+
+	// 2. Open admin connection to create isolated schema before store initialization
+	adminDB, err := sql.Open("postgres", connStr)
 	if err != nil {
+		t.Fatalf("Open admin postgres: %v", err)
+	}
+	if _, err := adminDB.Exec(fmt.Sprintf("CREATE SCHEMA %q", schema)); err != nil {
+		adminDB.Close()
+		t.Fatalf("create test schema %q: %v", schema, err)
+	}
+
+	// 3. Connect store with search_path scoped to isolated schema first
+	scopedConnStr := setConnSearchPath(connStr, schema)
+	s, err := OpenPostgres(scopedConnStr)
+	if err != nil {
+		_, _ = adminDB.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+		adminDB.Close()
 		t.Fatalf("OpenPostgres: %v", err)
 	}
-	t.Cleanup(func() { s.Close() })
 
-	// Isolated schema for this test run
-	schema := fmt.Sprintf("test_%d", rand.New(rand.NewSource(time.Now().UnixNano())).Int63())
-	_, err = s.db.Exec(fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %q", schema))
-	if err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
-	_, err = s.db.Exec(fmt.Sprintf("SET search_path TO %q, public", schema))
-	if err != nil {
-		t.Fatalf("set search_path: %v", err)
-	}
 	t.Cleanup(func() {
-		s.db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+		_ = s.Close()
+		_, _ = adminDB.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", schema))
+		_ = adminDB.Close()
 	})
 
 	return s
@@ -954,6 +979,114 @@ func TestPostgres_MigrationUpgradeLive(t *testing.T) {
 	}
 }
 
+func TestPostgres_Migration005_FileExistsAndValid(t *testing.T) {
+	data, err := os.ReadFile("../../migrations/005_nullable_run_org_id.sql")
+	if err != nil {
+		t.Fatalf("expected migrations/005_nullable_run_org_id.sql to exist: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "ALTER TABLE runs") {
+		t.Errorf("migration missing ALTER TABLE runs")
+	}
+	if !strings.Contains(content, "ALTER COLUMN org_id DROP NOT NULL") {
+		t.Errorf("migration missing ALTER COLUMN org_id DROP NOT NULL")
+	}
+	if !strings.Contains(content, "table_schema = CURRENT_SCHEMA") {
+		t.Errorf("migration missing CURRENT_SCHEMA check")
+	}
+	if !strings.Contains(content, "column_name = 'org_id'") {
+		t.Errorf("migration missing column_name = 'org_id' check")
+	}
+}
+
+func TestPostgres_Migration005_UpgradeLive(t *testing.T) {
+	connStr := os.Getenv("DREV_DB_URL")
+	if connStr == "" {
+		t.Skip("DREV_DB_URL not set — skipping postgres integration tests")
+	}
+
+	migrationSQL, err := os.ReadFile("../../migrations/005_nullable_run_org_id.sql")
+	if err != nil {
+		t.Fatalf("reading migration 005: %v", err)
+	}
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		t.Fatalf("opening postgres: %v", err)
+	}
+	defer db.Close()
+
+	// Dedicated test schema for migration verification
+	testSchema := fmt.Sprintf("test_mig005_%d_%d", time.Now().UnixNano(), rand.Intn(10000))
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %q", testSchema)); err != nil {
+		t.Fatalf("creating test schema %q: %v", testSchema, err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", testSchema))
+	})
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquiring dedicated connection: %v", err)
+	}
+	defer conn.Close()
+
+	// Set search_path strictly to testSchema (excluding public) so CURRENT_SCHEMA is testSchema
+	// and no fallback can ever resolve or affect public tables.
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q", testSchema)); err != nil {
+		t.Fatalf("setting dedicated search_path: %v", err)
+	}
+
+	// Create test runs table in CURRENT_SCHEMA with NOT NULL org_id
+	if _, err := conn.ExecContext(ctx, `
+		CREATE TABLE runs (
+			id     UUID PRIMARY KEY,
+			org_id UUID NOT NULL
+		)`); err != nil {
+		t.Fatalf("creating test runs table with NOT NULL org_id: %v", err)
+	}
+
+	checkNullable := func() string {
+		var isNullable string
+		err := conn.QueryRowContext(ctx, `
+			SELECT is_nullable
+			FROM information_schema.columns
+			WHERE table_schema = CURRENT_SCHEMA
+			  AND table_name = 'runs'
+			  AND column_name = 'org_id'`).Scan(&isNullable)
+		if err != nil {
+			t.Fatalf("querying is_nullable from information_schema: %v", err)
+		}
+		return isNullable
+	}
+
+	// 1. Verify that initially runs.org_id is NOT NULL (is_nullable = 'NO')
+	if isNullable := checkNullable(); isNullable != "NO" {
+		t.Fatalf("expected initial runs.org_id to be NOT NULL (is_nullable='NO'), got: %s", isNullable)
+	}
+
+	// 2. Execute migration 005 to upgrade schema
+	if _, err := conn.ExecContext(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("executing migration 005 failed: %v", err)
+	}
+
+	// 3. Verify that runs.org_id is now nullable (is_nullable = 'YES')
+	if isNullable := checkNullable(); isNullable != "YES" {
+		t.Errorf("expected runs.org_id to be nullable after migration (is_nullable='YES'), got: %s", isNullable)
+	}
+
+	// 4. Re-execute migration 005 to prove idempotency
+	if _, err := conn.ExecContext(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("re-executing migration 005 (idempotency check) failed: %v", err)
+	}
+
+	// 5. Verify that runs.org_id remains nullable (is_nullable = 'YES')
+	if isNullable := checkNullable(); isNullable != "YES" {
+		t.Errorf("expected runs.org_id to remain nullable after idempotent rerun (is_nullable='YES'), got: %s", isNullable)
+	}
+}
+
 func TestPostgresStore_CreateRunJobs_Success(t *testing.T) {
 	s := testDB(t)
 	ctx := context.Background()
@@ -1316,5 +1449,286 @@ func TestPostgresStore_ResetGhostRuns_OutboxAwareness(t *testing.T) {
 	}
 	if !outboxRunIDs["run-pg-pending-with-outbox"] {
 		t.Errorf("outbox entry for run-pg-pending-with-outbox was unexpectedly removed")
+	}
+}
+
+func TestPostgresStore_CreateRunWithDelivery_ForeignKeyOrder_RealUUID(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	// ── Case 1: Webhook ingestion with absent OrgID and human-readable PipelineID ──
+	// Verifies parent-before-child foreign key ordering, and verifies that absent
+	// OrgID is persisted as SQL NULL, pipeline_name stores the human-readable name,
+	// runs.pipeline_id remains SQL NULL, and GetRun returns that exact pipeline name.
+	runID := uuid.New().String()
+	deliveryID := "del-pg-uuid-" + uuid.New().String()
+
+	del := &drevtypes.WebhookDelivery{
+		DeliveryID: deliveryID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		PRNumber:   0,
+		RunID:      runID,
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+	}
+
+	run := &drevtypes.Run{
+		ID:          runID,
+		OrgID:       "",
+		PipelineID:  "deploy-pipeline",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+		CommitSHA:   "1234567890abcdef1234567890abcdef12345678",
+		Branch:      "main",
+	}
+
+	job1ID := uuid.New().String()
+	job2ID := uuid.New().String()
+	jobs := []*drevtypes.RunJob{
+		{ID: job1ID, RunID: runID, JobName: "build", Status: drevtypes.StatusPending},
+		{ID: job2ID, RunID: runID, JobName: "test", Status: drevtypes.StatusPending},
+	}
+
+	pipelineSpec := `{"name":"deploy-pipeline","jobs":[{"name":"build"},{"name":"test"}]}`
+
+	if err := s.CreateRunWithDelivery(ctx, del, run, jobs, pipelineSpec); err != nil {
+		t.Fatalf("CreateRunWithDelivery with absent OrgID failed: %v", err)
+	}
+
+	// 1. Verify delivery exists and references runID
+	gotDel, err := s.GetDelivery(ctx, deliveryID)
+	if err != nil || gotDel == nil {
+		t.Fatalf("expected delivery in store, got %+v (err: %v)", gotDel, err)
+	}
+	if gotDel.RunID != runID {
+		t.Errorf("expected delivery.RunID = %s, got %s", runID, gotDel.RunID)
+	}
+
+	// 2. Verify GetRun returns empty OrgID and the human-readable PipelineID
+	gotRun, err := s.GetRun(ctx, runID)
+	if err != nil || gotRun == nil {
+		t.Fatalf("expected run in store, got %+v (err: %v)", gotRun, err)
+	}
+	if gotRun.OrgID != "" {
+		t.Errorf("expected run.OrgID to be empty string, got %q", gotRun.OrgID)
+	}
+	if gotRun.PipelineID != "deploy-pipeline" {
+		t.Errorf("expected run.PipelineID to be %q, got %q", "deploy-pipeline", gotRun.PipelineID)
+	}
+	if gotRun.Status != drevtypes.StatusPending {
+		t.Errorf("expected run.Status = pending, got %s", gotRun.Status)
+	}
+
+	// 3. Verify in PostgreSQL directly that org_id and pipeline_id are SQL NULL, and pipeline_name matches
+	var dbOrgID, dbPipelineID sql.NullString
+	var dbPipelineName string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT org_id, pipeline_id, pipeline_name
+		FROM runs
+		WHERE id = $1`, runID).Scan(&dbOrgID, &dbPipelineID, &dbPipelineName); err != nil {
+		t.Fatalf("querying raw runs row: %v", err)
+	}
+	if dbOrgID.Valid {
+		t.Errorf("expected runs.org_id to be SQL NULL, got: %s", dbOrgID.String)
+	}
+	if dbPipelineID.Valid {
+		t.Errorf("expected runs.pipeline_id to be SQL NULL, got: %s", dbPipelineID.String)
+	}
+	if dbPipelineName != "deploy-pipeline" {
+		t.Errorf("expected runs.pipeline_name = %q, got: %q", "deploy-pipeline", dbPipelineName)
+	}
+
+	// 4. Verify jobs exist
+	gotJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil || len(gotJobs) != 2 {
+		t.Fatalf("expected 2 jobs, got %d (err: %v)", len(gotJobs), err)
+	}
+
+	// 5. Verify outbox exists
+	outboxItems, err := s.GetPendingOutbox(ctx, 10)
+	if err != nil || len(outboxItems) != 1 || outboxItems[0].RunID != runID {
+		t.Fatalf("expected outbox item for %s, got %+v (err: %v)", runID, outboxItems, err)
+	}
+
+	// ── Case 2: Webhook ingestion with absent OrgID and empty PipelineID ────────
+	runEmptyID := uuid.New().String()
+	delEmptyID := "del-pg-empty-" + uuid.New().String()
+	delEmpty := &drevtypes.WebhookDelivery{
+		DeliveryID: delEmptyID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      runEmptyID,
+	}
+	runEmpty := &drevtypes.Run{
+		ID:          runEmptyID,
+		OrgID:       "",
+		PipelineID:  "", // empty pipeline name
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, delEmpty, runEmpty, nil, "{}"); err != nil {
+		t.Fatalf("CreateRunWithDelivery with empty PipelineID failed: %v", err)
+	}
+
+	gotRunEmpty, err := s.GetRun(ctx, runEmptyID)
+	if err != nil || gotRunEmpty == nil {
+		t.Fatalf("expected runEmpty in store: %v", err)
+	}
+	if gotRunEmpty.PipelineID != "" {
+		t.Errorf("expected empty PipelineID, got %q", gotRunEmpty.PipelineID)
+	}
+
+	var dbEmptyOrgID, dbEmptyPipelineID sql.NullString
+	var dbEmptyPipelineName string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT org_id, pipeline_id, pipeline_name
+		FROM runs
+		WHERE id = $1`, runEmptyID).Scan(&dbEmptyOrgID, &dbEmptyPipelineID, &dbEmptyPipelineName); err != nil {
+		t.Fatalf("querying raw runEmpty row: %v", err)
+	}
+	if dbEmptyOrgID.Valid {
+		t.Errorf("expected runs.org_id to be SQL NULL, got: %s", dbEmptyOrgID.String)
+	}
+	if dbEmptyPipelineID.Valid {
+		t.Errorf("expected runs.pipeline_id to be SQL NULL, got: %s", dbEmptyPipelineID.String)
+	}
+	if dbEmptyPipelineName != "" {
+		t.Errorf("expected runs.pipeline_name = %q, got: %q", "", dbEmptyPipelineName)
+	}
+
+	// ── Case 3: Satisfy referenced organization foreign key with real UUID ──────
+	orgID := uuid.New().String()
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO organizations (id, name, slug)
+		VALUES ($1, $2, $3)`,
+		orgID, "Test Org", "test-org-"+uuid.New().String(),
+	); err != nil {
+		t.Fatalf("inserting test organization: %v", err)
+	}
+
+	runOrgID := uuid.New().String()
+	delOrgID := "del-org-" + uuid.New().String()
+	delOrg := &drevtypes.WebhookDelivery{
+		DeliveryID: delOrgID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      runOrgID,
+	}
+	runOrg := &drevtypes.Run{
+		ID:          runOrgID,
+		OrgID:       orgID,
+		PipelineID:  "org-pipeline",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, delOrg, runOrg, nil, `{"name":"org-pipeline"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery with valid organization foreign key failed: %v", err)
+	}
+
+	gotRunOrg, err := s.GetRun(ctx, runOrgID)
+	if err != nil || gotRunOrg == nil {
+		t.Fatalf("expected runOrg in store: %v", err)
+	}
+	if gotRunOrg.OrgID != orgID {
+		t.Errorf("expected runOrg.OrgID = %s, got %s", orgID, gotRunOrg.OrgID)
+	}
+	if gotRunOrg.PipelineID != "org-pipeline" {
+		t.Errorf("expected runOrg.PipelineID = %q, got %q", "org-pipeline", gotRunOrg.PipelineID)
+	}
+
+	var fkOrgID, fkPipelineID sql.NullString
+	var fkPipelineName string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT org_id, pipeline_id, pipeline_name
+		FROM runs
+		WHERE id = $1`, runOrgID).Scan(&fkOrgID, &fkPipelineID, &fkPipelineName); err != nil {
+		t.Fatalf("querying raw FK runs row: %v", err)
+	}
+	if !fkOrgID.Valid || fkOrgID.String != orgID {
+		t.Errorf("expected runs.org_id = %s, got: %+v", orgID, fkOrgID)
+	}
+	if fkPipelineID.Valid {
+		t.Errorf("expected runs.pipeline_id to be SQL NULL, got: %s", fkPipelineID.String)
+	}
+	if fkPipelineName != "org-pipeline" {
+		t.Errorf("expected runs.pipeline_name = %q, got: %q", "org-pipeline", fkPipelineName)
+	}
+}
+
+func TestPostgresStore_CreateRunWithDelivery_DuplicateDelivery_RollsBackRun(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	run1ID := uuid.New().String()
+	deliveryID := "del-pg-dup-" + uuid.New().String()
+
+	del1 := &drevtypes.WebhookDelivery{
+		DeliveryID: deliveryID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run1ID,
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+	}
+	run1 := &drevtypes.Run{
+		ID:          run1ID,
+		OrgID:       "",
+		PipelineID:  "ci",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+	}
+
+	if err := s.CreateRunWithDelivery(ctx, del1, run1, nil, `{"name":"ci"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery(1) failed: %v", err)
+	}
+
+	// Attempt duplicate delivery with SAME deliveryID but a NEW run UUID
+	run2ID := uuid.New().String()
+	delDup := &drevtypes.WebhookDelivery{
+		DeliveryID: deliveryID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      run2ID,
+		CreatedAt:  time.Now().UTC().Truncate(time.Second),
+	}
+	runDup := &drevtypes.Run{
+		ID:          run2ID,
+		OrgID:       "",
+		PipelineID:  "ci-dup",
+		Status:      drevtypes.StatusPending,
+		TriggeredBy: "webhook",
+	}
+
+	err := s.CreateRunWithDelivery(ctx, delDup, runDup, nil, `{"name":"ci-dup"}`)
+	if err == nil {
+		t.Fatalf("expected ErrDuplicateDelivery on duplicate delivery ID, got nil")
+	}
+	if !errors.Is(err, ErrDuplicateDelivery) {
+		t.Fatalf("expected ErrDuplicateDelivery, got: %v", err)
+	}
+
+	// PROVE ROLLBACK: runDup must NOT exist in the database!
+	gotRunDup, err := s.GetRun(ctx, run2ID)
+	if err == nil && gotRunDup != nil {
+		t.Fatalf("expected runDup (%s) to be rolled back, found in database: %+v", run2ID, gotRunDup)
+	}
+
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM runs WHERE id = $1`, run2ID).Scan(&count); err != nil {
+		t.Fatalf("counting rolled back run rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 rows for rolled back run %s, found %d", run2ID, count)
+	}
+
+	// Verify original delivery and run remain intact
+	delCheck, err := s.GetDelivery(ctx, deliveryID)
+	if err != nil || delCheck == nil || delCheck.RunID != run1ID {
+		t.Fatalf("expected original delivery to point to run1 (%s), got: %+v (err: %v)", run1ID, delCheck, err)
+	}
+	run1Check, err := s.GetRun(ctx, run1ID)
+	if err != nil || run1Check == nil || run1Check.Status != drevtypes.StatusPending {
+		t.Fatalf("expected original run1 to remain pending, got: %+v (err: %v)", run1Check, err)
 	}
 }

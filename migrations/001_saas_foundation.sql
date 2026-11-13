@@ -74,7 +74,7 @@ CREATE TABLE pipelines (
 -- ============================================================
 CREATE TABLE runs (
   id            UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
-  org_id        UUID        NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  org_id        UUID        REFERENCES organizations(id) ON DELETE CASCADE,
   pipeline_id   UUID        REFERENCES pipelines(id) ON DELETE SET NULL,
   pipeline_name TEXT        NOT NULL,
   status        TEXT        NOT NULL DEFAULT 'pending',

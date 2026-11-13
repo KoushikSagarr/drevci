@@ -109,6 +109,19 @@ func OpenPostgres(connString string) (*PostgresStore, error) {
 				END IF;
 			END IF;
 		END $$;`,
+		`DO $$
+		BEGIN
+			-- 3. nullable run org_id
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = CURRENT_SCHEMA
+				  AND table_name = 'runs'
+				  AND column_name = 'org_id'
+				  AND is_nullable = 'NO'
+			) THEN
+				ALTER TABLE runs ALTER COLUMN org_id DROP NOT NULL;
+			END IF;
+		END $$;`,
 	}
 	for _, q := range initQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -745,7 +758,20 @@ func (s *PostgresStore) CreateRunWithDelivery(
 	}
 	defer tx.Rollback()
 
-	// 1. Insert webhook delivery record
+	// 1. Insert run record first so dependent child foreign keys are satisfied
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO runs
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
+		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
+		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting postgres run: %w", err)
+	}
+
+	// 2. Insert webhook delivery record (child referencing runs(id))
 	createdAt := time.Now().UTC()
 	if !delivery.CreatedAt.IsZero() {
 		createdAt = delivery.CreatedAt.UTC()
@@ -763,19 +789,6 @@ func (s *PostgresStore) CreateRunWithDelivery(
 			return ErrDuplicateDelivery
 		}
 		return fmt.Errorf("inserting postgres webhook delivery: %w", err)
-	}
-
-	// 2. Insert run record
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
-		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
-		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
-	)
-	if err != nil {
-		return fmt.Errorf("inserting postgres run: %w", err)
 	}
 
 	// 3. Insert run jobs

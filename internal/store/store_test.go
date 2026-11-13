@@ -2332,3 +2332,66 @@ func TestStore_ResetGhostRuns_OutboxAwareness(t *testing.T) {
 		t.Errorf("outbox entry for run-pending-with-outbox was unexpectedly removed")
 	}
 }
+
+func TestStore_CreateRunWithDelivery_DuplicateDelivery_RollsBackRun(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "dup_rollback.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	del1 := &drevtypes.WebhookDelivery{
+		DeliveryID: "del-dup-test-001",
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      "run-first-001",
+	}
+	run1 := &drevtypes.Run{
+		ID:         del1.RunID,
+		PipelineID: "p1",
+		Status:     drevtypes.StatusPending,
+	}
+	if err := s.CreateRunWithDelivery(ctx, del1, run1, nil, `{"name":"p1"}`); err != nil {
+		t.Fatalf("CreateRunWithDelivery(1): %v", err)
+	}
+
+	// Attempt duplicate delivery with SAME deliveryID but NEW runID
+	delDup := &drevtypes.WebhookDelivery{
+		DeliveryID: del1.DeliveryID,
+		EventType:  "push",
+		Repo:       "octocat/hello-world",
+		RunID:      "run-second-rolled-back-002",
+	}
+	runDup := &drevtypes.Run{
+		ID:         delDup.RunID,
+		PipelineID: "p2",
+		Status:     drevtypes.StatusPending,
+	}
+
+	err = s.CreateRunWithDelivery(ctx, delDup, runDup, nil, `{"name":"p2"}`)
+	if err == nil {
+		t.Fatalf("expected ErrDuplicateDelivery, got nil")
+	}
+	if !errors.Is(err, store.ErrDuplicateDelivery) {
+		t.Fatalf("expected ErrDuplicateDelivery, got: %v", err)
+	}
+
+	// Verify runDup was rolled back and does not exist in store
+	gotRunDup, err := s.GetRun(ctx, runDup.ID)
+	if err == nil && gotRunDup != nil {
+		t.Fatalf("expected runDup to be rolled back, found: %+v", gotRunDup)
+	}
+
+	// Verify original delivery and run are untouched
+	gotDel1, err := s.GetDelivery(ctx, del1.DeliveryID)
+	if err != nil || gotDel1 == nil || gotDel1.RunID != run1.ID {
+		t.Fatalf("expected original delivery1 to remain intact, got: %+v (err: %v)", gotDel1, err)
+	}
+	gotRun1, err := s.GetRun(ctx, run1.ID)
+	if err != nil || gotRun1 == nil || gotRun1.Status != drevtypes.StatusPending {
+		t.Fatalf("expected original run1 to remain intact, got: %+v (err: %v)", gotRun1, err)
+	}
+}

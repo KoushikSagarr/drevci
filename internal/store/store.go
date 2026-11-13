@@ -886,11 +886,24 @@ func (s *SQLiteStore) CreateRunWithDelivery(
 	}
 	defer tx.Rollback()
 
-	// 1. Insert webhook delivery record
 	now := time.Now().UTC().Format(time.RFC3339)
 	if !delivery.CreatedAt.IsZero() {
 		now = delivery.CreatedAt.UTC().Format(time.RFC3339)
 	}
+
+	// 1. Insert run record first so dependent foreign keys are satisfied
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.OrgID, run.PipelineID, string(run.Status),
+		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
+		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("inserting run: %w", err)
+	}
+
+	// 2. Insert webhook delivery record (child referencing runs(id))
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO webhook_deliveries (delivery_id, event_type, repo, pr_number, run_id, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -901,18 +914,6 @@ func (s *SQLiteStore) CreateRunWithDelivery(
 			return ErrDuplicateDelivery
 		}
 		return fmt.Errorf("inserting webhook delivery: %w", err)
-	}
-
-	// 2. Insert run record
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		run.ID, run.OrgID, run.PipelineID, string(run.Status),
-		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
-		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
-	)
-	if err != nil {
-		return fmt.Errorf("inserting run: %w", err)
 	}
 
 	// 3. Insert all associated run jobs
