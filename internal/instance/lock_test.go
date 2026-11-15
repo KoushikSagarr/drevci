@@ -180,11 +180,11 @@ func TestPostgresLeaseKeeper_Integration(t *testing.T) {
 	// 2. Verify pg_locks has exactly the lock with objsubid = 2
 	var lockCount int
 	err = db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM pg_locks 
-		WHERE locktype = 'advisory' 
-		  AND classid = $1::oid 
-		  AND objid = $2::oid 
-		  AND objsubid = 2 
+		SELECT COUNT(*) FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = $1::oid
+		  AND objid = $2::oid
+		  AND objsubid = 2
 		  AND pid = $3
 		  AND granted = true
 	`, PostgresLockKey1, PostgresLockKey2, keeper.backendPID).Scan(&lockCount)
@@ -215,11 +215,11 @@ func TestPostgresLeaseKeeper_Integration(t *testing.T) {
 
 	// 5. Verify lock is no longer in pg_locks
 	err = db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM pg_locks 
-		WHERE locktype = 'advisory' 
-		  AND classid = $1::oid 
-		  AND objid = $2::oid 
-		  AND objsubid = 2 
+		SELECT COUNT(*) FROM pg_locks
+		WHERE locktype = 'advisory'
+		  AND classid = $1::oid
+		  AND objid = $2::oid
+		  AND objsubid = 2
 		  AND pid = $3
 	`, PostgresLockKey1, PostgresLockKey2, keeper.backendPID).Scan(&lockCount)
 	if err != nil {

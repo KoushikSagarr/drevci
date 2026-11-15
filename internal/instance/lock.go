@@ -178,11 +178,11 @@ func (k *PostgresLeaseKeeper) watchdog() {
 			var isHeld bool
 			queryErr := k.conn.QueryRowContext(pingCtx, `
 				SELECT pg_backend_pid(), EXISTS (
-					SELECT 1 FROM pg_locks 
-					WHERE locktype = 'advisory' 
-					  AND classid = $1::oid 
-					  AND objid = $2::oid 
-					  AND objsubid = 2 
+					SELECT 1 FROM pg_locks
+					WHERE locktype = 'advisory'
+					  AND classid = $1::oid
+					  AND objid = $2::oid
+					  AND objsubid = 2
 					  AND pid = pg_backend_pid()
 					  AND granted = true
 				)`, k.key1, k.key2).Scan(&currentPID, &isHeld)

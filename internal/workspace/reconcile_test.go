@@ -388,4 +388,3 @@ func TestReconcile_InterruptedRunIDsAuthorizesCleanup(t *testing.T) {
 		t.Fatalf("workspace should be removed after ghost run reconciliation")
 	}
 }
-
