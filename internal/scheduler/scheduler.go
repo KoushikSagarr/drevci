@@ -149,7 +149,11 @@ func (s *Scheduler) finalizePreparationFailure(
 	}
 
 	// Otherwise, update the run status using an uncancelled background context.
-	if updateErr := s.store.UpdateRunStatus(context.Background(), runID, targetStatus); updateErr != nil {
+	reason := drevtypes.FailureReasonPreparationFailed
+	if isCancelled {
+		reason = string(drevtypes.StatusCancelled)
+	}
+	if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, targetStatus, reason, drevtypes.StagePreparation); updateErr != nil {
 		return errors.Join(prepErr, fmt.Errorf("updating run status to %s: %w", targetStatus, updateErr))
 	}
 
@@ -531,8 +535,14 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 					fmt.Fprintf(logWriter, "[drev] job %q timed out after %s\n", job.Name, job.Timeout)
 					err = fmt.Errorf("job %q timed out after %s: %w", job.Name, job.Timeout, err)
 				}
+				jobReason := drevtypes.FailureReasonCommandFailed
+				if isJobTimeout {
+					jobReason = drevtypes.FailureReasonTimeout
+				} else if targetStatus == drevtypes.StatusCancelled {
+					jobReason = string(drevtypes.StatusCancelled)
+				}
 				mu.Unlock()
-				s.store.UpdateRunJobStatus(context.Background(), rj.ID, targetStatus)
+				s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, targetStatus, jobReason)
 				return err
 			}
 			mu.Unlock()
@@ -569,13 +579,13 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 
 	if ctx.Err() == context.Canceled || hasCancelled {
 		if hasFailure {
-			s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+			s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
 			if waitErr != nil {
 				return waitErr
 			}
 			return fmt.Errorf("pipeline run failed with errors before cancellation")
 		}
-		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusCancelled)
+		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled), drevtypes.StageExecution)
 		if waitErr != nil {
 			return waitErr
 		}
@@ -583,12 +593,12 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 	}
 
 	if waitErr != nil {
-		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
 		return waitErr
 	}
 
 	if hasFailure || hasSkip {
-		s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusFailed)
+		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
 		return fmt.Errorf("pipeline run completed with failed or skipped jobs")
 	}
 

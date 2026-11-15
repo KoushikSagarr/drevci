@@ -122,6 +122,30 @@ func OpenPostgres(connString string) (*PostgresStore, error) {
 				ALTER TABLE runs ALTER COLUMN org_id DROP NOT NULL;
 			END IF;
 		END $$;`,
+		`DO $$
+		BEGIN
+			-- 4. ghost-run diagnostics columns
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs' AND column_name = 'failure_reason'
+			) THEN
+				ALTER TABLE runs ADD COLUMN failure_reason TEXT;
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs' AND column_name = 'interrupted_stage'
+			) THEN
+				ALTER TABLE runs ADD COLUMN interrupted_stage TEXT;
+			END IF;
+
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'run_jobs' AND column_name = 'failure_reason'
+			) THEN
+				ALTER TABLE run_jobs ADD COLUMN failure_reason TEXT;
+			END IF;
+		END $$;`,
 	}
 	for _, q := range initQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -180,11 +204,13 @@ func scanPgRun(row interface {
 	var status, triggeredBy string
 	var commitSHA, commitMsg, branch sql.NullString
 	var startedAt, finishedAt sql.NullTime
+	var failureReason, interruptedStage sql.NullString
 
 	err := row.Scan(
 		&r.ID, &r.OrgID, &r.PipelineID, &status,
 		&triggeredBy, &commitSHA, &commitMsg, &branch,
 		&startedAt, &finishedAt,
+		&failureReason, &interruptedStage,
 	)
 	if err != nil {
 		return nil, err
@@ -196,6 +222,8 @@ func scanPgRun(row interface {
 	r.Branch = scanNullString(&branch)
 	r.StartedAt = scanNullTime(&startedAt)
 	r.FinishedAt = scanNullTime(&finishedAt)
+	r.FailureReason = scanNullString(&failureReason)
+	r.InterruptedStage = scanNullString(&interruptedStage)
 	return &r, nil
 }
 
@@ -204,11 +232,12 @@ func scanPgRun(row interface {
 func (s *PostgresStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
 	)
 	return err
 }
@@ -263,11 +292,12 @@ func (s *PostgresStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.R
 	// 4. Insert parent run
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting postgres run: %w", err)
@@ -283,9 +313,11 @@ func (s *PostgresStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.R
 			status = drevtypes.StatusPending
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO run_jobs (id, run_id, job_name, status)
-			VALUES ($1, $2, $3, $4)`,
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			job.ID, run.ID, job.JobName, string(status),
+			pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+			pgNullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting postgres run job: %w", err)
@@ -310,7 +342,8 @@ func (s *PostgresStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.R
 func (s *PostgresStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-		       commit_sha, commit_msg, branch, started_at, finished_at
+		       commit_sha, commit_msg, branch, started_at, finished_at,
+		       failure_reason, interrupted_stage
 		FROM runs WHERE id = $1`, id)
 
 	r, err := scanPgRun(row)
@@ -330,14 +363,22 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, 
 }
 
 func (s *PostgresStore) UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
+	return s.UpdateRunStatusWithDiagnostics(ctx, id, status, "", "")
+}
+
+func (s *PostgresStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET
 		  status      = $1,
 		  started_at  = CASE WHEN $2 = 'running'  AND started_at  IS NULL THEN $3 ELSE started_at  END,
-		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END
-		WHERE id = $5 AND (status NOT IN ('success', 'failed', 'cancelled') OR status = $6)`,
-		string(status), string(status), now, string(status), id, string(status),
+		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END,
+		  failure_reason = CASE WHEN $5 != '' THEN $5 ELSE failure_reason END,
+		  interrupted_stage = CASE WHEN $6 != '' THEN $6 ELSE interrupted_stage END
+		WHERE id = $7 AND (status NOT IN ('success', 'failed', 'cancelled') OR status = $8)`,
+		string(status), string(status), now, string(status),
+		failureReason, interruptedStage,
+		id, string(status),
 	)
 	if err != nil {
 		return err
@@ -376,13 +417,15 @@ func (s *PostgresStore) listRuns(ctx context.Context, orgID string, limit int) (
 	if orgID != "" {
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs WHERE org_id = $1
 			ORDER BY created_at DESC LIMIT $2`, orgID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs ORDER BY created_at DESC LIMIT $1`, limit)
 	}
 	if err != nil {
@@ -411,10 +454,11 @@ func (s *PostgresStore) listRuns(ctx context.Context, orgID string, limit int) (
 
 func (s *PostgresStore) CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-		VALUES ($1,$2,$3,$4,$5,$6)`,
+		INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		job.ID, job.RunID, job.JobName, string(job.Status),
 		pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+		pgNullStr(job.FailureReason),
 	)
 	return err
 }
@@ -449,10 +493,11 @@ func (s *PostgresStore) CreateRunJobs(ctx context.Context, runID string, jobs []
 		}
 
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			job.ID, runID, job.JobName, string(status),
 			pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+			pgNullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting postgres run job %s: %w", job.JobName, err)
@@ -466,14 +511,21 @@ func (s *PostgresStore) CreateRunJobs(ctx context.Context, runID string, jobs []
 }
 
 func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
+	return s.UpdateRunJobStatusWithDiagnostics(ctx, id, status, "")
+}
+
+func (s *PostgresStore) UpdateRunJobStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string) error {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE run_jobs SET
 		  status      = $1,
 		  started_at  = CASE WHEN $2 = 'running'  AND started_at  IS NULL THEN $3 ELSE started_at  END,
-		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled','skipped') THEN $3 ELSE finished_at END
-		WHERE id = $5 AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = $6)`,
-		string(status), string(status), now, string(status), id, string(status),
+		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled','skipped') THEN $3 ELSE finished_at END,
+		  failure_reason = CASE WHEN $5 != '' THEN $5 ELSE failure_reason END
+		WHERE id = $6 AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = $7)`,
+		string(status), string(status), now, string(status),
+		failureReason,
+		id, string(status),
 	)
 	if err != nil {
 		return err
@@ -498,7 +550,7 @@ func (s *PostgresStore) UpdateRunJobStatus(ctx context.Context, id string, statu
 
 func (s *PostgresStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, run_id, job_name, status, started_at, finished_at
+		SELECT id, run_id, job_name, status, started_at, finished_at, failure_reason
 		FROM run_jobs WHERE run_id = $1`, runID)
 	if err != nil {
 		return nil, err
@@ -510,67 +562,138 @@ func (s *PostgresStore) GetRunJobs(ctx context.Context, runID string) ([]*drevty
 		var j drevtypes.RunJob
 		var status string
 		var startedAt, finishedAt sql.NullTime
+		var failureReason sql.NullString
 
-		if err := rows.Scan(&j.ID, &j.RunID, &j.JobName, &status, &startedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.RunID, &j.JobName, &status, &startedAt, &finishedAt, &failureReason); err != nil {
 			return nil, err
 		}
 		j.Status = drevtypes.RunStatus(status)
 		j.StartedAt = scanNullTime(&startedAt)
 		j.FinishedAt = scanNullTime(&finishedAt)
+		j.FailureReason = scanNullString(&failureReason)
 		jobs = append(jobs, &j)
 	}
 	return jobs, rows.Err()
 }
 
 func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id FROM runs
-		WHERE status = 'running'
-		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(ids) == 0 {
-		return nil, nil
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("beginning postgres reset ghost runs transaction: %w", err)
 	}
 	defer tx.Rollback()
 
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, status, started_at FROM runs
+		WHERE status = 'running'
+		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))
+		FOR UPDATE SKIP LOCKED`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type candidate struct {
+		id        string
+		status    string
+		startedAt sql.NullTime
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.status, &c.startedAt); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
 	now := time.Now().UTC()
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE runs SET status = 'failed', finished_at = $1
-			WHERE id = $2`, now, id); err != nil {
-			return nil, fmt.Errorf("updating postgres ghost run %s: %w", id, err)
+	var ids []string
+
+	for _, c := range candidates {
+		// 1. Fetch current jobs for this run within the transaction
+		jrows, err := tx.QueryContext(ctx, `
+			SELECT id, status FROM run_jobs WHERE run_id = $1`, c.id)
+		if err != nil {
+			return nil, fmt.Errorf("querying postgres jobs for ghost run %s: %w", c.id, err)
+		}
+		var jobs []*drevtypes.RunJob
+		for jrows.Next() {
+			var j drevtypes.RunJob
+			var jstatus string
+			if err := jrows.Scan(&j.ID, &jstatus); err != nil {
+				jrows.Close()
+				return nil, fmt.Errorf("scanning postgres job for ghost run %s: %w", c.id, err)
+			}
+			j.Status = drevtypes.RunStatus(jstatus)
+			jobs = append(jobs, &j)
+		}
+		jrows.Close()
+		if err := jrows.Err(); err != nil {
+			return nil, fmt.Errorf("reading postgres jobs for ghost run %s: %w", c.id, err)
 		}
 
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs SET status = 'failed', finished_at = $1
-			WHERE run_id = $2 AND status IN ('running', 'pending')`, now, id); err != nil {
-			return nil, fmt.Errorf("updating postgres ghost run jobs for %s: %w", id, err)
+		// 2. Formulate candidate Run for stage deduction
+		runObj := &drevtypes.Run{
+			ID:        c.id,
+			Status:    drevtypes.RunStatus(c.status),
+			StartedAt: scanNullTime(&c.startedAt),
+		}
+		stage := drevtypes.DeduceInterruptedStage(runObj, jobs)
+
+		// 3. Atomically update run status to failed with failure_reason and deduced stage
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET status = 'failed',
+			    failure_reason = 'interrupted_by_daemon_restart',
+			    interrupted_stage = $1,
+			    finished_at = CASE WHEN finished_at IS NULL THEN $2 ELSE finished_at END
+			WHERE id = $3 AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+		if err != nil {
+			return nil, fmt.Errorf("updating postgres ghost run %s: %w", c.id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			continue
 		}
 
-		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = $1`, id); err != nil {
-			return nil, fmt.Errorf("releasing postgres webhook delivery for ghost run %s: %w", id, err)
+		// 4. Mark active running jobs as failed
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'failed',
+			    failure_reason = 'interrupted_by_daemon_restart',
+			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+			WHERE run_id = $2 AND status = 'running'`, now, c.id); err != nil {
+			return nil, fmt.Errorf("updating postgres running ghost jobs for %s: %w", c.id, err)
 		}
+
+		// 5. Mark unstarted pending jobs as cancelled
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled_by_daemon_restart',
+			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+			WHERE run_id = $2 AND status = 'pending'`, now, c.id); err != nil {
+			return nil, fmt.Errorf("updating postgres pending ghost jobs for %s: %w", c.id, err)
+		}
+
+		// 6. Release webhook delivery claim
+		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = $1`, c.id); err != nil {
+			return nil, fmt.Errorf("releasing postgres webhook delivery for ghost run %s: %w", c.id, err)
+		}
+
+		ids = append(ids, c.id)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -705,7 +828,8 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 	if orgID != "" {
 		termRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs
 			WHERE org_id = $1 AND status IN ('success', 'failed', 'cancelled')
 			ORDER BY created_at DESC
@@ -713,7 +837,8 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 	} else {
 		termRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs
 			WHERE status IN ('success', 'failed', 'cancelled')
 			ORDER BY created_at DESC
@@ -745,7 +870,8 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		case drevtypes.StatusCancelled:
 			cancelledCount++
 		}
-		if !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
+		isInterrupted := r.FailureReason == drevtypes.FailureReasonInterruptedByDaemonRestart
+		if !isInterrupted && !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
 			durationSampleCount++
 			totalDurationSec += r.FinishedAt.Sub(r.StartedAt).Seconds()
 		}
@@ -773,7 +899,8 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 	if orgID != "" {
 		failRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs
 			WHERE org_id = $1 AND status = 'failed'
 			ORDER BY created_at DESC
@@ -781,7 +908,8 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 	} else {
 		failRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
-			       commit_sha, commit_msg, branch, started_at, finished_at
+			       commit_sha, commit_msg, branch, started_at, finished_at,
+			       failure_reason, interrupted_stage
 			FROM runs
 			WHERE status = 'failed'
 			ORDER BY created_at DESC
@@ -876,11 +1004,12 @@ func (s *PostgresStore) CreateRunWithDelivery(
 	// 1. Insert run record first so dependent child foreign keys are satisfied
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
+		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting postgres run: %w", err)
@@ -909,10 +1038,11 @@ func (s *PostgresStore) CreateRunWithDelivery(
 	// 3. Insert run jobs
 	for _, job := range jobs {
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			job.ID, job.RunID, job.JobName, string(job.Status),
 			pgNullTime(job.StartedAt), pgNullTime(job.FinishedAt),
+			pgNullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting postgres run job %s: %w", job.JobName, err)

@@ -2670,3 +2670,108 @@ func TestPostgresStore_FailRunWithDelivery_TerminalRunSemantics(t *testing.T) {
 		t.Errorf("repeat FailRunWithDelivery mutated finished_at: %v != %v", failedRunAfter.FinishedAt, failedRunBefore.FinishedAt)
 	}
 }
+
+func TestPostgresStore_ResetGhostRuns_JobAndRunDiagnostics(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	orgID := createTestOrg(t, s)
+	runID := uuid.New().String()
+
+	run := &drevtypes.Run{
+		ID:           runID,
+		OrgID:        orgID,
+		PipelineName: "test-pipeline",
+		Status:       drevtypes.StatusRunning,
+		StartedAt:    time.Now().Add(-10 * time.Minute),
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	jRunID := uuid.New().String()
+	jPendID := uuid.New().String()
+	jSuccID := uuid.New().String()
+	jFailID := uuid.New().String()
+
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:        jRunID,
+			RunID:     runID,
+			JobName:   "step-running",
+			Status:    drevtypes.StatusRunning,
+			StartedAt: time.Now().Add(-5 * time.Minute),
+		},
+		{
+			ID:        jPendID,
+			RunID:     runID,
+			JobName:   "step-pending",
+			Status:    drevtypes.StatusPending,
+			StartedAt: time.Now().Add(-5 * time.Minute),
+		},
+		{
+			ID:         jSuccID,
+			RunID:      runID,
+			JobName:    "step-success",
+			Status:     drevtypes.StatusSuccess,
+			StartedAt:  time.Now().Add(-8 * time.Minute),
+			FinishedAt: time.Now().Add(-6 * time.Minute),
+		},
+		{
+			ID:            jFailID,
+			RunID:         runID,
+			JobName:       "step-failed",
+			Status:        drevtypes.StatusFailed,
+			StartedAt:     time.Now().Add(-8 * time.Minute),
+			FinishedAt:    time.Now().Add(-7 * time.Minute),
+			FailureReason: drevtypes.FailureReasonCommandFailed,
+		},
+	}
+	if err := s.CreateRunJobs(ctx, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns: %v", err)
+	}
+	if len(interrupted) != 1 || interrupted[0] != runID {
+		t.Fatalf("expected [%s], got %v", runID, interrupted)
+	}
+
+	updatedRun, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if updatedRun.Status != drevtypes.StatusFailed {
+		t.Errorf("status = %s, want failed", updatedRun.Status)
+	}
+	if updatedRun.FailureReason != drevtypes.FailureReasonInterruptedByDaemonRestart {
+		t.Errorf("failure_reason = %q, want %q", updatedRun.FailureReason, drevtypes.FailureReasonInterruptedByDaemonRestart)
+	}
+	if updatedRun.InterruptedStage != drevtypes.StageExecution {
+		t.Errorf("stage = %q, want %q", updatedRun.InterruptedStage, drevtypes.StageExecution)
+	}
+
+	jobMap := make(map[string]*drevtypes.RunJob)
+	updatedJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	for _, j := range updatedJobs {
+		jobMap[j.ID] = j
+	}
+
+	if jobMap[jRunID].Status != drevtypes.StatusFailed || jobMap[jRunID].FailureReason != drevtypes.FailureReasonInterruptedByDaemonRestart {
+		t.Errorf("running job state mismatch: status=%s, reason=%s", jobMap[jRunID].Status, jobMap[jRunID].FailureReason)
+	}
+	if jobMap[jPendID].Status != drevtypes.StatusCancelled || jobMap[jPendID].FailureReason != drevtypes.FailureReasonCancelledByDaemonRestart {
+		t.Errorf("pending job state mismatch: status=%s, reason=%s", jobMap[jPendID].Status, jobMap[jPendID].FailureReason)
+	}
+	if jobMap[jSuccID].Status != drevtypes.StatusSuccess || jobMap[jSuccID].FailureReason != "" {
+		t.Errorf("success job mutated: status=%s, reason=%s", jobMap[jSuccID].Status, jobMap[jSuccID].FailureReason)
+	}
+	if jobMap[jFailID].Status != drevtypes.StatusFailed || jobMap[jFailID].FailureReason != drevtypes.FailureReasonCommandFailed {
+		t.Errorf("failed job mutated: status=%s, reason=%s", jobMap[jFailID].Status, jobMap[jFailID].FailureReason)
+	}
+}

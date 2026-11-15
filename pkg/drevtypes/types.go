@@ -64,28 +64,102 @@ type Step struct {
 
 // Run represents a single execution instance of a pipeline.
 type Run struct {
-	ID           string    `json:"id"`
-	OrgID        string    `json:"org_id,omitempty"`
-	PipelineID   string    `json:"pipeline_id"`
-	PipelineName string    `json:"pipeline_name,omitempty"`
-	Status       RunStatus `json:"status"`
-	TriggeredBy  string    `json:"triggered_by,omitempty"`
-	CommitSHA    string    `json:"commit_sha,omitempty"`
-	CommitMsg    string    `json:"commit_msg,omitempty"`
-	Branch       string    `json:"branch,omitempty"`
-	StartedAt    time.Time `json:"started_at"`
-	FinishedAt   time.Time `json:"finished_at"`
-	Jobs         []RunJob  `json:"jobs"`
+	ID               string    `json:"id"`
+	OrgID            string    `json:"org_id,omitempty"`
+	PipelineID       string    `json:"pipeline_id"`
+	PipelineName     string    `json:"pipeline_name,omitempty"`
+	Status           RunStatus `json:"status"`
+	FailureReason    string    `json:"failure_reason,omitempty"`
+	InterruptedStage string    `json:"interrupted_stage,omitempty"`
+	TriggeredBy      string    `json:"triggered_by,omitempty"`
+	CommitSHA        string    `json:"commit_sha,omitempty"`
+	CommitMsg        string    `json:"commit_msg,omitempty"`
+	Branch           string    `json:"branch,omitempty"`
+	StartedAt        time.Time `json:"started_at"`
+	FinishedAt       time.Time `json:"finished_at"`
+	Jobs             []RunJob  `json:"jobs"`
 }
 
 // RunJob tracks the execution state of an individual job within a run.
 type RunJob struct {
-	ID         string    `json:"id"`
-	RunID      string    `json:"run_id"`
-	JobName    string    `json:"job_name"`
-	Status     RunStatus `json:"status"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
+	ID            string    `json:"id"`
+	RunID         string    `json:"run_id"`
+	JobName       string    `json:"job_name"`
+	Status        RunStatus `json:"status"`
+	FailureReason string    `json:"failure_reason,omitempty"`
+	StartedAt     time.Time `json:"started_at"`
+	FinishedAt    time.Time `json:"finished_at"`
+}
+
+// Controlled failure reasons and interruption stages for ghost-run and failure diagnostics.
+const (
+	FailureReasonInterruptedByDaemonRestart = "interrupted_by_daemon_restart"
+	FailureReasonCancelledByDaemonRestart   = "cancelled_by_daemon_restart"
+	FailureReasonPreparationFailed         = "preparation_failed"
+	FailureReasonJobFailed                 = "job_failed"
+	FailureReasonTimeout                   = "timeout"
+	FailureReasonCommandFailed             = "command_failed"
+)
+
+const (
+	StageScheduling   = "scheduling"
+	StagePreparation  = "preparation"
+	StageExecution    = "execution"
+	StageFinalization = "finalization"
+	StageUnknown      = "unknown"
+)
+
+// DeduceInterruptedStage deterministically classifies the interruption stage of a run
+// based purely on verified database invariants at the time of recovery.
+// If any state is ambiguous or inconsistent, it returns StageUnknown.
+func DeduceInterruptedStage(run *Run, jobs []*RunJob) string {
+	if run == nil {
+		return StageUnknown
+	}
+	if run.Status == StatusPending {
+		return StageScheduling
+	}
+	if run.Status != StatusRunning {
+		return StageUnknown
+	}
+	if run.StartedAt.IsZero() {
+		return StageUnknown
+	}
+	if len(jobs) == 0 {
+		return StagePreparation
+	}
+
+	var runningCount, pendingCount, terminalCount int
+	for _, j := range jobs {
+		if j == nil {
+			return StageUnknown
+		}
+		switch j.Status {
+		case StatusRunning:
+			runningCount++
+		case StatusPending:
+			pendingCount++
+		case StatusSuccess, StatusFailed, StatusCancelled, StatusSkipped:
+			terminalCount++
+		default:
+			return StageUnknown
+		}
+	}
+
+	if runningCount > 0 {
+		return StageExecution
+	}
+	if terminalCount > 0 && pendingCount > 0 {
+		return StageExecution
+	}
+	if terminalCount > 0 && pendingCount == 0 {
+		return StageFinalization
+	}
+	if pendingCount == len(jobs) {
+		return StagePreparation
+	}
+
+	return StageUnknown
 }
 
 // RunStats contains aggregated operational metrics over a recent sample of runs.

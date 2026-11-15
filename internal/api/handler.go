@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -485,6 +486,13 @@ func (sw *sseWriter) Write(p []byte) (n int, err error) {
 func (h *Handler) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
 
+	// 1. Verify existence against authoritative database before writing headers
+	run, err := h.store.GetRun(r.Context(), runID)
+	if err != nil || run == nil {
+		http.Error(w, "run not found", http.StatusNotFound)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -496,25 +504,70 @@ func (h *Handler) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				run, err := h.store.GetRun(context.Background(), runID)
-				if err != nil || (run.Status != drevtypes.StatusRunning && run.Status != drevtypes.StatusPending) {
-					cancel()
+	if run.Status == drevtypes.StatusRunning || run.Status == drevtypes.StatusPending {
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case <-ticker.C:
+					currentRun, err := h.store.GetRun(context.Background(), runID)
+					if err != nil || (currentRun.Status != drevtypes.StatusRunning && currentRun.Status != drevtypes.StatusPending) {
+						cancel()
+						return
+					}
 				}
 			}
+		}()
+		_ = h.streamer.Tail(ctx, runID, sw)
+	} else {
+		// Terminal run: stream existing file contents directly without polling
+		if rdr, err := h.streamer.Reader(runID); err == nil {
+			defer rdr.Close()
+			buf := make([]byte, 4096)
+			var lineBuf []byte
+			for {
+				n, readErr := rdr.Read(buf)
+				if n > 0 {
+					lineBuf = append(lineBuf, buf[:n]...)
+					for {
+						idx := bytes.IndexByte(lineBuf, '\n')
+						if idx == -1 {
+							break
+						}
+						sw.Write(lineBuf[:idx+1])
+						lineBuf = lineBuf[idx+1:]
+					}
+				}
+				if readErr != nil {
+					break
+				}
+			}
+			if len(lineBuf) > 0 {
+				sw.Write(lineBuf)
+			}
 		}
-	}()
+	}
 
-	err := h.streamer.Tail(ctx, runID, sw)
-	if err != nil && err != context.Canceled {
-		// Log error silently — SSE stream already active
+	// Re-check run state in case it transitioned during tailing
+	if run.Status == drevtypes.StatusRunning || run.Status == drevtypes.StatusPending {
+		if updatedRun, err := h.store.GetRun(context.Background(), runID); err == nil && updatedRun != nil {
+			run = updatedRun
+		}
+	}
+
+	if run.FailureReason == drevtypes.FailureReasonInterruptedByDaemonRestart {
+		ts := time.Now().UTC().Format(time.RFC3339)
+		if !run.FinishedAt.IsZero() {
+			ts = run.FinishedAt.Format(time.RFC3339)
+		}
+		diagnosticMsg := fmt.Sprintf(
+			"[drev] RUN INTERRUPTED: Pipeline execution was interrupted by daemon termination during stage %q. Recovered at %s.",
+			run.InterruptedStage,
+			ts,
+		)
+		fmt.Fprintf(sw, "%s\n", diagnosticMsg)
 	}
 }

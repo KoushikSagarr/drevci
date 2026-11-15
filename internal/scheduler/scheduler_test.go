@@ -2899,6 +2899,13 @@ func (w *failStatusStoreWrapper) UpdateRunStatus(ctx context.Context, id string,
 	return w.Store.UpdateRunStatus(ctx, id, status)
 }
 
+func (w *failStatusStoreWrapper) UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error {
+	if status == w.failStatus {
+		return errors.New("simulated UpdateRunStatus failure")
+	}
+	return w.Store.UpdateRunStatusWithDiagnostics(ctx, id, status, failureReason, interruptedStage)
+}
+
 func TestDynamicScheduler_StatusUpdateFailurePreservesBothErrors(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	realStore, err := store.Open(dbPath)

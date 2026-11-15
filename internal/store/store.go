@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS runs (
 	branch        TEXT,
 	started_at    DATETIME,
 	finished_at   DATETIME,
-	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	failure_reason TEXT,
+	interrupted_stage TEXT
 );
 
 CREATE TABLE IF NOT EXISTS run_jobs (
@@ -38,7 +40,8 @@ CREATE TABLE IF NOT EXISTS run_jobs (
 	job_name    TEXT NOT NULL,
 	status      TEXT NOT NULL,
 	started_at  DATETIME,
-	finished_at DATETIME
+	finished_at DATETIME,
+	failure_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at DESC);
@@ -69,11 +72,13 @@ type Store interface {
 	CreateRun(ctx context.Context, run *drevtypes.Run) error
 	GetRun(ctx context.Context, id string) (*drevtypes.Run, error)
 	UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
+	UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error
 	ListRuns(ctx context.Context, limit int) ([]*drevtypes.Run, error)
 	ListRunsByOrg(ctx context.Context, orgID string, limit int) ([]*drevtypes.Run, error)
 	CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error
 	CreateRunJobs(ctx context.Context, runID string, jobs []*drevtypes.RunJob) error
 	UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
+	UpdateRunJobStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string) error
 	ResetGhostRuns(ctx context.Context) ([]string, error)
 	GetRunJobs(ctx context.Context, runID string) ([]*drevtypes.RunJob, error)
 	GetRunStats(ctx context.Context, orgID string, sampleLimit int) (*drevtypes.RunStats, error)
@@ -137,11 +142,14 @@ var requiredRunsColumns = []columnDef{
 	{name: "started_at", definition: "DATETIME"},
 	{name: "finished_at", definition: "DATETIME"},
 	{name: "created_at", definition: "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"},
+	{name: "failure_reason", definition: "TEXT"},
+	{name: "interrupted_stage", definition: "TEXT"},
 }
 
 var requiredRunJobsColumns = []columnDef{
 	{name: "started_at", definition: "DATETIME"},
 	{name: "finished_at", definition: "DATETIME"},
+	{name: "failure_reason", definition: "TEXT"},
 }
 
 func getExistingColumns(ctx context.Context, db *sql.DB, tableName string) (map[string]bool, error) {
@@ -316,14 +324,14 @@ func (s *SQLiteStore) prepare() error {
 	var err error
 
 	s.stmtCreateRun, err = s.db.Prepare(
-		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtGetRun, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
 		 FROM runs WHERE id = ?`)
 	if err != nil {
 		return err
@@ -332,21 +340,23 @@ func (s *SQLiteStore) prepare() error {
 	s.stmtUpdateRunStatus, err = s.db.Prepare(
 		`UPDATE runs SET status = ?,
 		 started_at  = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END
+		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END,
+		 failure_reason = CASE WHEN ? != '' THEN ? ELSE failure_reason END,
+		 interrupted_stage = CASE WHEN ? != '' THEN ? ELSE interrupted_stage END
 		 WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled') OR status = ?)`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtListRuns, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
 		 FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtCreateRunJob, err = s.db.Prepare(
-		`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
@@ -354,20 +364,21 @@ func (s *SQLiteStore) prepare() error {
 	s.stmtUpdateRunJobStatus, err = s.db.Prepare(
 		`UPDATE run_jobs SET status = ?,
 		 started_at  = CASE WHEN ? = 'running' AND started_at IS NULL THEN ? ELSE started_at END,
-		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled', 'skipped') THEN ? ELSE finished_at END
+		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled', 'skipped') THEN ? ELSE finished_at END,
+		 failure_reason = CASE WHEN ? != '' THEN ? ELSE failure_reason END
 		 WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled', 'skipped') OR status = ?)`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtGetRunJobs, err = s.db.Prepare(
-		`SELECT id, run_id, job_name, status, started_at, finished_at FROM run_jobs WHERE run_id = ?`)
+		`SELECT id, run_id, job_name, status, started_at, finished_at, failure_reason FROM run_jobs WHERE run_id = ?`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtGetTerminalRuns, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
 		 FROM runs
 		 WHERE status IN ('success', 'failed', 'cancelled')
 		 ORDER BY created_at DESC, rowid DESC
@@ -377,7 +388,7 @@ func (s *SQLiteStore) prepare() error {
 	}
 
 	s.stmtGetRecentFailures, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
 		 FROM runs
 		 WHERE status = 'failed'
 		 ORDER BY created_at DESC, rowid DESC
@@ -439,11 +450,13 @@ func scanRun(row interface {
 	var status, triggeredBy string
 	var commitSHA, commitMsg, branch sql.NullString
 	var startedAt, finishedAt sql.NullString
+	var failureReason, interruptedStage sql.NullString
 
 	err := row.Scan(
 		&r.ID, &r.OrgID, &r.PipelineID, &status,
 		&triggeredBy, &commitSHA, &commitMsg, &branch,
 		&startedAt, &finishedAt,
+		&failureReason, &interruptedStage,
 	)
 	if err != nil {
 		return nil, err
@@ -455,6 +468,8 @@ func scanRun(row interface {
 	r.Branch = branch.String
 	r.StartedAt = scanTime(&startedAt)
 	r.FinishedAt = scanTime(&finishedAt)
+	r.FailureReason = failureReason.String
+	r.InterruptedStage = interruptedStage.String
 	return &r, nil
 }
 
@@ -465,6 +480,7 @@ func (s *SQLiteStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 		run.ID, run.OrgID, run.PipelineID, string(run.Status),
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
 	)
 	return err
 }
@@ -503,11 +519,12 @@ func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run
 
 	// 1. Insert parent run
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.ID, run.OrgID, run.PipelineID, string(run.Status),
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting sqlite run: %w", err)
@@ -523,10 +540,11 @@ func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run
 			status = drevtypes.StatusPending
 		}
 		_, err = tx.ExecContext(ctx, `
-			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-			VALUES (?, ?, ?, ?, ?, ?)`,
+			INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			job.ID, run.ID, job.JobName, string(status),
 			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+			nullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting sqlite run job: %w", err)
@@ -573,9 +591,15 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, er
 }
 
 func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
+	return s.UpdateRunStatusWithDiagnostics(ctx, id, status, "", "")
+}
+
+func (s *SQLiteStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.stmtUpdateRunStatus.ExecContext(ctx,
-		string(status), string(status), now, string(status), now, id, string(status))
+		string(status), string(status), now, string(status), now,
+		failureReason, failureReason, interruptedStage, interruptedStage,
+		id, string(status))
 	if err != nil {
 		return err
 	}
@@ -632,6 +656,7 @@ func (s *SQLiteStore) CreateRunJob(ctx context.Context, job *drevtypes.RunJob) e
 	_, err := s.stmtCreateRunJob.ExecContext(ctx,
 		job.ID, job.RunID, job.JobName, string(job.Status),
 		nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+		nullStr(job.FailureReason),
 	)
 	return err
 }
@@ -708,10 +733,11 @@ func (s *SQLiteStore) CreateRunJobs(ctx context.Context, runID string, jobs []*d
 		}
 
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			job.ID, runID, job.JobName, string(status),
 			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+			nullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting run job %s: %w", job.JobName, err)
@@ -725,9 +751,13 @@ func (s *SQLiteStore) CreateRunJobs(ctx context.Context, runID string, jobs []*d
 }
 
 func (s *SQLiteStore) UpdateRunJobStatus(ctx context.Context, id string, status drevtypes.RunStatus) error {
+	return s.UpdateRunJobStatusWithDiagnostics(ctx, id, status, "")
+}
+
+func (s *SQLiteStore) UpdateRunJobStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.stmtUpdateRunJobStatus.ExecContext(ctx,
-		string(status), string(status), now, string(status), now, id, string(status))
+		string(status), string(status), now, string(status), now, failureReason, failureReason, id, string(status))
 	if err != nil {
 		return err
 	}
@@ -761,21 +791,29 @@ func (s *SQLiteStore) GetRunJobs(ctx context.Context, runID string) ([]*drevtype
 		var j drevtypes.RunJob
 		var status string
 		var startedAt, finishedAt sql.NullString
+		var failureReason sql.NullString
 
-		if err := rows.Scan(&j.ID, &j.RunID, &j.JobName, &status, &startedAt, &finishedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.RunID, &j.JobName, &status, &startedAt, &finishedAt, &failureReason); err != nil {
 			return nil, err
 		}
 		j.Status = drevtypes.RunStatus(status)
 		j.StartedAt = scanTime(&startedAt)
 		j.FinishedAt = scanTime(&finishedAt)
+		j.FailureReason = failureReason.String
 		jobs = append(jobs, &j)
 	}
 	return jobs, rows.Err()
 }
 
 func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id FROM runs
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("beginning reset ghost runs transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, status, started_at FROM runs
 		WHERE status = 'running'
 		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))`)
 	if err != nil {
@@ -783,45 +821,108 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var ids []string
+	type candidate struct {
+		id        string
+		status    string
+		startedAt sql.NullString
+	}
+	var candidates []candidate
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.status, &c.startedAt); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		candidates = append(candidates, c)
 	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	if len(ids) == 0 {
+	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("beginning reset ghost runs transaction: %w", err)
-	}
-	defer tx.Rollback()
-
 	now := time.Now().UTC().Format(time.RFC3339)
-	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE runs SET status = 'failed', finished_at = ?
-			WHERE id = ?`, now, id); err != nil {
-			return nil, fmt.Errorf("updating ghost run %s: %w", id, err)
+	var ids []string
+
+	for _, c := range candidates {
+		// 1. Fetch current jobs for this run within the transaction
+		jrows, err := tx.QueryContext(ctx, `
+			SELECT id, status FROM run_jobs WHERE run_id = ?`, c.id)
+		if err != nil {
+			return nil, fmt.Errorf("querying jobs for ghost run %s: %w", c.id, err)
+		}
+		var jobs []*drevtypes.RunJob
+		for jrows.Next() {
+			var j drevtypes.RunJob
+			var jstatus string
+			if err := jrows.Scan(&j.ID, &jstatus); err != nil {
+				jrows.Close()
+				return nil, fmt.Errorf("scanning job for ghost run %s: %w", c.id, err)
+			}
+			j.Status = drevtypes.RunStatus(jstatus)
+			jobs = append(jobs, &j)
+		}
+		jrows.Close()
+		if err := jrows.Err(); err != nil {
+			return nil, fmt.Errorf("reading jobs for ghost run %s: %w", c.id, err)
 		}
 
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs SET status = 'failed', finished_at = ?
-			WHERE run_id = ? AND status IN ('running', 'pending')`, now, id); err != nil {
-			return nil, fmt.Errorf("updating ghost run jobs for %s: %w", id, err)
+		// 2. Formulate candidate Run for stage deduction
+		runObj := &drevtypes.Run{
+			ID:        c.id,
+			Status:    drevtypes.RunStatus(c.status),
+			StartedAt: scanTime(&c.startedAt),
+		}
+		stage := drevtypes.DeduceInterruptedStage(runObj, jobs)
+
+		// 3. Atomically update run status to failed with failure_reason and deduced stage
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET status = 'failed',
+			    failure_reason = 'interrupted_by_daemon_restart',
+			    interrupted_stage = ?,
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+			WHERE id = ? AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+		if err != nil {
+			return nil, fmt.Errorf("updating ghost run %s: %w", c.id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			// Another concurrent transaction already transitioned this run
+			continue
 		}
 
-		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, id); err != nil {
-			return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", id, err)
+		// 4. Mark active running jobs as failed
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'failed',
+			    failure_reason = 'interrupted_by_daemon_restart',
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+			WHERE run_id = ? AND status = 'running'`, now, c.id); err != nil {
+			return nil, fmt.Errorf("updating running ghost jobs for %s: %w", c.id, err)
 		}
+
+		// 5. Mark unstarted pending jobs as cancelled
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled_by_daemon_restart',
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+			WHERE run_id = ? AND status = 'pending'`, now, c.id); err != nil {
+			return nil, fmt.Errorf("updating pending ghost jobs for %s: %w", c.id, err)
+		}
+
+		// 6. Release webhook delivery claim
+		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, c.id); err != nil {
+			return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", c.id, err)
+		}
+
+		ids = append(ids, c.id)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -869,8 +970,10 @@ func (s *SQLiteStore) GetRunStats(ctx context.Context, _ string, sampleLimit int
 			cancelledCount++
 		}
 
-		// Valid non-negative duration check
-		if !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
+		// Valid non-negative duration check (exclude runs interrupted by daemon restart
+		// so host downtime does not skew mean duration metrics).
+		isInterrupted := r.FailureReason == drevtypes.FailureReasonInterruptedByDaemonRestart
+		if !isInterrupted && !r.StartedAt.IsZero() && !r.FinishedAt.IsZero() && (r.FinishedAt.Equal(r.StartedAt) || r.FinishedAt.After(r.StartedAt)) {
 			durationSampleCount++
 			totalDurationSec += r.FinishedAt.Sub(r.StartedAt).Seconds()
 		}
@@ -1006,11 +1109,12 @@ func (s *SQLiteStore) CreateRunWithDelivery(
 
 	// 1. Insert run record first so dependent foreign keys are satisfied
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.ID, run.OrgID, run.PipelineID, string(run.Status),
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
+		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting run: %w", err)
@@ -1032,10 +1136,11 @@ func (s *SQLiteStore) CreateRunWithDelivery(
 	// 3. Insert all associated run jobs
 	for _, job := range jobs {
 		_, err = tx.ExecContext(ctx,
-			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO run_jobs (id, run_id, job_name, status, started_at, finished_at, failure_reason)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			job.ID, job.RunID, job.JobName, string(job.Status),
 			nullTimeParam(job.StartedAt), nullTimeParam(job.FinishedAt),
+			nullStr(job.FailureReason),
 		)
 		if err != nil {
 			return fmt.Errorf("inserting run job %s: %w", job.JobName, err)
