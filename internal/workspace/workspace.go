@@ -3,6 +3,7 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,10 +12,59 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/drevci/drev/pkg/drevtypes"
+	"github.com/google/uuid"
+	"golang.org/x/sys/unix"
 )
+
+// DefaultWorkspaceDir is the canonical fallback directory for pipeline checkouts.
+const DefaultWorkspaceDir = "/tmp/drev-workspaces"
+
+// RunStore is the subset of store.Store required by workspace cleanup to confirm run state.
+type RunStore interface {
+	GetRun(ctx context.Context, id string) (*drevtypes.Run, error)
+}
+
+func isTerminalRunStatus(status drevtypes.RunStatus) bool {
+	return status == drevtypes.StatusSuccess || status == drevtypes.StatusFailed || status == drevtypes.StatusCancelled
+}
+
+// ResolveWorkspaceRoot returns the canonical, validated workspace root directory.
+func ResolveWorkspaceRoot() (string, error) {
+	raw := os.Getenv("DREV_WORKSPACE_DIR")
+	if strings.TrimSpace(raw) == "" {
+		raw = DefaultWorkspaceDir
+	}
+	clean := filepath.Clean(raw)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("workspace root must be an absolute path: %q", raw)
+	}
+	if clean == "/" || clean == "." {
+		return "", fmt.Errorf("refusing to use %q as workspace root", clean)
+	}
+
+	if err := os.MkdirAll(clean, 0700); err != nil {
+		return "", fmt.Errorf("creating workspace root: %w", err)
+	}
+
+	canonical, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return "", fmt.Errorf("evaluating symlinks for workspace root: %w", err)
+	}
+
+	fi, err := os.Lstat(canonical)
+	if err != nil {
+		return "", fmt.Errorf("inspecting workspace root: %w", err)
+	}
+	if !fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("workspace root %q must be a real directory, not a symlink", canonical)
+	}
+
+	return canonical, nil
+}
 
 var credentialURLPattern = regexp.MustCompile(`([a-zA-Z0-9+.-]+://)([^/\s]+@)`)
 
@@ -43,16 +93,105 @@ func isCommitSHA(s string) bool {
 
 // Workspace manages the lifecycle of a build directory.
 type Workspace struct {
-	Dir string
+	Dir      string
+	RunID    string
+	lockFile *os.File
+	store    RunStore
+	wsRoot   string
+}
+
+// CreateForRun initializes an isolated pipeline workspace directory with active kernel locking and metadata.
+func CreateForRun(rootDir, runID string, s RunStore) (*Workspace, error) {
+	if strings.TrimSpace(runID) == "" {
+		return nil, errors.New("runID cannot be empty")
+	}
+	cleanRunID := filepath.Clean(runID)
+	if strings.ContainsAny(cleanRunID, "/\\:\x00") || cleanRunID == "." || cleanRunID == ".." {
+		return nil, fmt.Errorf("invalid run ID %q: contains unsafe path characters", runID)
+	}
+
+	canonicalRoot := rootDir
+	if canonicalRoot == "" {
+		resolved, err := ResolveWorkspaceRoot()
+		if err != nil {
+			return nil, err
+		}
+		canonicalRoot = resolved
+	} else {
+		clean := filepath.Clean(canonicalRoot)
+		if !filepath.IsAbs(clean) {
+			return nil, fmt.Errorf("workspace root must be an absolute path: %q", canonicalRoot)
+		}
+		if err := os.MkdirAll(clean, 0700); err != nil {
+			return nil, fmt.Errorf("creating workspace root: %w", err)
+		}
+		eval, err := filepath.EvalSymlinks(clean)
+		if err != nil {
+			return nil, fmt.Errorf("evaluating symlinks for workspace root: %w", err)
+		}
+		canonicalRoot = eval
+	}
+
+	nonce := uuid.New().String()
+	nonceShort := nonce[:8]
+	dirName := fmt.Sprintf("drev-workspace-%s-%s", cleanRunID, nonceShort)
+	dirPath := filepath.Join(canonicalRoot, dirName)
+
+	if err := os.Mkdir(dirPath, 0700); err != nil {
+		return nil, fmt.Errorf("creating workspace directory: %w", err)
+	}
+
+	lockPath := filepath.Join(dirPath, ".drev_lock")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		_ = os.RemoveAll(dirPath)
+		return nil, fmt.Errorf("creating lock file: %w", err)
+	}
+
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		_ = os.RemoveAll(dirPath)
+		return nil, fmt.Errorf("acquiring workspace lock: %w", err)
+	}
+
+	meta := WorkspaceMetadata{
+		Magic:         WorkspaceMetaMagic,
+		SchemaVersion: WorkspaceMetaVersion,
+		RunID:         cleanRunID,
+		OriginalDir:   dirName,
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
+		CreatorPID:    os.Getpid(),
+	}
+	metaBytes, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		_ = os.RemoveAll(dirPath)
+		return nil, fmt.Errorf("marshaling workspace metadata: %w", err)
+	}
+
+	metaPath := filepath.Join(dirPath, ".drev_meta.json")
+	if err := os.WriteFile(metaPath, metaBytes, 0600); err != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		_ = lockFile.Close()
+		_ = os.RemoveAll(dirPath)
+		return nil, fmt.Errorf("writing workspace metadata: %w", err)
+	}
+
+	return &Workspace{
+		Dir:      dirPath,
+		RunID:    cleanRunID,
+		lockFile: lockFile,
+		store:    s,
+		wsRoot:   canonicalRoot,
+	}, nil
 }
 
 // Create initializes a new pipeline-level root workspace directory.
+// Provided for backward compatibility in standalone test environments.
 func Create() (*Workspace, error) {
-	dir, err := os.MkdirTemp("", "drev-workspace-*")
-	if err != nil {
-		return nil, fmt.Errorf("creating workspace dir: %w", err)
-	}
-	return &Workspace{Dir: dir}, nil
+	tempRunID := "test-" + uuid.New().String()
+	return CreateForRun("", tempRunID, nil)
 }
 
 // SourceDir returns the path to the central immutable source checkout directory.
@@ -378,8 +517,113 @@ func (w *Workspace) Clone(ctx context.Context, source drevtypes.Source, logWrite
 }
 
 // Cleanup removes the entire workspace tree including source and all job workspaces.
+// Workspace cleanup is strictly conditional on confirmed database terminal status.
+// If the run is not confirmed terminal (e.g. database unavailable or terminal-state update failed),
+// the workspace directory is preserved.
 func (w *Workspace) Cleanup() error {
-	return os.RemoveAll(w.Dir)
+	if w.Dir == "" {
+		return nil
+	}
+
+	// Rule 2: Workspace cleanup is conditional on confirmed database authorization
+	if w.store != nil && w.RunID != "" {
+		run, err := w.store.GetRun(context.Background(), w.RunID)
+		if err != nil || run == nil || !isTerminalRunStatus(run.Status) {
+			// Database unavailable, persistence failed, or run is still pending/running:
+			// PRESERVE WORKSPACE. Do not delete directory. Do not publish tombstone.
+			// Release flock so process can exit cleanly and on reboot ResetGhostRuns
+			// can mark it failed and startup reconciliation can safely reclaim it.
+			if w.lockFile != nil {
+				_ = syscall.Flock(int(w.lockFile.Fd()), syscall.LOCK_UN)
+				_ = w.lockFile.Close()
+				w.lockFile = nil
+			}
+			if err != nil {
+				return fmt.Errorf("cleanup aborted: database unavailable or terminal status not confirmed: %w", err)
+			}
+			if run != nil {
+				return fmt.Errorf("cleanup aborted: run %s is in non-terminal status %s", w.RunID, run.Status)
+			}
+			return fmt.Errorf("cleanup aborted: run %s not found in store", w.RunID)
+		}
+	}
+
+	// If no lockFile or wsRoot exists (e.g. legacy fallback or mock), perform basic RemoveAll
+	if w.lockFile == nil || w.wsRoot == "" {
+		return os.RemoveAll(w.Dir)
+	}
+
+	origName := filepath.Base(w.Dir)
+	if !strings.HasPrefix(origName, "drev-workspace-") {
+		return os.RemoveAll(w.Dir)
+	}
+	targetName := strings.Replace(origName, "drev-workspace-", "drev-deleting-", 1)
+
+	// Open workspace root directory descriptor
+	rootFd, err := unix.Open(w.wsRoot, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("opening workspace root descriptor: %w", err)
+	}
+	defer unix.Close(rootFd)
+
+	// Step 1: Publish tombstone BEFORE renaming directory
+	tombstoneID := uuid.New().String()
+	ts := Tombstone{
+		Magic:          TombstoneMagic,
+		SchemaVersion:  TombstoneVersion,
+		TombstoneID:    tombstoneID,
+		RunID:          w.RunID,
+		OriginalDir:    origName,
+		TargetDir:      targetName,
+		DeletionIntent: DeletionIntentCleanup,
+		CreatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		CreatorPID:     os.Getpid(),
+	}
+
+	tombF, err := PublishTombstone(w.wsRoot, ts)
+	if err != nil {
+		return fmt.Errorf("publishing deletion tombstone: %w", err)
+	}
+	defer func() {
+		if tombF != nil {
+			_ = syscall.Flock(int(tombF.Fd()), syscall.LOCK_UN)
+			_ = tombF.Close()
+		}
+	}()
+
+	// Step 2: Atomic no-replace transition: drev-workspace-* -> drev-deleting-*
+	if err := renameNoReplaceAt(rootFd, origName, rootFd, targetName); err != nil {
+		// Failed to rename (e.g. target already existed); preserve tombstone and original directory
+		return fmt.Errorf("atomic rename to deleting namespace failed: %w", err)
+	}
+	_ = unix.Fsync(rootFd)
+
+	// Update w.Dir to target path
+	w.Dir = filepath.Join(w.wsRoot, targetName)
+
+	// Close workspace lock descriptor now that directory is renamed and tombstone lock is held
+	_ = syscall.Flock(int(w.lockFile.Fd()), syscall.LOCK_UN)
+	_ = w.lockFile.Close()
+	w.lockFile = nil
+
+	// Step 3: Descriptor-relative recursive purge anchored to rootFd
+	if err := removeDirectoryUnderRoot(rootFd, targetName); err != nil {
+		// Purge failed partially: tombstone remains intact for startup recovery!
+		return fmt.Errorf("descriptor-relative purge of %s: %w", targetName, err)
+	}
+	_ = unix.Fsync(rootFd)
+
+	// Step 4: Unlink tombstone file upon confirmed directory removal
+	tombstoneDir := filepath.Join(w.wsRoot, ".tombstones")
+	tombDirFd, err := unix.Open(tombstoneDir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	if err == nil {
+		_ = unix.Unlinkat(tombDirFd, tombstoneID+".tombstone", 0)
+		_ = unix.Fsync(tombDirFd)
+		_ = unix.Close(tombDirFd)
+	}
+
+	w.Dir = ""
+	return nil
 }
 
 // CopyDir recursively copies a directory tree from src to dst.

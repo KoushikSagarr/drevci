@@ -15,6 +15,7 @@ import (
 
 	"github.com/drevci/drev/internal/api"
 	"github.com/drevci/drev/internal/auth"
+	"github.com/drevci/drev/internal/instance"
 	"github.com/drevci/drev/internal/notify"
 	"github.com/drevci/drev/internal/parser"
 	"github.com/drevci/drev/internal/pool"
@@ -24,6 +25,7 @@ import (
 	"github.com/drevci/drev/internal/store"
 	"github.com/drevci/drev/internal/streamer"
 	"github.com/drevci/drev/internal/webhook"
+	"github.com/drevci/drev/internal/workspace"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
@@ -34,6 +36,7 @@ func main() {
 	var port int
 	var dbPath string
 	var logDir string
+	var workspaceDir string
 	var token string
 	var host string
 	var webhookSecret string
@@ -109,6 +112,20 @@ func main() {
 				log.Fatalf("failed to create log dir: %v", err)
 			}
 
+			// Configure workspace root and acquire local workspace instance lock
+			if workspaceDir != "" {
+				os.Setenv("DREV_WORKSPACE_DIR", workspaceDir)
+			}
+			wsRoot, err := workspace.ResolveWorkspaceRoot()
+			if err != nil {
+				log.Fatalf("failed to resolve workspace directory: %v", err)
+			}
+			wsLock, err := instance.AcquireLocalWorkspaceLock(wsRoot)
+			if err != nil {
+				log.Fatalf("failed to acquire workspace instance lock: %v", err)
+			}
+			defer wsLock.Close()
+
 			// Resolve database type and URL from flags/env
 			if dbType == "" {
 				dbType = os.Getenv("DREV_DB_TYPE")
@@ -121,6 +138,8 @@ func main() {
 			}
 
 			var s store.Store
+			var leaseKeeper *instance.PostgresLeaseKeeper
+
 			switch dbType {
 			case "postgres":
 				if dbURL == "" {
@@ -131,9 +150,27 @@ func main() {
 					log.Fatalf("failed to open postgres store: %v", err)
 				}
 				defer pg.Close()
+
+				leaseCtx, leaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				keeper, err := instance.AcquirePostgresLease(leaseCtx, pg.DB())
+				leaseCancel()
+				if err != nil {
+					log.Fatalf("failed to acquire postgres deployment advisory lock: %v", err)
+				}
+				leaseKeeper = keeper
+				defer func() {
+					_ = leaseKeeper.Release(context.Background())
+				}()
+
 				s = pg
 				fmt.Println("Database: PostgreSQL (Supabase)")
 			default:
+				dbLock, err := instance.AcquireSQLiteInstanceLock(dbPath)
+				if err != nil {
+					log.Fatalf("failed to acquire sqlite instance lock: %v", err)
+				}
+				defer dbLock.Close()
+
 				sg, err := store.Open(dbPath)
 				if err != nil {
 					log.Fatalf("failed to open sqlite store: %v", err)
@@ -176,7 +213,13 @@ func main() {
 				cli.Close()
 			}
 
-			sched := scheduler.New(r, s)
+			// 4. Safely reconcile leftover/orphaned Drev CI filesystem workspaces
+			wsRecCtx, wsRecCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			wsSummary, wsRecErr := workspace.ReconcileOrphans(wsRecCtx, wsRoot, s, interruptedRunIDs)
+			wsRecCancel()
+			workspace.LogReconciliationSummary(log.Printf, wsSummary, wsRecErr)
+
+			sched := scheduler.New(r, s, scheduler.WithWorkspaceDir(wsRoot))
 			p := parser.NewParser()
 			stream := streamer.New(logDir)
 
@@ -254,9 +297,18 @@ func main() {
 
 			stop := make(chan os.Signal, 1)
 			signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-			<-stop
 
-			fmt.Println("\nShutting down gracefully...")
+			var failStopCh <-chan error
+			if leaseKeeper != nil {
+				failStopCh = leaseKeeper.FailStopChannel()
+			}
+
+			select {
+			case sig := <-stop:
+				fmt.Printf("\nReceived signal %v, shutting down gracefully...\n", sig)
+			case err := <-failStopCh:
+				log.Printf("FATAL: PostgreSQL advisory lease lost: %v. Initiating fail-stop to prevent split-brain execution.", err)
+			}
 
 			// 1. First drain/stop HTTP server so no new incoming requests or webhook jobs can be enqueued.
 			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -274,6 +326,7 @@ func main() {
 	rootCmd.Flags().IntVar(&port, "port", 9090, "HTTP port")
 	rootCmd.Flags().StringVar(&dbPath, "db", "./drev.db", "SQLite DB path")
 	rootCmd.Flags().StringVar(&logDir, "log-dir", "./logs", "log file directory")
+	rootCmd.Flags().StringVar(&workspaceDir, "workspace-dir", "", "workspace root directory (or DREV_WORKSPACE_DIR env)")
 	rootCmd.Flags().StringVar(&token, "token", "", "API token (or DREV_TOKEN env var)")
 	rootCmd.Flags().StringVar(&host, "host", "0.0.0.0", "bind host")
 	rootCmd.Flags().StringVar(&webhookSecret, "webhook-secret", "", "HMAC secret for GitHub (or DREV_WEBHOOK_SECRET env)")

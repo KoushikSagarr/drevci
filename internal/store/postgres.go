@@ -133,6 +133,11 @@ func OpenPostgres(connString string) (*PostgresStore, error) {
 	return &PostgresStore{db: db}, nil
 }
 
+// DB returns the underlying *sql.DB connection pool.
+func (s *PostgresStore) DB() *sql.DB {
+	return s.db
+}
+
 // Close closes the underlying database connection pool.
 func (s *PostgresStore) Close() error {
 	return s.db.Close()

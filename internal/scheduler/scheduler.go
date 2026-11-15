@@ -42,11 +42,19 @@ func WithHostFallback(p *drevtypes.Pipeline) Option {
 	}
 }
 
+// WithWorkspaceDir configures the workspace root directory for pipeline checkouts.
+func WithWorkspaceDir(dir string) Option {
+	return func(s *Scheduler) {
+		s.workspaceDir = dir
+	}
+}
+
 // Scheduler coordinates pipeline and job execution across worker workspaces.
 type Scheduler struct {
 	runner       JobRunner
 	store        store.Store
 	hostFallback *drevtypes.Pipeline
+	workspaceDir string
 }
 
 // New creates a new Scheduler with optional configuration options.
@@ -302,7 +310,7 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 			errors.New("invalid pipeline: inconsistent job and source configuration"), run)
 	}
 
-	w, err := workspace.Create()
+	w, err := workspace.CreateForRun(s.workspaceDir, runID, s.store)
 	if err != nil {
 		return s.finalizePreparationFailure(ctx, runID, logWriter, "workspace creation", err, run)
 	}
