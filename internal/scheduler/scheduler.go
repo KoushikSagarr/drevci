@@ -152,9 +152,18 @@ func (s *Scheduler) finalizePreparationFailure(
 	reason := drevtypes.FailureReasonPreparationFailed
 	if isCancelled {
 		reason = string(drevtypes.StatusCancelled)
+		if existingJobs, err := s.store.GetRunJobs(context.Background(), runID); err == nil {
+			for _, rj := range existingJobs {
+				if !isTerminalRunStatus(rj.Status) {
+					_ = s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled))
+				}
+			}
+		}
 	}
 	if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, targetStatus, reason, drevtypes.StagePreparation); updateErr != nil {
-		return errors.Join(prepErr, fmt.Errorf("updating run status to %s: %w", targetStatus, updateErr))
+		if !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+			return errors.Join(prepErr, fmt.Errorf("updating run status to %s: %w", targetStatus, updateErr))
+		}
 	}
 
 	return prepErr
@@ -268,6 +277,11 @@ func buildAndValidateDAG(jobs []drevtypes.Job, pipelineEnv map[string]string) ([
 }
 
 func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipeline, runID string, logWriter io.Writer) error {
+	// Pre-start cancellation check: if context is already cancelled, abort before touching store or workspace
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline execution", ctx.Err(), nil)
+	}
+
 	run, err := s.store.GetRun(ctx, runID)
 	if err != nil {
 		return s.finalizePreparationFailure(ctx, runID, logWriter, "loading run from database", err, nil)
@@ -284,9 +298,17 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 	}
 	run.Status = drevtypes.StatusRunning
 
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline execution", ctx.Err(), run)
+	}
+
 	existingJobs, err := s.store.GetRunJobs(ctx, runID)
 	if err != nil {
 		return s.finalizePreparationFailure(ctx, runID, logWriter, "loading run jobs from database", err, run)
+	}
+
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline execution", ctx.Err(), run)
 	}
 
 	hasRepoURL := strings.TrimSpace(pipeline.Source.URL) != ""
@@ -314,6 +336,10 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 			errors.New("invalid pipeline: inconsistent job and source configuration"), run)
 	}
 
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "workspace creation", ctx.Err(), run)
+	}
+
 	w, err := workspace.CreateForRun(s.workspaceDir, runID, s.store)
 	if err != nil {
 		return s.finalizePreparationFailure(ctx, runID, logWriter, "workspace creation", err, run)
@@ -322,9 +348,16 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 
 	needsClone := mode == modeBootstrap || mode == modeUnregisteredRepo || (mode == modePreRegisteredLegacy && hasRepoURL)
 	if needsClone {
+		if ctx.Err() != nil {
+			return s.finalizePreparationFailure(ctx, runID, logWriter, "repository clone", ctx.Err(), run)
+		}
 		if err := w.Clone(ctx, pipeline.Source, logWriter); err != nil {
 			return s.finalizePreparationFailure(ctx, runID, logWriter, "repository clone", err, run)
 		}
+	}
+
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "resolving repository configuration", ctx.Err(), run)
 	}
 
 	var activePipeline *drevtypes.Pipeline
@@ -359,6 +392,10 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline DAG validation", err, run)
 	}
 
+	if ctx.Err() != nil {
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline execution", ctx.Err(), run)
+	}
+
 	var runJobMap map[string]*drevtypes.RunJob
 	if mode == modePreRegisteredLegacy || (mode == modeInMemoryDirect && hasExistingJobs) {
 		correspMap, err := validateJobRecordsCorrespondence(activePipeline.Jobs, existingJobs)
@@ -378,6 +415,10 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 			newRunJobs = append(newRunJobs, rj)
 		}
 
+		if ctx.Err() != nil {
+			return s.finalizePreparationFailure(ctx, runID, logWriter, "registering run jobs", ctx.Err(), run)
+		}
+
 		if err := s.store.CreateRunJobs(ctx, runID, newRunJobs); err != nil {
 			return s.finalizePreparationFailure(ctx, runID, logWriter, "registering run jobs", err, run)
 		}
@@ -386,6 +427,16 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 		for _, rj := range newRunJobs {
 			runJobMap[rj.JobName] = rj
 		}
+	}
+
+	// Final pre-DAG check: if cancelled before goroutines spawn, mark jobs cancelled and finalize
+	if ctx.Err() != nil {
+		if s.store != nil {
+			for _, rj := range runJobMap {
+				_ = s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled))
+			}
+		}
+		return s.finalizePreparationFailure(ctx, runID, logWriter, "pipeline execution", ctx.Err(), run)
 	}
 
 	// ── Shared Job Execution Machinery ──────────────────────────────────────────
@@ -412,6 +463,21 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				jobStatuses[jobName] = drevtypes.StatusFailed
 				mu.Unlock()
 				return fmt.Errorf("run job not found for %s", jobName)
+			}
+
+			// Pre-start cancellation check before waiting or acquiring resources
+			if ctx.Err() != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusCancelled
+				mu.Unlock()
+				if s.store != nil {
+					if updateErr := s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled)); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+						if logWriter != nil {
+							fmt.Fprintf(logWriter, "[drev] failed to update job %s status to cancelled: %v\n", jobName, updateErr)
+						}
+					}
+				}
+				return ctx.Err()
 			}
 
 			if len(job.DependsOn) > 0 {
@@ -447,11 +513,17 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 						mu.Lock()
 						jobStatuses[jobName] = drevtypes.StatusCancelled
 						mu.Unlock()
-						s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusCancelled)
+						if s.store != nil {
+							if updateErr := s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled)); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+								if logWriter != nil {
+									fmt.Fprintf(logWriter, "[drev] failed to update job %s status to cancelled: %v\n", jobName, updateErr)
+								}
+							}
+						}
 						return ctx.Err()
 					}
 
-					// If any dependency failed or was skipped, this job cannot execute.
+					// If any dependency failed, was skipped, or was cancelled, this job cannot execute.
 					// We can skip immediately without waiting for remaining dependencies.
 					if failedDep != "" {
 						break
@@ -459,18 +531,52 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				}
 
 				if failedDep != "" {
-					fmt.Fprintf(logWriter, "[drev] job %q skipped because dependency %q was %s\n", job.Name, failedDep, failedDepStatus)
-					if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSkipped); err != nil {
-						mu.Lock()
-						jobStatuses[jobName] = drevtypes.StatusFailed
-						mu.Unlock()
-						return fmt.Errorf("updating job status to skipped for %s: %w", job.Name, err)
+					targetJobStatus := drevtypes.StatusSkipped
+					targetReason := ""
+					if failedDepStatus == drevtypes.StatusCancelled {
+						targetJobStatus = drevtypes.StatusCancelled
+						targetReason = string(drevtypes.StatusCancelled)
+						fmt.Fprintf(logWriter, "[drev] job %q cancelled because dependency %q was cancelled\n", job.Name, failedDep)
+					} else {
+						fmt.Fprintf(logWriter, "[drev] job %q skipped because dependency %q was %s\n", job.Name, failedDep, failedDepStatus)
+					}
+					if s.store != nil {
+						var updateErr error
+						if targetReason != "" {
+							updateErr = s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, targetJobStatus, targetReason)
+						} else {
+							updateErr = s.store.UpdateRunJobStatus(context.Background(), rj.ID, targetJobStatus)
+						}
+						if updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+							mu.Lock()
+							jobStatuses[jobName] = drevtypes.StatusFailed
+							mu.Unlock()
+							return fmt.Errorf("updating job status to %s for %s: %w", targetJobStatus, job.Name, updateErr)
+						}
 					}
 					mu.Lock()
-					jobStatuses[jobName] = drevtypes.StatusSkipped
+					jobStatuses[jobName] = targetJobStatus
 					mu.Unlock()
+					if targetJobStatus == drevtypes.StatusCancelled {
+						return context.Canceled
+					}
 					return nil
 				}
+			}
+
+			// Pre-start cancellation check right before workspace creation
+			if ctx.Err() != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusCancelled
+				mu.Unlock()
+				if s.store != nil {
+					if updateErr := s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled)); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+						if logWriter != nil {
+							fmt.Fprintf(logWriter, "[drev] failed to update job %s status to cancelled: %v\n", jobName, updateErr)
+						}
+					}
+				}
+				return ctx.Err()
 			}
 
 			// Single-Parent Snapshot Inheritance (Contract Rule 3, 4, 5):
@@ -486,8 +592,25 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				mu.Lock()
 				jobStatuses[jobName] = drevtypes.StatusFailed
 				mu.Unlock()
-				s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+				if s.store != nil {
+					_ = s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+				}
 				return fmt.Errorf("creating workspace for job %s: %w", job.Name, err)
+			}
+
+			// Pre-start cancellation check right before running
+			if ctx.Err() != nil {
+				mu.Lock()
+				jobStatuses[jobName] = drevtypes.StatusCancelled
+				mu.Unlock()
+				if s.store != nil {
+					if updateErr := s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled)); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+						if logWriter != nil {
+							fmt.Fprintf(logWriter, "[drev] failed to update job %s status to cancelled: %v\n", jobName, updateErr)
+						}
+					}
+				}
+				return ctx.Err()
 			}
 
 			// Determine execution context, enforcing per-job timeout if configured
@@ -499,7 +622,9 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 					jobStatuses[jobName] = drevtypes.StatusFailed
 					fmt.Fprintf(logWriter, "[drev] invalid timeout %q for job %q\n", job.Timeout, job.Name)
 					mu.Unlock()
-					s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+					if s.store != nil {
+						_ = s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusFailed)
+					}
 					return fmt.Errorf("invalid timeout %q for job %q", job.Timeout, job.Name)
 				}
 				var jobCancel context.CancelFunc
@@ -507,11 +632,13 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 				defer jobCancel()
 			}
 
-			if err := s.store.UpdateRunJobStatus(ctx, rj.ID, drevtypes.StatusRunning); err != nil {
-				mu.Lock()
-				jobStatuses[jobName] = drevtypes.StatusFailed
-				mu.Unlock()
-				return fmt.Errorf("updating job status to running for %s: %w", job.Name, err)
+			if s.store != nil {
+				if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusRunning); err != nil {
+					mu.Lock()
+					jobStatuses[jobName] = drevtypes.StatusFailed
+					mu.Unlock()
+					return fmt.Errorf("updating job status to running for %s: %w", job.Name, err)
+				}
 			}
 
 			err = s.runner.RunJob(jobCtx, run, &job, jobWorkspace, logWriter)
@@ -519,7 +646,7 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 			mu.Lock()
 			if err != nil {
 				targetStatus := drevtypes.StatusFailed
-				if ctx.Err() == context.Canceled && (errors.Is(err, context.Canceled) || jobCtx.Err() == context.Canceled) {
+				if (ctx.Err() != nil || jobCtx.Err() == context.Canceled) && (errors.Is(err, context.Canceled) || jobCtx.Err() == context.Canceled || ctx.Err() == context.Canceled) {
 					targetStatus = drevtypes.StatusCancelled
 				}
 				jobStatuses[jobName] = targetStatus
@@ -542,16 +669,24 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 					jobReason = string(drevtypes.StatusCancelled)
 				}
 				mu.Unlock()
-				s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, targetStatus, jobReason)
+				if s.store != nil {
+					if updateErr := s.store.UpdateRunJobStatusWithDiagnostics(context.Background(), rj.ID, targetStatus, jobReason); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+						if logWriter != nil {
+							fmt.Fprintf(logWriter, "[drev] failed to update job %s status to %s: %v\n", jobName, targetStatus, updateErr)
+						}
+					}
+				}
 				return err
 			}
 			mu.Unlock()
 
-			if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSuccess); err != nil {
-				mu.Lock()
-				jobStatuses[jobName] = drevtypes.StatusFailed
-				mu.Unlock()
-				return fmt.Errorf("updating job status to success for %s: %w", job.Name, err)
+			if s.store != nil {
+				if err := s.store.UpdateRunJobStatus(context.Background(), rj.ID, drevtypes.StatusSuccess); err != nil {
+					mu.Lock()
+					jobStatuses[jobName] = drevtypes.StatusFailed
+					mu.Unlock()
+					return fmt.Errorf("updating job status to success for %s: %w", job.Name, err)
+				}
 			}
 
 			mu.Lock()
@@ -577,31 +712,82 @@ func (s *Scheduler) RunPipeline(ctx context.Context, pipeline *drevtypes.Pipelin
 	}
 	mu.Unlock()
 
-	if ctx.Err() == context.Canceled || hasCancelled {
+	if ctx.Err() != nil || hasCancelled {
 		if hasFailure {
-			s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
+			if s.store != nil {
+				if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+					if logWriter != nil {
+						fmt.Fprintf(logWriter, "[drev] failed to update run status to failed: %v\n", updateErr)
+					}
+					return fmt.Errorf("finalizing failed run: %w", updateErr)
+				}
+			}
 			if waitErr != nil {
 				return waitErr
 			}
 			return fmt.Errorf("pipeline run failed with errors before cancellation")
 		}
-		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled), drevtypes.StageExecution)
-		if waitErr != nil {
+		if s.store != nil {
+			if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled), drevtypes.StageExecution); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "[drev] failed to update run status to cancelled: %v\n", updateErr)
+				}
+				return fmt.Errorf("finalizing cancelled run: %w", updateErr)
+			}
+		}
+		if waitErr != nil && !errors.Is(waitErr, context.Canceled) {
 			return waitErr
 		}
-		return ctx.Err()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return context.Canceled
 	}
 
 	if waitErr != nil {
-		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
+		if s.store != nil {
+			if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "[drev] failed to update run status to failed: %v\n", updateErr)
+				}
+				return fmt.Errorf("finalizing failed run: %w", updateErr)
+			}
+		}
 		return waitErr
 	}
 
 	if hasFailure || hasSkip {
-		s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution)
+		if s.store != nil {
+			if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "[drev] failed to update run status to failed: %v\n", updateErr)
+				}
+				return fmt.Errorf("finalizing failed run: %w", updateErr)
+			}
+		}
 		return fmt.Errorf("pipeline run completed with failed or skipped jobs")
 	}
 
-	s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusSuccess)
+	if s.store != nil {
+		err := s.store.UpdateRunStatus(context.Background(), runID, drevtypes.StatusSuccess)
+		if err != nil {
+			if errors.Is(err, store.ErrCancellationRequested) {
+				if updateErr := s.store.UpdateRunStatusWithDiagnostics(context.Background(), runID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled), drevtypes.StageExecution); updateErr != nil && !errors.Is(updateErr, store.ErrRunAlreadyTerminal) {
+					if logWriter != nil {
+						fmt.Fprintf(logWriter, "[drev] failed to finalize cancelled run after conflict: %v\n", updateErr)
+					}
+					return fmt.Errorf("finalizing cancelled run after cancellation conflict: %w", updateErr)
+				}
+				if logWriter != nil {
+					fmt.Fprintf(logWriter, "[drev] pipeline run cancelled: cancellation requested before finalization\n")
+				}
+				return context.Canceled
+			}
+			if logWriter != nil {
+				fmt.Fprintf(logWriter, "[drev] failed to update run status to success: %v\n", err)
+			}
+			return fmt.Errorf("updating run status to success: %w", err)
+		}
+	}
 	return nil
 }
