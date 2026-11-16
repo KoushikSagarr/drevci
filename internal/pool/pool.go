@@ -21,18 +21,34 @@ type Pool struct {
 	scheduler *scheduler.Scheduler
 	store     store.Store
 	notifier  *notify.Notifier
+	registry  *ExecutionRegistry
 	wg        sync.WaitGroup
 }
 
-// New creates a new Pool.
+// New creates a new Pool with a default ExecutionRegistry.
 func New(workers int, q *queue.Queue, sched *scheduler.Scheduler, s store.Store, notif *notify.Notifier) *Pool {
+	return NewWithRegistry(workers, q, sched, s, notif, NewExecutionRegistry())
+}
+
+// NewWithRegistry creates a new Pool with an explicitly provided ExecutionRegistry.
+// If reg is nil, a default ExecutionRegistry is created.
+func NewWithRegistry(workers int, q *queue.Queue, sched *scheduler.Scheduler, s store.Store, notif *notify.Notifier, reg *ExecutionRegistry) *Pool {
+	if reg == nil {
+		reg = NewExecutionRegistry()
+	}
 	return &Pool{
 		workers:   workers,
 		queue:     q,
 		scheduler: sched,
 		store:     s,
 		notifier:  notif,
+		registry:  reg,
 	}
+}
+
+// Registry returns the ExecutionRegistry associated with the pool.
+func (p *Pool) Registry() *ExecutionRegistry {
+	return p.registry
 }
 
 // Start spawns `workers` goroutines that each pull jobs from the queue.
@@ -71,6 +87,8 @@ func (p *Pool) processJob(ctx context.Context, job *queue.Job) {
 
 	// Atomic durable execution claim: verify run is pending, set status to running,
 	// record started_at, and delete its outbox entry before any pipeline side effects occur.
+	// Must use the uncancelled daemon/worker context so early cancellation cannot prevent
+	// the database claim from recording or observing the run's execution state correctly.
 	if p.store != nil {
 		if err := p.store.ClaimRunForExecution(ctx, job.RunID); err != nil {
 			log.Printf("[pool] worker failed to claim run %s for execution: %v", job.RunID, err)
@@ -81,11 +99,33 @@ func (p *Pool) processJob(ctx context.Context, job *queue.Job) {
 		}
 	}
 
-	runErr := p.scheduler.RunPipeline(ctx, job.Pipeline, job.RunID, job.LogWriter)
-	if runErr != nil {
-		log.Printf("[pool] run %s finished with error: %v", job.RunID, runErr)
-	} else {
-		log.Printf("[pool] run %s succeeded", job.RunID)
+	// Create run-scoped cancellation context derived from the daemon/worker lifecycle context.
+	runCtx, runCancel := context.WithCancelCause(ctx)
+	defer runCancel(nil)
+
+	if p.registry != nil {
+		alreadyCancelled, err := p.registry.Register(job.RunID, runCancel)
+		if err != nil {
+			log.Printf("[pool] worker failed to register run %s in execution registry: %v", job.RunID, err)
+			if job.LogWriter != nil {
+				fmt.Fprintf(job.LogWriter, "[drev] run %s registration error: %v\n", job.RunID, err)
+			}
+			return
+		}
+		defer p.registry.Unregister(job.RunID)
+
+		if alreadyCancelled {
+			log.Printf("[pool] run %s had pending cancellation at registration", job.RunID)
+		}
+	}
+
+	if p.scheduler != nil {
+		runErr := p.scheduler.RunPipeline(runCtx, job.Pipeline, job.RunID, job.LogWriter)
+		if runErr != nil {
+			log.Printf("[pool] run %s finished with error: %v", job.RunID, runErr)
+		} else {
+			log.Printf("[pool] run %s succeeded", job.RunID)
+		}
 	}
 
 	if p.store == nil {
