@@ -69,6 +69,9 @@ func TestOpen_FreshDatabase(t *testing.T) {
 	}
 
 	// 4. Update status
+	if err := s.UpdateRunStatus(ctx, run.ID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running) error = %v", err)
+	}
 	if err := s.UpdateRunStatus(ctx, run.ID, drevtypes.StatusSuccess); err != nil {
 		t.Fatalf("UpdateRunStatus() error = %v", err)
 	}
@@ -2543,6 +2546,9 @@ func TestStore_CreateRunWithLimit_TerminalRunsFreeCapacity(t *testing.T) {
 	}
 
 	// Mark run-term-1 as Success (terminal)
+	if err := s.UpdateRunStatus(ctx, "run-term-1", drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running): %v", err)
+	}
 	if err := s.UpdateRunStatus(ctx, "run-term-1", drevtypes.StatusSuccess); err != nil {
 		t.Fatalf("UpdateRunStatus: %v", err)
 	}
@@ -3333,6 +3339,9 @@ func TestStore_FailRunWithDelivery_TerminalRunSemantics(t *testing.T) {
 	}
 	if err := s.CreateRunWithLimit(ctx, runSuccess, nil, 5, ""); err != nil {
 		t.Fatalf("CreateRunWithLimit: %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runSuccess.ID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running): %v", err)
 	}
 	if err := s.UpdateRunStatus(ctx, runSuccess.ID, drevtypes.StatusSuccess); err != nil {
 		t.Fatalf("UpdateRunStatus: %v", err)

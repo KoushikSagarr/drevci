@@ -1038,6 +1038,9 @@ jobs:
 	}
 
 	// 3. Mark run 1 as Success -> frees active capacity
+	if err := s.UpdateRunStatus(ctx, run1ID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("updating run 1 to running: %v", err)
+	}
 	if err := s.UpdateRunStatus(ctx, run1ID, drevtypes.StatusSuccess); err != nil {
 		t.Fatalf("updating run 1 to success: %v", err)
 	}

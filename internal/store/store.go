@@ -70,6 +70,9 @@ var ErrJobAlreadyTerminal = errors.New("job is in a terminal state")
 // ErrRunNotFound indicates that a requested run does not exist or does not belong to the tenant.
 var ErrRunNotFound = errors.New("run not found")
 
+// ErrCancellationRequested indicates that a run cannot transition to success because cancellation was requested.
+var ErrCancellationRequested = errors.New("cancellation requested for run")
+
 // CancelResult describes the outcome of a CancelRun operation.
 type CancelResult struct {
 	Run            *drevtypes.Run       `json:"run"`
@@ -358,7 +361,15 @@ func (s *SQLiteStore) prepare() error {
 		 finished_at = CASE WHEN finished_at IS NULL AND ? IN ('success', 'failed', 'cancelled') THEN ? ELSE finished_at END,
 		 failure_reason = CASE WHEN ? != '' THEN ? ELSE failure_reason END,
 		 interrupted_stage = CASE WHEN ? != '' THEN ? ELSE interrupted_stage END
-		 WHERE id = ? AND (status NOT IN ('success', 'failed', 'cancelled') OR status = ?)`)
+		 WHERE id = ?
+		   AND (
+		     (? != 'success' AND (status NOT IN ('success', 'failed', 'cancelled') OR status = ?))
+		     OR
+		     (? = 'success' AND (
+		       (status = 'running' AND cancellation_requested_at IS NULL)
+		       OR status = 'success'
+		     ))
+		   )`)
 	if err != nil {
 		return err
 	}
@@ -644,12 +655,18 @@ func (s *SQLiteStore) UpdateRunStatus(ctx context.Context, id string, status dre
 	return s.UpdateRunStatusWithDiagnostics(ctx, id, status, "", "")
 }
 
+func isTerminalRunStatus(status drevtypes.RunStatus) bool {
+	return status == drevtypes.StatusSuccess ||
+		status == drevtypes.StatusFailed ||
+		status == drevtypes.StatusCancelled
+}
+
 func (s *SQLiteStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	res, err := s.stmtUpdateRunStatus.ExecContext(ctx,
 		string(status), string(status), now, string(status), now,
 		failureReason, failureReason, interruptedStage, interruptedStage,
-		id, string(status))
+		id, string(status), string(status), string(status))
 	if err != nil {
 		return err
 	}
@@ -659,12 +676,16 @@ func (s *SQLiteStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id str
 	}
 	if n == 0 {
 		var currentStatus string
-		err := s.db.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, id).Scan(&currentStatus)
+		var cancelReq sql.NullString
+		err := s.db.QueryRowContext(ctx, `SELECT status, cancellation_requested_at FROM runs WHERE id = ?`, id).Scan(&currentStatus, &cancelReq)
 		if errors.Is(err, sql.ErrNoRows) {
 			return sql.ErrNoRows
 		}
 		if err != nil {
 			return fmt.Errorf("checking run status for %s: %w", id, err)
+		}
+		if status == drevtypes.StatusSuccess && currentStatus == string(drevtypes.StatusRunning) && cancelReq.Valid && cancelReq.String != "" {
+			return fmt.Errorf("%w: cannot transition run %s to %s with active cancellation intent", ErrCancellationRequested, id, status)
 		}
 		return fmt.Errorf("%w: cannot transition run %s from %s to %s", ErrRunAlreadyTerminal, id, currentStatus, status)
 	}

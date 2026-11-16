@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -542,6 +543,9 @@ func TestCancelRun_TerminalRun_ReturnsErrRunAlreadyTerminal(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("CreateRun() error = %v", err)
 		}
+		if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+			t.Fatalf("UpdateRunStatus(running) error = %v", err)
+		}
 		if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess); err != nil {
 			t.Fatalf("UpdateRunStatus() error = %v", err)
 		}
@@ -1000,4 +1004,407 @@ func TestCancelRun_TransactionRollback_LeavesNoPartialState(t *testing.T) {
 			t.Fatalf("expected error on pre-canceled context, got res=%+v", res)
 		}
 	})
+}
+
+// ─── Step 5.1: Store-Level Cancellation vs Success Linearization Tests ───────
+
+func TestUpdateRunStatus_PendingCannotBecomeSuccess(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "pending_success_rejected.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	runID := "run-pending-success"
+	if err := s.CreateRun(ctx, &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+
+	// Directly transitioning from pending to success must be rejected
+	err = s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess)
+	if err == nil {
+		t.Fatal("expected error transitioning pending -> success, got nil")
+	}
+	if errors.Is(err, store.ErrCancellationRequested) {
+		t.Errorf("rejected pending run must not be classified as ErrCancellationRequested")
+	}
+	if !errors.Is(err, store.ErrRunAlreadyTerminal) {
+		t.Errorf("expected ErrRunAlreadyTerminal, got: %v", err)
+	}
+
+	// Status must remain pending
+	persisted, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if persisted.Status != drevtypes.StatusPending {
+		t.Errorf("status was mutated to %s, want %s", persisted.Status, drevtypes.StatusPending)
+	}
+	if !persisted.FinishedAt.IsZero() {
+		t.Errorf("finished_at was unexpectedly set: %v", persisted.FinishedAt)
+	}
+}
+
+func TestUpdateRunStatus_AlreadySuccessfulIdempotency(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "idempotent_success.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	runID := "run-idemp-success"
+	if err := s.CreateRun(ctx, &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running) error = %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("UpdateRunStatus(success) error = %v", err)
+	}
+
+	initial, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	initialFinishedAt := initial.FinishedAt
+	if initialFinishedAt.IsZero() {
+		t.Fatal("expected finished_at to be populated")
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Idempotent update to success must succeed
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("idempotent UpdateRunStatus(success) failed: %v", err)
+	}
+
+	after, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if after.Status != drevtypes.StatusSuccess {
+		t.Errorf("status mutated to %s", after.Status)
+	}
+	if !after.FinishedAt.Equal(initialFinishedAt) {
+		t.Errorf("finished_at changed on idempotent update: before %v, after %v", initialFinishedAt, after.FinishedAt)
+	}
+}
+
+func TestUpdateRunStatus_SuccessAllowed_WhenNoCancellationIntent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "success_no_cancel.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	runID := "run-success-allowed"
+	if err := s.CreateRun(ctx, &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running) error = %v", err)
+	}
+
+	// Finalizing as success must succeed when cancellation_requested_at is NULL
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess); err != nil {
+		t.Fatalf("UpdateRunStatus(success) error = %v", err)
+	}
+
+	run, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if run.Status != drevtypes.StatusSuccess {
+		t.Errorf("status = %s, want %s", run.Status, drevtypes.StatusSuccess)
+	}
+	if run.FinishedAt.IsZero() {
+		t.Errorf("finished_at was not populated")
+	}
+	if run.CancellationRequestedAt != nil {
+		t.Errorf("cancellation_requested_at was unexpectedly populated: %v", run.CancellationRequestedAt)
+	}
+}
+
+func TestUpdateRunStatus_SuccessRejected_WhenCancellationRequested(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "success_rejected_cancel.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	runID := "run-success-rejected"
+	if err := s.CreateRun(ctx, &drevtypes.Run{
+		ID:         runID,
+		PipelineID: "p-test",
+		Status:     drevtypes.StatusPending,
+	}); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+	if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+		t.Fatalf("UpdateRunStatus(running) error = %v", err)
+	}
+
+	// 1. Persist cancellation intent
+	cancelRes, err := s.CancelRun(ctx, runID, "")
+	if err != nil {
+		t.Fatalf("CancelRun() error = %v", err)
+	}
+	if !cancelRes.WasRunning || cancelRes.Run.CancellationRequestedAt == nil {
+		t.Fatalf("expected running run with cancellation_requested_at set, got %+v", cancelRes)
+	}
+	originalCancelTime := *cancelRes.Run.CancellationRequestedAt
+
+	// 2. Attempt to finalize as success: MUST be rejected with ErrCancellationRequested
+	err = s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess)
+	if err == nil {
+		t.Fatal("expected UpdateRunStatus(success) to fail due to cancellation intent, got nil")
+	}
+	if !errors.Is(err, store.ErrCancellationRequested) {
+		t.Fatalf("expected ErrCancellationRequested, got: %v", err)
+	}
+
+	// 3. Verify database state remains running with cancellation_requested_at intact
+	persisted, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if persisted.Status != drevtypes.StatusRunning {
+		t.Errorf("status was mutated to %s, want %s", persisted.Status, drevtypes.StatusRunning)
+	}
+	if persisted.CancellationRequestedAt == nil {
+		t.Fatal("cancellation_requested_at was cleared")
+	}
+	if !persisted.CancellationRequestedAt.Equal(originalCancelTime) {
+		t.Errorf("cancellation_requested_at changed: was %v, now %v", originalCancelTime, *persisted.CancellationRequestedAt)
+	}
+	if !persisted.FinishedAt.IsZero() {
+		t.Errorf("finished_at was unexpectedly set: %v", persisted.FinishedAt)
+	}
+}
+
+func TestUpdateRunStatus_PrecedingFailureAndCancellationFinalizationAllowed_WhenCancellationRequested(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "failure_cancel_allowed.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// Subtest 1: Preceding genuine failure can finalize despite cancellation intent
+	t.Run("preceding failure allowed", func(t *testing.T) {
+		runID := "run-preceding-fail"
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			PipelineID: "p-fail",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		_ = s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning)
+		_, err := s.CancelRun(ctx, runID, "")
+		if err != nil {
+			t.Fatalf("CancelRun: %v", err)
+		}
+
+		// Updating to StatusFailed with diagnostics must succeed
+		if err := s.UpdateRunStatusWithDiagnostics(ctx, runID, drevtypes.StatusFailed, drevtypes.FailureReasonJobFailed, drevtypes.StageExecution); err != nil {
+			t.Fatalf("UpdateRunStatusWithDiagnostics(failed) error = %v", err)
+		}
+
+		run, _ := s.GetRun(ctx, runID)
+		if run.Status != drevtypes.StatusFailed {
+			t.Errorf("status = %s, want %s", run.Status, drevtypes.StatusFailed)
+		}
+		if run.FailureReason != drevtypes.FailureReasonJobFailed {
+			t.Errorf("failure_reason = %s, want %s", run.FailureReason, drevtypes.FailureReasonJobFailed)
+		}
+	})
+
+	// Subtest 2: Cancellation finalization can finalize when cancellation intent was requested
+	t.Run("cancellation finalization allowed", func(t *testing.T) {
+		runID := "run-cancel-finalize"
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			PipelineID: "p-cancel",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		_ = s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning)
+		_, err := s.CancelRun(ctx, runID, "")
+		if err != nil {
+			t.Fatalf("CancelRun: %v", err)
+		}
+
+		// Updating to StatusCancelled with diagnostics must succeed
+		if err := s.UpdateRunStatusWithDiagnostics(ctx, runID, drevtypes.StatusCancelled, string(drevtypes.StatusCancelled), drevtypes.StageExecution); err != nil {
+			t.Fatalf("UpdateRunStatusWithDiagnostics(cancelled) error = %v", err)
+		}
+
+		run, _ := s.GetRun(ctx, runID)
+		if run.Status != drevtypes.StatusCancelled {
+			t.Errorf("status = %s, want %s", run.Status, drevtypes.StatusCancelled)
+		}
+		if run.FailureReason != string(drevtypes.StatusCancelled) {
+			t.Errorf("failure_reason = %s, want %s", run.FailureReason, drevtypes.StatusCancelled)
+		}
+	})
+}
+
+func TestUpdateRunStatus_TerminalRunReturnsErrRunAlreadyTerminal_NotErrCancellationRequested(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "terminal_run_err.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Run already failed
+	runFailed := "run-already-failed"
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runFailed, PipelineID: "p", Status: drevtypes.StatusPending})
+	_ = s.UpdateRunStatus(ctx, runFailed, drevtypes.StatusFailed)
+
+	err = s.UpdateRunStatus(ctx, runFailed, drevtypes.StatusSuccess)
+	if !errors.Is(err, store.ErrRunAlreadyTerminal) {
+		t.Errorf("expected ErrRunAlreadyTerminal on failed run, got: %v", err)
+	}
+	if errors.Is(err, store.ErrCancellationRequested) {
+		t.Errorf("unexpected ErrCancellationRequested on failed run")
+	}
+
+	// 2. Run already cancelled
+	runCancelled := "run-already-cancelled"
+	_ = s.CreateRun(ctx, &drevtypes.Run{ID: runCancelled, PipelineID: "p", Status: drevtypes.StatusPending})
+	_ = s.UpdateRunStatus(ctx, runCancelled, drevtypes.StatusCancelled)
+
+	err = s.UpdateRunStatus(ctx, runCancelled, drevtypes.StatusSuccess)
+	if !errors.Is(err, store.ErrRunAlreadyTerminal) {
+		t.Errorf("expected ErrRunAlreadyTerminal on cancelled run, got: %v", err)
+	}
+	if errors.Is(err, store.ErrCancellationRequested) {
+		t.Errorf("unexpected ErrCancellationRequested on cancelled run")
+	}
+}
+
+func TestUpdateRunStatus_MissingRunReturnsErrNoRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "missing_run.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	err = s.UpdateRunStatus(context.Background(), "non-existent-run-id", drevtypes.StatusSuccess)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows for missing run, got: %v", err)
+	}
+}
+
+func TestUpdateRunStatus_ConcurrentCancelAndSuccess_Linearization(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "concurrent_linearization.db")
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	const iterations = 10
+
+	for i := 0; i < iterations; i++ {
+		runID := fmt.Sprintf("run-concurrent-lin-%d", i)
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			PipelineID: "p-conc",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+			t.Fatalf("UpdateRunStatus: %v", err)
+		}
+
+		var startWg sync.WaitGroup
+		startWg.Add(1)
+		var doneWg sync.WaitGroup
+		doneWg.Add(2)
+
+		var cancelRes *store.CancelResult
+		var cancelErr error
+		var successErr error
+
+		go func() {
+			defer doneWg.Done()
+			startWg.Wait()
+			cancelRes, cancelErr = s.CancelRun(ctx, runID, "")
+		}()
+
+		go func() {
+			defer doneWg.Done()
+			startWg.Wait()
+			successErr = s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess)
+		}()
+
+		startWg.Done()
+		doneWg.Wait()
+
+		// Winner verification:
+		// Case A: CancelRun committed first -> successErr MUST be ErrCancellationRequested, run remains running with cancel intent
+		// Case B: Success update committed first -> cancelErr MUST be ErrRunAlreadyTerminal, run is StatusSuccess
+		run, err := s.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+
+		if run.Status == drevtypes.StatusSuccess {
+			// Success won
+			if successErr != nil {
+				t.Errorf("iter %d: run is success but successErr was %v", i, successErr)
+			}
+			if cancelErr == nil || !errors.Is(cancelErr, store.ErrRunAlreadyTerminal) {
+				t.Errorf("iter %d: success won but cancelErr was %v (want ErrRunAlreadyTerminal)", i, cancelErr)
+			}
+			if run.CancellationRequestedAt != nil {
+				t.Errorf("iter %d: run is success but cancellation_requested_at is set: %v", i, run.CancellationRequestedAt)
+			}
+		} else if run.Status == drevtypes.StatusRunning {
+			// Cancel intent won
+			if cancelErr != nil {
+				t.Errorf("iter %d: run is running (cancel won) but cancelErr was %v", i, cancelErr)
+			}
+			if cancelRes == nil || cancelRes.Run.CancellationRequestedAt == nil {
+				t.Errorf("iter %d: cancel won but cancellation_requested_at not populated", i)
+			}
+			if successErr == nil || !errors.Is(successErr, store.ErrCancellationRequested) {
+				t.Errorf("iter %d: cancel won but successErr was %v (want ErrCancellationRequested)", i, successErr)
+			}
+		} else {
+			t.Errorf("iter %d: unexpected final status: %s", i, run.Status)
+		}
+	}
 }

@@ -405,7 +405,15 @@ func (s *PostgresStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id s
 		  finished_at = CASE WHEN finished_at IS NULL AND $4 IN ('success','failed','cancelled') THEN $3 ELSE finished_at END,
 		  failure_reason = CASE WHEN $5 != '' THEN $5 ELSE failure_reason END,
 		  interrupted_stage = CASE WHEN $6 != '' THEN $6 ELSE interrupted_stage END
-		WHERE id = $7 AND (status NOT IN ('success', 'failed', 'cancelled') OR status = $8)`,
+		WHERE id = $7
+		  AND (
+		    ($1 != 'success' AND (status NOT IN ('success', 'failed', 'cancelled') OR status = $8))
+		    OR
+		    ($1 = 'success' AND (
+		      (status = 'running' AND cancellation_requested_at IS NULL)
+		      OR status = 'success'
+		    ))
+		  )`,
 		string(status), string(status), now, string(status),
 		failureReason, interruptedStage,
 		id, string(status),
@@ -419,12 +427,16 @@ func (s *PostgresStore) UpdateRunStatusWithDiagnostics(ctx context.Context, id s
 	}
 	if n == 0 {
 		var currentStatus string
-		err := s.db.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = $1`, id).Scan(&currentStatus)
+		var cancelReq sql.NullTime
+		err := s.db.QueryRowContext(ctx, `SELECT status, cancellation_requested_at FROM runs WHERE id = $1`, id).Scan(&currentStatus, &cancelReq)
 		if errors.Is(err, sql.ErrNoRows) {
 			return sql.ErrNoRows
 		}
 		if err != nil {
 			return fmt.Errorf("checking run status for %s: %w", id, err)
+		}
+		if status == drevtypes.StatusSuccess && currentStatus == string(drevtypes.StatusRunning) && cancelReq.Valid {
+			return fmt.Errorf("%w: cannot transition run %s to %s with active cancellation intent", ErrCancellationRequested, id, status)
 		}
 		return fmt.Errorf("%w: cannot transition run %s from %s to %s", ErrRunAlreadyTerminal, id, currentStatus, status)
 	}
