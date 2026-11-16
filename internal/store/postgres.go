@@ -146,6 +146,16 @@ func OpenPostgres(connString string) (*PostgresStore, error) {
 				ALTER TABLE run_jobs ADD COLUMN failure_reason TEXT;
 			END IF;
 		END $$;`,
+		`DO $$
+		BEGIN
+			-- 5. cancellation intent column
+			IF NOT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs' AND column_name = 'cancellation_requested_at'
+			) THEN
+				ALTER TABLE runs ADD COLUMN cancellation_requested_at TIMESTAMPTZ;
+			END IF;
+		END $$;`,
 	}
 	for _, q := range initQueries {
 		if _, err := db.Exec(q); err != nil {
@@ -176,6 +186,13 @@ func pgNullTime(t time.Time) interface{} {
 	return t.UTC()
 }
 
+func pgNullTimePtr(t *time.Time) interface{} {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return t.UTC()
+}
+
 func pgNullStr(str string) interface{} {
 	if str == "" {
 		return nil
@@ -188,6 +205,14 @@ func scanNullTime(nt *sql.NullTime) time.Time {
 		return time.Time{}
 	}
 	return nt.Time
+}
+
+func scanNullTimePtr(nt *sql.NullTime) *time.Time {
+	if !nt.Valid {
+		return nil
+	}
+	t := nt.Time.UTC()
+	return &t
 }
 
 func scanNullString(ns *sql.NullString) string {
@@ -205,12 +230,14 @@ func scanPgRun(row interface {
 	var commitSHA, commitMsg, branch sql.NullString
 	var startedAt, finishedAt sql.NullTime
 	var failureReason, interruptedStage sql.NullString
+	var cancellationRequestedAt sql.NullTime
 
 	err := row.Scan(
 		&r.ID, &r.OrgID, &r.PipelineID, &status,
 		&triggeredBy, &commitSHA, &commitMsg, &branch,
 		&startedAt, &finishedAt,
 		&failureReason, &interruptedStage,
+		&cancellationRequestedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -224,6 +251,7 @@ func scanPgRun(row interface {
 	r.FinishedAt = scanNullTime(&finishedAt)
 	r.FailureReason = scanNullString(&failureReason)
 	r.InterruptedStage = scanNullString(&interruptedStage)
+	r.CancellationRequestedAt = scanNullTimePtr(&cancellationRequestedAt)
 	return &r, nil
 }
 
@@ -232,12 +260,13 @@ func scanPgRun(row interface {
 func (s *PostgresStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
 		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
+		pgNullTimePtr(run.CancellationRequestedAt),
 	)
 	return err
 }
@@ -292,12 +321,13 @@ func (s *PostgresStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.R
 	// 4. Insert parent run
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
 		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
+		pgNullTimePtr(run.CancellationRequestedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting postgres run: %w", err)
@@ -343,7 +373,7 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*drevtypes.Run, 
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 		       commit_sha, commit_msg, branch, started_at, finished_at,
-		       failure_reason, interrupted_stage
+		       failure_reason, interrupted_stage, cancellation_requested_at
 		FROM runs WHERE id = $1`, id)
 
 	r, err := scanPgRun(row)
@@ -418,14 +448,14 @@ func (s *PostgresStore) listRuns(ctx context.Context, orgID string, limit int) (
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs WHERE org_id = $1
 			ORDER BY created_at DESC LIMIT $2`, orgID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs ORDER BY created_at DESC LIMIT $1`, limit)
 	}
 	if err != nil {
@@ -829,7 +859,7 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		termRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs
 			WHERE org_id = $1 AND status IN ('success', 'failed', 'cancelled')
 			ORDER BY created_at DESC
@@ -838,7 +868,7 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		termRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs
 			WHERE status IN ('success', 'failed', 'cancelled')
 			ORDER BY created_at DESC
@@ -900,7 +930,7 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		failRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs
 			WHERE org_id = $1 AND status = 'failed'
 			ORDER BY created_at DESC
@@ -909,7 +939,7 @@ func (s *PostgresStore) GetRunStats(ctx context.Context, orgID string, sampleLim
 		failRows, err = s.db.QueryContext(ctx, `
 			SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
 			       commit_sha, commit_msg, branch, started_at, finished_at,
-			       failure_reason, interrupted_stage
+			       failure_reason, interrupted_stage, cancellation_requested_at
 			FROM runs
 			WHERE status = 'failed'
 			ORDER BY created_at DESC
@@ -1004,12 +1034,13 @@ func (s *PostgresStore) CreateRunWithDelivery(
 	// 1. Insert run record first so dependent child foreign keys are satisfied
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO runs
-		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		  (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		run.ID, pgNullStr(run.OrgID), run.PipelineID, string(run.Status),
 		run.TriggeredBy, pgNullStr(run.CommitSHA), pgNullStr(run.CommitMsg), pgNullStr(run.Branch),
 		pgNullTime(run.StartedAt), pgNullTime(run.FinishedAt),
 		pgNullStr(run.FailureReason), pgNullStr(run.InterruptedStage),
+		pgNullTimePtr(run.CancellationRequestedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting postgres run: %w", err)
@@ -1106,6 +1137,210 @@ func (s *PostgresStore) ClaimRunForExecution(ctx context.Context, runID string) 
 		return fmt.Errorf("committing claim transaction: %w", err)
 	}
 	return nil
+}
+
+// CancelRun coordinates store-level cancellation of a run across its lifecycle in PostgreSQL.
+// If the run is pending, it transitions to cancelled, sets failure_reason to 'cancelled',
+// interrupted_stage to 'scheduling', cancels any pending jobs, and purges the outbox entry.
+// If the run is running, it records durable cancellation intent (cancellation_requested_at)
+// while leaving the run and jobs in running state for scheduler teardown.
+// Terminal runs in success or failed state return ErrRunAlreadyTerminal.
+// Runs already cancelled return the idempotent CancelResult with AlreadyDone=true.
+// Cross-tenant access or non-existent runs return ErrRunNotFound.
+func (s *PostgresStore) CancelRun(ctx context.Context, runID string, orgID string) (*CancelResult, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("%w: runID cannot be empty", ErrRunNotFound)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("beginning postgres cancel transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Fetch current run with row-level lock
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, COALESCE(org_id,''), pipeline_name, status, triggered_by,
+		       commit_sha, commit_msg, branch, started_at, finished_at,
+		       failure_reason, interrupted_stage, cancellation_requested_at
+		FROM runs WHERE id = $1 FOR UPDATE`, runID)
+	r, err := scanPgRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrRunNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying postgres run for cancel: %w", err)
+	}
+
+	// 2. Tenant isolation check: if orgID is provided, it must match
+	if orgID != "" && r.OrgID != orgID {
+		return nil, ErrRunNotFound
+	}
+
+	// 3. Inspect status
+	switch r.Status {
+	case drevtypes.StatusSuccess, drevtypes.StatusFailed:
+		return nil, fmt.Errorf("%w: cannot cancel run in terminal status %s", ErrRunAlreadyTerminal, r.Status)
+
+	case drevtypes.StatusCancelled:
+		_ = tx.Rollback()
+		fullRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching cancelled run: %w", err)
+		}
+		return &CancelResult{
+			Run:            fullRun,
+			PreviousStatus: drevtypes.StatusCancelled,
+			AlreadyDone:    true,
+		}, nil
+
+	case drevtypes.StatusPending:
+		now := time.Now().UTC()
+
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled',
+			    interrupted_stage = 'scheduling',
+			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END,
+			    cancellation_requested_at = CASE WHEN cancellation_requested_at IS NULL THEN $1 ELSE cancellation_requested_at END
+			WHERE id = $2 AND status = 'pending'`,
+			now, runID)
+		if err != nil {
+			return nil, fmt.Errorf("updating postgres pending run to cancelled: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("checking rows affected on postgres pending cancel: %w", err)
+		}
+		if n == 0 {
+			var curStatus string
+			if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = $1`, runID).Scan(&curStatus); err != nil {
+				return nil, fmt.Errorf("re-checking postgres run status on pending cancel race: %w", err)
+			}
+			if curStatus == string(drevtypes.StatusCancelled) {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{Run: fullRun, PreviousStatus: drevtypes.StatusCancelled, AlreadyDone: true}, nil
+			}
+			return nil, fmt.Errorf("%w: run status changed concurrently to %s", ErrRunAlreadyTerminal, curStatus)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled',
+			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+			WHERE run_id = $2 AND status = 'pending'`,
+			now, runID); err != nil {
+			return nil, fmt.Errorf("cancelling postgres pending jobs for run %s: %w", runID, err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = $1`, runID); err != nil {
+			return nil, fmt.Errorf("deleting postgres outbox entry for run %s: %w", runID, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing postgres pending run cancellation: %w", err)
+		}
+
+		updatedRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching postgres updated run after cancellation: %w", err)
+		}
+		return &CancelResult{
+			Run:            updatedRun,
+			PreviousStatus: drevtypes.StatusPending,
+			WasRunning:     false,
+			AlreadyDone:    false,
+			AlreadyPending: false,
+		}, nil
+
+	case drevtypes.StatusRunning:
+		if r.CancellationRequestedAt != nil {
+			_ = tx.Rollback()
+			fullRun, err := s.GetRun(ctx, runID)
+			if err != nil {
+				return nil, fmt.Errorf("fetching postgres running run: %w", err)
+			}
+			return &CancelResult{
+				Run:            fullRun,
+				PreviousStatus: drevtypes.StatusRunning,
+				WasRunning:     true,
+				AlreadyPending: true,
+				AlreadyDone:    false,
+			}, nil
+		}
+
+		now := time.Now().UTC()
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET cancellation_requested_at = $1
+			WHERE id = $2 AND status = 'running' AND cancellation_requested_at IS NULL`,
+			now, runID)
+		if err != nil {
+			return nil, fmt.Errorf("setting cancellation intent on postgres running run: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("checking rows affected on setting postgres cancellation intent: %w", err)
+		}
+		if n == 0 {
+			var curStatus string
+			var cancelReq sql.NullTime
+			if err := tx.QueryRowContext(ctx, `SELECT status, cancellation_requested_at FROM runs WHERE id = $1`, runID).Scan(&curStatus, &cancelReq); err != nil {
+				return nil, fmt.Errorf("re-checking postgres run status on running cancel race: %w", err)
+			}
+			if curStatus == string(drevtypes.StatusSuccess) || curStatus == string(drevtypes.StatusFailed) {
+				return nil, fmt.Errorf("%w: cannot cancel run in terminal status %s", ErrRunAlreadyTerminal, curStatus)
+			}
+			if curStatus == string(drevtypes.StatusCancelled) {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{Run: fullRun, PreviousStatus: drevtypes.StatusCancelled, AlreadyDone: true}, nil
+			}
+			if cancelReq.Valid {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{
+					Run:            fullRun,
+					PreviousStatus: drevtypes.StatusRunning,
+					WasRunning:     true,
+					AlreadyPending: true,
+					AlreadyDone:    false,
+				}, nil
+			}
+			return nil, fmt.Errorf("%w: run status changed concurrently to %s", ErrRunAlreadyTerminal, curStatus)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing postgres running cancellation intent: %w", err)
+		}
+
+		updatedRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching postgres updated run after recording cancellation intent: %w", err)
+		}
+		return &CancelResult{
+			Run:            updatedRun,
+			PreviousStatus: drevtypes.StatusRunning,
+			WasRunning:     true,
+			AlreadyPending: false,
+			AlreadyDone:    false,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported run status %s for cancellation", r.Status)
+	}
 }
 
 // GetPendingOutbox retrieves up to limit pending, never-started runs from PostgreSQL outbox,

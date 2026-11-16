@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS runs (
 	finished_at   DATETIME,
 	created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	failure_reason TEXT,
-	interrupted_stage TEXT
+	interrupted_stage TEXT,
+	cancellation_requested_at DATETIME
 );
 
 CREATE TABLE IF NOT EXISTS run_jobs (
@@ -66,6 +67,18 @@ var ErrRunAlreadyTerminal = errors.New("run is in a terminal state")
 // ErrJobAlreadyTerminal indicates that a job is in a terminal state and cannot transition to a different status.
 var ErrJobAlreadyTerminal = errors.New("job is in a terminal state")
 
+// ErrRunNotFound indicates that a requested run does not exist or does not belong to the tenant.
+var ErrRunNotFound = errors.New("run not found")
+
+// CancelResult describes the outcome of a CancelRun operation.
+type CancelResult struct {
+	Run            *drevtypes.Run       `json:"run"`
+	PreviousStatus drevtypes.RunStatus `json:"previous_status"`
+	WasRunning     bool                 `json:"was_running"`
+	AlreadyDone    bool                 `json:"already_done"`
+	AlreadyPending bool                 `json:"already_pending"`
+}
+
 // Store defines the persistence interface for pipeline runs and SaaS tenancy.
 type Store interface {
 	// ── Core pipeline methods ──────────────────────────────────────────────
@@ -73,6 +86,7 @@ type Store interface {
 	GetRun(ctx context.Context, id string) (*drevtypes.Run, error)
 	UpdateRunStatus(ctx context.Context, id string, status drevtypes.RunStatus) error
 	UpdateRunStatusWithDiagnostics(ctx context.Context, id string, status drevtypes.RunStatus, failureReason string, interruptedStage string) error
+	CancelRun(ctx context.Context, runID string, orgID string) (*CancelResult, error)
 	ListRuns(ctx context.Context, limit int) ([]*drevtypes.Run, error)
 	ListRunsByOrg(ctx context.Context, orgID string, limit int) ([]*drevtypes.Run, error)
 	CreateRunJob(ctx context.Context, job *drevtypes.RunJob) error
@@ -144,6 +158,7 @@ var requiredRunsColumns = []columnDef{
 	{name: "created_at", definition: "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"},
 	{name: "failure_reason", definition: "TEXT"},
 	{name: "interrupted_stage", definition: "TEXT"},
+	{name: "cancellation_requested_at", definition: "DATETIME"},
 }
 
 var requiredRunJobsColumns = []columnDef{
@@ -324,14 +339,14 @@ func (s *SQLiteStore) prepare() error {
 	var err error
 
 	s.stmtCreateRun, err = s.db.Prepare(
-		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return err
 	}
 
 	s.stmtGetRun, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at
 		 FROM runs WHERE id = ?`)
 	if err != nil {
 		return err
@@ -349,7 +364,7 @@ func (s *SQLiteStore) prepare() error {
 	}
 
 	s.stmtListRuns, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at
 		 FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?`)
 	if err != nil {
 		return err
@@ -378,7 +393,7 @@ func (s *SQLiteStore) prepare() error {
 	}
 
 	s.stmtGetTerminalRuns, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at
 		 FROM runs
 		 WHERE status IN ('success', 'failed', 'cancelled')
 		 ORDER BY created_at DESC, rowid DESC
@@ -388,7 +403,7 @@ func (s *SQLiteStore) prepare() error {
 	}
 
 	s.stmtGetRecentFailures, err = s.db.Prepare(
-		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage
+		`SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at
 		 FROM runs
 		 WHERE status = 'failed'
 		 ORDER BY created_at DESC, rowid DESC
@@ -435,12 +450,42 @@ func nullTimeParam(t time.Time) interface{} {
 	return t.UTC().Format(time.RFC3339)
 }
 
+func nullTimePtrParam(t *time.Time) interface{} {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
 func scanTime(val *sql.NullString) time.Time {
 	if !val.Valid {
 		return time.Time{}
 	}
 	t, _ := time.Parse(time.RFC3339, val.String)
 	return t
+}
+
+func scanTimePtr(val *sql.NullString) *time.Time {
+	if !val.Valid || val.String == "" {
+		return nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, val.String); err == nil {
+		utc := t.UTC()
+		return &utc
+	}
+	if t, err := time.Parse(time.RFC3339, val.String); err == nil {
+		utc := t.UTC()
+		return &utc
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05.999999999", val.String); err == nil {
+		utc := t.UTC()
+		return &utc
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", val.String); err == nil {
+		utc := t.UTC()
+		return &utc
+	}
+	return nil
 }
 
 func scanRun(row interface {
@@ -451,12 +496,14 @@ func scanRun(row interface {
 	var commitSHA, commitMsg, branch sql.NullString
 	var startedAt, finishedAt sql.NullString
 	var failureReason, interruptedStage sql.NullString
+	var cancellationRequestedAt sql.NullString
 
 	err := row.Scan(
 		&r.ID, &r.OrgID, &r.PipelineID, &status,
 		&triggeredBy, &commitSHA, &commitMsg, &branch,
 		&startedAt, &finishedAt,
 		&failureReason, &interruptedStage,
+		&cancellationRequestedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -470,6 +517,7 @@ func scanRun(row interface {
 	r.FinishedAt = scanTime(&finishedAt)
 	r.FailureReason = failureReason.String
 	r.InterruptedStage = interruptedStage.String
+	r.CancellationRequestedAt = scanTimePtr(&cancellationRequestedAt)
 	return &r, nil
 }
 
@@ -481,6 +529,7 @@ func (s *SQLiteStore) CreateRun(ctx context.Context, run *drevtypes.Run) error {
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
 		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
+		nullTimePtrParam(run.CancellationRequestedAt),
 	)
 	return err
 }
@@ -519,12 +568,13 @@ func (s *SQLiteStore) CreateRunWithLimit(ctx context.Context, run *drevtypes.Run
 
 	// 1. Insert parent run
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.ID, run.OrgID, run.PipelineID, string(run.Status),
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
 		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
+		nullTimePtrParam(run.CancellationRequestedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting sqlite run: %w", err)
@@ -1109,12 +1159,13 @@ func (s *SQLiteStore) CreateRunWithDelivery(
 
 	// 1. Insert run record first so dependent foreign keys are satisfied
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO runs (id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch, started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.ID, run.OrgID, run.PipelineID, string(run.Status),
 		run.TriggeredBy, nullStr(run.CommitSHA), nullStr(run.CommitMsg), nullStr(run.Branch),
 		nullTimeParam(run.StartedAt), nullTimeParam(run.FinishedAt),
 		nullStr(run.FailureReason), nullStr(run.InterruptedStage),
+		nullTimePtrParam(run.CancellationRequestedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("inserting run: %w", err)
@@ -1204,6 +1255,216 @@ func (s *SQLiteStore) ClaimRunForExecution(ctx context.Context, runID string) er
 		return fmt.Errorf("committing claim transaction: %w", err)
 	}
 	return nil
+}
+
+// CancelRun coordinates store-level cancellation of a run across its lifecycle.
+// If the run is pending, it transitions to cancelled, sets failure_reason to 'cancelled',
+// interrupted_stage to 'scheduling', cancels any pending jobs, and purges the outbox entry.
+// If the run is running, it records durable cancellation intent (cancellation_requested_at)
+// while leaving the run and jobs in running state for scheduler teardown.
+// Terminal runs in success or failed state return ErrRunAlreadyTerminal.
+// Runs already cancelled return the idempotent CancelResult with AlreadyDone=true.
+// Cross-tenant access or non-existent runs return ErrRunNotFound.
+func (s *SQLiteStore) CancelRun(ctx context.Context, runID string, orgID string) (*CancelResult, error) {
+	if runID == "" {
+		return nil, fmt.Errorf("%w: runID cannot be empty", ErrRunNotFound)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("beginning sqlite cancel transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Fetch current run inside the transaction
+	r, err := scanRun(tx.QueryRowContext(ctx, `
+		SELECT id, org_id, pipeline_name, status, triggered_by, commit_sha, commit_msg, branch,
+		       started_at, finished_at, failure_reason, interrupted_stage, cancellation_requested_at
+		FROM runs WHERE id = ?`, runID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrRunNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("querying run for cancel: %w", err)
+	}
+
+	// 2. Tenant isolation check: if orgID is provided, it must match
+	if orgID != "" && r.OrgID != orgID {
+		return nil, ErrRunNotFound
+	}
+
+	// 3. Inspect status
+	switch r.Status {
+	case drevtypes.StatusSuccess, drevtypes.StatusFailed:
+		return nil, fmt.Errorf("%w: cannot cancel run in terminal status %s", ErrRunAlreadyTerminal, r.Status)
+
+	case drevtypes.StatusCancelled:
+		_ = tx.Rollback()
+		fullRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching cancelled run: %w", err)
+		}
+		return &CancelResult{
+			Run:            fullRun,
+			PreviousStatus: drevtypes.StatusCancelled,
+			AlreadyDone:    true,
+		}, nil
+
+	case drevtypes.StatusPending:
+		now := time.Now().UTC()
+		nowStr := now.Format(time.RFC3339)
+		cancelStr := now.Format(time.RFC3339Nano)
+
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled',
+			    interrupted_stage = 'scheduling',
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END,
+			    cancellation_requested_at = CASE WHEN cancellation_requested_at IS NULL THEN ? ELSE cancellation_requested_at END
+			WHERE id = ? AND status = 'pending'`,
+			nowStr, cancelStr, runID)
+		if err != nil {
+			return nil, fmt.Errorf("updating pending run to cancelled: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("checking rows affected on pending run cancel: %w", err)
+		}
+		if n == 0 {
+			var curStatus string
+			if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&curStatus); err != nil {
+				return nil, fmt.Errorf("re-checking run status on pending cancel race: %w", err)
+			}
+			if curStatus == string(drevtypes.StatusCancelled) {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{Run: fullRun, PreviousStatus: drevtypes.StatusCancelled, AlreadyDone: true}, nil
+			}
+			return nil, fmt.Errorf("%w: run status changed concurrently to %s", ErrRunAlreadyTerminal, curStatus)
+		}
+
+		// Update pending jobs to cancelled
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE run_jobs
+			SET status = 'cancelled',
+			    failure_reason = 'cancelled',
+			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
+			WHERE run_id = ? AND status = 'pending'`,
+			nowStr, runID); err != nil {
+			return nil, fmt.Errorf("cancelling pending jobs for run %s: %w", runID, err)
+		}
+
+		// Delete pipeline outbox entry (if any)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pipeline_outbox WHERE run_id = ?`, runID); err != nil {
+			return nil, fmt.Errorf("deleting outbox entry for cancelled run %s: %w", runID, err)
+		}
+
+		// Note: webhook_deliveries is strictly preserved for idempotency
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing pending run cancellation: %w", err)
+		}
+
+		updatedRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching updated run after cancellation: %w", err)
+		}
+		return &CancelResult{
+			Run:            updatedRun,
+			PreviousStatus: drevtypes.StatusPending,
+			WasRunning:     false,
+			AlreadyDone:    false,
+			AlreadyPending: false,
+		}, nil
+
+	case drevtypes.StatusRunning:
+		if r.CancellationRequestedAt != nil {
+			_ = tx.Rollback()
+			fullRun, err := s.GetRun(ctx, runID)
+			if err != nil {
+				return nil, fmt.Errorf("fetching running run: %w", err)
+			}
+			return &CancelResult{
+				Run:            fullRun,
+				PreviousStatus: drevtypes.StatusRunning,
+				WasRunning:     true,
+				AlreadyPending: true,
+				AlreadyDone:    false,
+			}, nil
+		}
+
+		now := time.Now().UTC()
+		cancelStr := now.Format(time.RFC3339Nano)
+
+		res, err := tx.ExecContext(ctx, `
+			UPDATE runs
+			SET cancellation_requested_at = ?
+			WHERE id = ? AND status = 'running' AND cancellation_requested_at IS NULL`,
+			cancelStr, runID)
+		if err != nil {
+			return nil, fmt.Errorf("setting cancellation intent on running run: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("checking rows affected on setting cancellation intent: %w", err)
+		}
+		if n == 0 {
+			var curStatus string
+			var cancelReq sql.NullString
+			if err := tx.QueryRowContext(ctx, `SELECT status, cancellation_requested_at FROM runs WHERE id = ?`, runID).Scan(&curStatus, &cancelReq); err != nil {
+				return nil, fmt.Errorf("re-checking run status on running cancel race: %w", err)
+			}
+			if curStatus == string(drevtypes.StatusSuccess) || curStatus == string(drevtypes.StatusFailed) {
+				return nil, fmt.Errorf("%w: cannot cancel run in terminal status %s", ErrRunAlreadyTerminal, curStatus)
+			}
+			if curStatus == string(drevtypes.StatusCancelled) {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{Run: fullRun, PreviousStatus: drevtypes.StatusCancelled, AlreadyDone: true}, nil
+			}
+			if cancelReq.Valid && cancelReq.String != "" {
+				_ = tx.Rollback()
+				fullRun, err := s.GetRun(ctx, runID)
+				if err != nil {
+					return nil, err
+				}
+				return &CancelResult{
+					Run:            fullRun,
+					PreviousStatus: drevtypes.StatusRunning,
+					WasRunning:     true,
+					AlreadyPending: true,
+					AlreadyDone:    false,
+				}, nil
+			}
+			return nil, fmt.Errorf("%w: run status changed concurrently to %s", ErrRunAlreadyTerminal, curStatus)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("committing running cancellation intent: %w", err)
+		}
+
+		updatedRun, err := s.GetRun(ctx, runID)
+		if err != nil {
+			return nil, fmt.Errorf("fetching updated run after recording cancellation intent: %w", err)
+		}
+		return &CancelResult{
+			Run:            updatedRun,
+			PreviousStatus: drevtypes.StatusRunning,
+			WasRunning:     true,
+			AlreadyPending: false,
+			AlreadyDone:    false,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported run status %s for cancellation", r.Status)
+	}
 }
 
 // GetPendingOutbox retrieves up to limit pending, never-started runs from the outbox,

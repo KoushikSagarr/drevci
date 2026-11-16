@@ -2675,7 +2675,7 @@ func TestPostgresStore_ResetGhostRuns_JobAndRunDiagnostics(t *testing.T) {
 	s := testDB(t)
 	ctx := context.Background()
 
-	orgID := createTestOrg(t, s)
+	orgID := uuid.New().String()
 	runID := uuid.New().String()
 
 	run := &drevtypes.Run{
@@ -2727,7 +2727,7 @@ func TestPostgresStore_ResetGhostRuns_JobAndRunDiagnostics(t *testing.T) {
 			FailureReason: drevtypes.FailureReasonCommandFailed,
 		},
 	}
-	if err := s.CreateRunJobs(ctx, jobs); err != nil {
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
 		t.Fatalf("CreateRunJobs: %v", err)
 	}
 
@@ -2774,4 +2774,369 @@ func TestPostgresStore_ResetGhostRuns_JobAndRunDiagnostics(t *testing.T) {
 	if jobMap[jFailID].Status != drevtypes.StatusFailed || jobMap[jFailID].FailureReason != drevtypes.FailureReasonCommandFailed {
 		t.Errorf("failed job mutated: status=%s, reason=%s", jobMap[jFailID].Status, jobMap[jFailID].FailureReason)
 	}
+}
+
+func TestPostgres_Migration007_FileExistsAndValid(t *testing.T) {
+	data, err := os.ReadFile("../../migrations/007_cancellation_intent.sql")
+	if err != nil {
+		t.Fatalf("expected migrations/007_cancellation_intent.sql to exist: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "ALTER TABLE runs") {
+		t.Errorf("migration missing ALTER TABLE runs")
+	}
+	if !strings.Contains(content, "ADD COLUMN cancellation_requested_at TIMESTAMPTZ") {
+		t.Errorf("migration missing ADD COLUMN cancellation_requested_at TIMESTAMPTZ")
+	}
+	if !strings.Contains(content, "table_schema = CURRENT_SCHEMA") {
+		t.Errorf("migration missing CURRENT_SCHEMA check")
+	}
+	if !strings.Contains(content, "column_name = 'cancellation_requested_at'") {
+		t.Errorf("migration missing column_name = 'cancellation_requested_at' check")
+	}
+}
+
+func TestPostgres_Migration007_UpgradeLive(t *testing.T) {
+	connStr := os.Getenv("DREV_DB_URL")
+	if connStr == "" {
+		t.Skip("DREV_DB_URL not set — skipping postgres integration tests")
+	}
+
+	migrationSQL, err := os.ReadFile("../../migrations/007_cancellation_intent.sql")
+	if err != nil {
+		t.Fatalf("reading migration 007: %v", err)
+	}
+
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		t.Fatalf("opening postgres: %v", err)
+	}
+	defer db.Close()
+
+	testSchema := fmt.Sprintf("test_mig007_%d_%d", time.Now().UnixNano(), rand.Intn(10000))
+	if _, err := db.Exec(fmt.Sprintf("CREATE SCHEMA %q", testSchema)); err != nil {
+		t.Fatalf("creating test schema %q: %v", testSchema, err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %q CASCADE", testSchema))
+	})
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("acquiring dedicated connection: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("SET search_path TO %q", testSchema)); err != nil {
+		t.Fatalf("setting dedicated search_path: %v", err)
+	}
+
+	// Create pre-migration table without cancellation_requested_at
+	createSQL := `
+	CREATE TABLE runs (
+		id UUID PRIMARY KEY,
+		org_id UUID,
+		pipeline_name TEXT NOT NULL,
+		status TEXT NOT NULL,
+		triggered_by TEXT NOT NULL DEFAULT 'api',
+		commit_sha TEXT,
+		commit_msg TEXT,
+		branch TEXT,
+		started_at TIMESTAMPTZ,
+		finished_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		failure_reason TEXT,
+		interrupted_stage TEXT
+	);`
+	if _, err := conn.ExecContext(ctx, createSQL); err != nil {
+		t.Fatalf("creating pre-migration runs table: %v", err)
+	}
+
+	// First execution of migration
+	if _, err := conn.ExecContext(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("first execution of migration 007 failed: %v", err)
+	}
+
+	// Second execution to verify idempotency
+	if _, err := conn.ExecContext(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("second execution (idempotency check) of migration 007 failed: %v", err)
+	}
+
+	// Verify column exists
+	var exists bool
+	checkSQL := `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = CURRENT_SCHEMA AND table_name = 'runs' AND column_name = 'cancellation_requested_at'
+		);`
+	if err := conn.QueryRowContext(ctx, checkSQL).Scan(&exists); err != nil {
+		t.Fatalf("checking column existence: %v", err)
+	}
+	if !exists {
+		t.Errorf("cancellation_requested_at column does not exist after migration")
+	}
+}
+
+func TestPostgresStore_CancelRun(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	createOrg := func(name string) string {
+		id := uuid.New().String()
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO organizations (id, name, slug) VALUES ($1, $2, $3)`, id, name, "slug-"+uuid.New().String()); err != nil {
+			t.Fatalf("creating test org: %v", err)
+		}
+		return id
+	}
+
+	t.Run("pending run cancellation with jobs outbox and delivery", func(t *testing.T) {
+		orgID := createOrg("Cancel Pending Org")
+		runID := uuid.New().String()
+		deliveryID := "del-pg-" + uuid.New().String()
+
+		delivery := &drevtypes.WebhookDelivery{
+			DeliveryID: deliveryID,
+			EventType:  "push",
+			Repo:       "acme/postgres-repo",
+			RunID:      runID,
+		}
+		run := &drevtypes.Run{
+			ID:         runID,
+			OrgID:      orgID,
+			PipelineID: "p-pg-cancel",
+			Status:     drevtypes.StatusPending,
+		}
+		jobs := []*drevtypes.RunJob{
+			{ID: uuid.New().String(), RunID: runID, JobName: "build", Status: drevtypes.StatusPending},
+		}
+
+		if err := s.CreateRunWithDelivery(ctx, delivery, run, jobs, "pipeline: spec"); err != nil {
+			t.Fatalf("CreateRunWithDelivery() error = %v", err)
+		}
+
+		// Also add a terminal job to verify it is preserved
+		succJobID := uuid.New().String()
+		succJob := &drevtypes.RunJob{
+			ID:         succJobID,
+			RunID:      runID,
+			JobName:    "lint",
+			Status:     drevtypes.StatusSuccess,
+			FinishedAt: time.Now().UTC().Add(-time.Minute),
+		}
+		if err := s.CreateRunJob(ctx, succJob); err != nil {
+			t.Fatalf("CreateRunJob() error = %v", err)
+		}
+
+		res, err := s.CancelRun(ctx, runID, orgID)
+		if err != nil {
+			t.Fatalf("CancelRun() error = %v", err)
+		}
+
+		if res.PreviousStatus != drevtypes.StatusPending {
+			t.Errorf("PreviousStatus = %s, want pending", res.PreviousStatus)
+		}
+		if res.WasRunning || res.AlreadyDone || res.AlreadyPending {
+			t.Errorf("unexpected booleans on pending cancel: %+v", res)
+		}
+		if res.Run.Status != drevtypes.StatusCancelled {
+			t.Errorf("Run.Status = %s, want cancelled", res.Run.Status)
+		}
+		if res.Run.FailureReason != drevtypes.FailureReasonCancelled {
+			t.Errorf("FailureReason = %q, want cancelled", res.Run.FailureReason)
+		}
+		if res.Run.InterruptedStage != drevtypes.StageScheduling {
+			t.Errorf("InterruptedStage = %q, want scheduling", res.Run.InterruptedStage)
+		}
+		if res.Run.CancellationRequestedAt == nil {
+			t.Errorf("CancellationRequestedAt is nil")
+		}
+
+		// Outbox purged
+		outbox, err := s.GetPendingOutbox(ctx, 10)
+		if err != nil {
+			t.Fatalf("GetPendingOutbox() error = %v", err)
+		}
+		for _, o := range outbox {
+			if o.RunID == runID {
+				t.Errorf("outbox item was not purged for run %s", runID)
+			}
+		}
+
+		// Webhook delivery preserved
+		del, err := s.GetDelivery(ctx, deliveryID)
+		if err != nil {
+			t.Fatalf("GetDelivery() error = %v", err)
+		}
+		if del == nil || del.DeliveryID != deliveryID {
+			t.Errorf("webhook delivery was deleted")
+		}
+
+		// Terminal job preserved, pending job cancelled
+		persisted, err := s.GetRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("GetRun() error = %v", err)
+		}
+		for _, j := range persisted.Jobs {
+			if j.ID == succJobID {
+				if j.Status != drevtypes.StatusSuccess {
+					t.Errorf("terminal job status altered to %s", j.Status)
+				}
+			} else {
+				if j.Status != drevtypes.StatusCancelled || j.FailureReason != drevtypes.FailureReasonCancelled {
+					t.Errorf("pending job was not properly cancelled: %+v", j)
+				}
+			}
+		}
+	})
+
+	t.Run("running run cancellation intent and idempotency", func(t *testing.T) {
+		orgID := createOrg("Cancel Running Org")
+		runID := uuid.New().String()
+
+		run := &drevtypes.Run{
+			ID:         runID,
+			OrgID:      orgID,
+			PipelineID: "p-pg-running",
+			Status:     drevtypes.StatusPending,
+		}
+		if err := s.CreateRun(ctx, run); err != nil {
+			t.Fatalf("CreateRun() error = %v", err)
+		}
+		if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusRunning); err != nil {
+			t.Fatalf("UpdateRunStatus() error = %v", err)
+		}
+
+		// First cancellation
+		res1, err := s.CancelRun(ctx, runID, orgID)
+		if err != nil {
+			t.Fatalf("first CancelRun() error = %v", err)
+		}
+		if !res1.WasRunning || res1.AlreadyPending || res1.AlreadyDone {
+			t.Errorf("unexpected res1 booleans: %+v", res1)
+		}
+		if res1.Run.Status != drevtypes.StatusRunning {
+			t.Errorf("run status changed from running to %s", res1.Run.Status)
+		}
+		if res1.Run.CancellationRequestedAt == nil {
+			t.Fatalf("CancellationRequestedAt is nil")
+		}
+		firstTS := *res1.Run.CancellationRequestedAt
+
+		time.Sleep(20 * time.Millisecond)
+
+		// Second cancellation (idempotent)
+		res2, err := s.CancelRun(ctx, runID, orgID)
+		if err != nil {
+			t.Fatalf("second CancelRun() error = %v", err)
+		}
+		if !res2.WasRunning || !res2.AlreadyPending || res2.AlreadyDone {
+			t.Errorf("unexpected res2 booleans: %+v", res2)
+		}
+		if !res2.Run.CancellationRequestedAt.Equal(firstTS) {
+			t.Errorf("timestamp was overwritten: first=%v, second=%v", firstTS, res2.Run.CancellationRequestedAt)
+		}
+	})
+
+	t.Run("terminal run rejection", func(t *testing.T) {
+		orgID := createOrg("Cancel Terminal Org")
+		runID := uuid.New().String()
+
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			OrgID:      orgID,
+			PipelineID: "p-pg-term",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun() error = %v", err)
+		}
+		if err := s.UpdateRunStatus(ctx, runID, drevtypes.StatusSuccess); err != nil {
+			t.Fatalf("UpdateRunStatus() error = %v", err)
+		}
+
+		res, err := s.CancelRun(ctx, runID, orgID)
+		if res != nil {
+			t.Errorf("expected nil result on terminal run, got %+v", res)
+		}
+		if !errors.Is(err, ErrRunAlreadyTerminal) {
+			t.Errorf("expected ErrRunAlreadyTerminal, got %v", err)
+		}
+	})
+
+	t.Run("not found and cross tenant isolation", func(t *testing.T) {
+		orgA := createOrg("Org A")
+		orgB := createOrg("Org B")
+		runID := uuid.New().String()
+
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			OrgID:      orgA,
+			PipelineID: "p-pg-tenant",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun() error = %v", err)
+		}
+
+		// Org B attempts to cancel Org A's run
+		res, err := s.CancelRun(ctx, runID, orgB)
+		if res != nil {
+			t.Errorf("expected nil result for cross-tenant, got %+v", res)
+		}
+		if !errors.Is(err, ErrRunNotFound) {
+			t.Errorf("expected ErrRunNotFound for cross-tenant cancel, got %v", err)
+		}
+
+		// Random non-existent run
+		resNF, errNF := s.CancelRun(ctx, uuid.New().String(), orgA)
+		if resNF != nil || !errors.Is(errNF, ErrRunNotFound) {
+			t.Errorf("expected ErrRunNotFound for non-existent run, got res=%+v, err=%v", resNF, errNF)
+		}
+	})
+
+	t.Run("concurrent cancellations in postgres", func(t *testing.T) {
+		orgID := createOrg("Concurrent Cancel Org")
+		runID := uuid.New().String()
+
+		if err := s.CreateRun(ctx, &drevtypes.Run{
+			ID:         runID,
+			OrgID:      orgID,
+			PipelineID: "p-pg-conc",
+			Status:     drevtypes.StatusPending,
+		}); err != nil {
+			t.Fatalf("CreateRun() error = %v", err)
+		}
+
+		concurrency := 15
+		var wg sync.WaitGroup
+		results := make([]*CancelResult, concurrency)
+		errs := make([]error, concurrency)
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				results[idx], errs[idx] = s.CancelRun(ctx, runID, orgID)
+			}(i)
+		}
+		wg.Wait()
+
+		var wins, alreadies int
+		for i := 0; i < concurrency; i++ {
+			if errs[i] != nil {
+				t.Fatalf("concurrent cancel error: %v", errs[i])
+			}
+			if results[i].AlreadyDone {
+				alreadies++
+			} else {
+				wins++
+			}
+		}
+
+		if wins != 1 {
+			t.Errorf("expected exactly 1 win, got %d", wins)
+		}
+		if alreadies != concurrency-1 {
+			t.Errorf("expected %d AlreadyDone, got %d", concurrency-1, alreadies)
+		}
+	})
 }

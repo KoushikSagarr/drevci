@@ -75,9 +75,10 @@ type Run struct {
 	CommitSHA        string    `json:"commit_sha,omitempty"`
 	CommitMsg        string    `json:"commit_msg,omitempty"`
 	Branch           string    `json:"branch,omitempty"`
-	StartedAt        time.Time `json:"started_at"`
-	FinishedAt       time.Time `json:"finished_at"`
-	Jobs             []RunJob  `json:"jobs"`
+	StartedAt               time.Time  `json:"started_at"`
+	FinishedAt              time.Time  `json:"finished_at"`
+	CancellationRequestedAt *time.Time `json:"cancellation_requested_at,omitempty"`
+	Jobs                    []RunJob   `json:"jobs"`
 }
 
 // RunJob tracks the execution state of an individual job within a run.
@@ -93,6 +94,7 @@ type RunJob struct {
 
 // Controlled failure reasons and interruption stages for ghost-run and failure diagnostics.
 const (
+	FailureReasonCancelled                 = "cancelled"
 	FailureReasonInterruptedByDaemonRestart = "interrupted_by_daemon_restart"
 	FailureReasonCancelledByDaemonRestart   = "cancelled_by_daemon_restart"
 	FailureReasonPreparationFailed         = "preparation_failed"
