@@ -2776,6 +2776,281 @@ func TestPostgresStore_ResetGhostRuns_JobAndRunDiagnostics(t *testing.T) {
 	}
 }
 
+func TestPostgresStore_ResetGhostRuns_Cancellation_MixedJobStates(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	orgID := uuid.New().String()
+	runID := uuid.New().String()
+	startedAt := time.Now().UTC().Add(-15 * time.Minute)
+	cancelTime := time.Now().UTC().Add(-5 * time.Minute)
+
+	run := &drevtypes.Run{
+		ID:                      runID,
+		OrgID:                   orgID,
+		PipelineName:            "test-cancel-pipeline",
+		Status:                  drevtypes.StatusRunning,
+		StartedAt:               startedAt,
+		CancellationRequestedAt: &cancelTime,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	finTime := time.Now().UTC().Add(-8 * time.Minute)
+	jSuccID := uuid.New().String()
+	jFailID := uuid.New().String()
+	jSkipID := uuid.New().String()
+	jRunID := uuid.New().String()
+	jPendID := uuid.New().String()
+
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:         jSuccID,
+			RunID:      runID,
+			JobName:    "job-success",
+			Status:     drevtypes.StatusSuccess,
+			StartedAt:  startedAt,
+			FinishedAt: finTime,
+		},
+		{
+			ID:            jFailID,
+			RunID:         runID,
+			JobName:       "job-failed",
+			Status:        drevtypes.StatusFailed,
+			StartedAt:     startedAt,
+			FinishedAt:    finTime,
+			FailureReason: drevtypes.FailureReasonCommandFailed,
+		},
+		{
+			ID:         jSkipID,
+			RunID:      runID,
+			JobName:    "job-skipped",
+			Status:     drevtypes.StatusSkipped,
+			StartedAt:  startedAt,
+			FinishedAt: finTime,
+		},
+		{
+			ID:        jRunID,
+			RunID:     runID,
+			JobName:   "job-running",
+			Status:    drevtypes.StatusRunning,
+			StartedAt: startedAt,
+		},
+		{
+			ID:      jPendID,
+			RunID:   runID,
+			JobName: "job-pending",
+			Status:  drevtypes.StatusPending,
+		},
+	}
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	if len(interrupted) != 1 || interrupted[0] != runID {
+		t.Fatalf("expected [%s], got %v", runID, interrupted)
+	}
+
+	updatedRun, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if updatedRun.Status != drevtypes.StatusCancelled {
+		t.Errorf("status = %s, want %s", updatedRun.Status, drevtypes.StatusCancelled)
+	}
+	if updatedRun.FailureReason != drevtypes.FailureReasonCancelled {
+		t.Errorf("failure_reason = %q, want %q", updatedRun.FailureReason, drevtypes.FailureReasonCancelled)
+	}
+	if updatedRun.InterruptedStage != drevtypes.StageExecution {
+		t.Errorf("interrupted_stage = %q, want %q", updatedRun.InterruptedStage, drevtypes.StageExecution)
+	}
+	if updatedRun.FinishedAt.IsZero() {
+		t.Errorf("finished_at was not populated")
+	}
+	if updatedRun.CancellationRequestedAt == nil || !updatedRun.CancellationRequestedAt.Equal(cancelTime) {
+		t.Errorf("cancellation_requested_at corrupted: got %v, want %v", updatedRun.CancellationRequestedAt, cancelTime)
+	}
+
+	updatedJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	jobMap := make(map[string]*drevtypes.RunJob)
+	for _, j := range updatedJobs {
+		jobMap[j.ID] = j
+	}
+
+	if jobMap[jRunID].Status != drevtypes.StatusCancelled || jobMap[jRunID].FailureReason != drevtypes.FailureReasonCancelled {
+		t.Errorf("running job state mismatch: status=%s, reason=%s", jobMap[jRunID].Status, jobMap[jRunID].FailureReason)
+	}
+	if jobMap[jPendID].Status != drevtypes.StatusCancelled || jobMap[jPendID].FailureReason != drevtypes.FailureReasonCancelled {
+		t.Errorf("pending job state mismatch: status=%s, reason=%s", jobMap[jPendID].Status, jobMap[jPendID].FailureReason)
+	}
+	if jobMap[jSuccID].Status != drevtypes.StatusSuccess || jobMap[jSuccID].FailureReason != "" {
+		t.Errorf("success job mutated: status=%s, reason=%s", jobMap[jSuccID].Status, jobMap[jSuccID].FailureReason)
+	}
+	if jobMap[jFailID].Status != drevtypes.StatusFailed || jobMap[jFailID].FailureReason != drevtypes.FailureReasonCommandFailed {
+		t.Errorf("failed job mutated: status=%s, reason=%s", jobMap[jFailID].Status, jobMap[jFailID].FailureReason)
+	}
+	if jobMap[jSkipID].Status != drevtypes.StatusSkipped || jobMap[jSkipID].FailureReason != "" {
+		t.Errorf("skipped job mutated: status=%s, reason=%s", jobMap[jSkipID].Status, jobMap[jSkipID].FailureReason)
+	}
+}
+
+func TestPostgresStore_ResetGhostRuns_Cancellation_Stages(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	orgID := uuid.New().String()
+	cancelTime := time.Now().UTC().Add(-2 * time.Minute)
+	startedAt := time.Now().UTC().Add(-10 * time.Minute)
+
+	// Scenario 1: Preparation stage (no jobs)
+	runPrepID := uuid.New().String()
+	runPrep := &drevtypes.Run{
+		ID:                      runPrepID,
+		OrgID:                   orgID,
+		PipelineName:            "pipe-prep",
+		Status:                  drevtypes.StatusRunning,
+		StartedAt:               startedAt,
+		CancellationRequestedAt: &cancelTime,
+	}
+	if err := s.CreateRun(ctx, runPrep); err != nil {
+		t.Fatalf("CreateRun prep: %v", err)
+	}
+
+	// Scenario 2: Finalization stage (all jobs terminal)
+	runFinID := uuid.New().String()
+	runFin := &drevtypes.Run{
+		ID:                      runFinID,
+		OrgID:                   orgID,
+		PipelineName:            "pipe-fin",
+		Status:                  drevtypes.StatusRunning,
+		StartedAt:               startedAt,
+		CancellationRequestedAt: &cancelTime,
+	}
+	if err := s.CreateRun(ctx, runFin); err != nil {
+		t.Fatalf("CreateRun fin: %v", err)
+	}
+	finJobs := []*drevtypes.RunJob{
+		{
+			ID:         uuid.New().String(),
+			RunID:      runFinID,
+			JobName:    "job-done",
+			Status:     drevtypes.StatusSuccess,
+			StartedAt:  startedAt,
+			FinishedAt: time.Now().UTC().Add(-5 * time.Minute),
+		},
+	}
+	if err := s.CreateRunJobs(ctx, runFinID, finJobs); err != nil {
+		t.Fatalf("CreateRunJobs fin: %v", err)
+	}
+
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	if len(interrupted) != 2 {
+		t.Fatalf("expected 2 interrupted runs, got %d (%v)", len(interrupted), interrupted)
+	}
+
+	upPrep, err := s.GetRun(ctx, runPrepID)
+	if err != nil {
+		t.Fatalf("GetRun prep: %v", err)
+	}
+	if upPrep.Status != drevtypes.StatusCancelled {
+		t.Errorf("prep status = %s, want %s", upPrep.Status, drevtypes.StatusCancelled)
+	}
+	if upPrep.InterruptedStage != drevtypes.StagePreparation {
+		t.Errorf("prep stage = %q, want %q", upPrep.InterruptedStage, drevtypes.StagePreparation)
+	}
+
+	upFin, err := s.GetRun(ctx, runFinID)
+	if err != nil {
+		t.Fatalf("GetRun fin: %v", err)
+	}
+	if upFin.Status != drevtypes.StatusCancelled {
+		t.Errorf("fin status = %s, want %s", upFin.Status, drevtypes.StatusCancelled)
+	}
+	if upFin.InterruptedStage != drevtypes.StageFinalization {
+		t.Errorf("fin stage = %q, want %q", upFin.InterruptedStage, drevtypes.StageFinalization)
+	}
+}
+
+func TestPostgresStore_ResetGhostRuns_TimestampPreservation(t *testing.T) {
+	s := testDB(t)
+	ctx := context.Background()
+
+	orgID := uuid.New().String()
+	runID := uuid.New().String()
+	cancelTime := time.Date(2026, 11, 16, 9, 30, 45, 123456789, time.UTC)
+	existingRunFin := time.Date(2026, 11, 16, 9, 29, 0, 0, time.UTC)
+	existingJobFin := time.Date(2026, 11, 16, 9, 28, 0, 0, time.UTC)
+
+	run := &drevtypes.Run{
+		ID:                      runID,
+		OrgID:                   orgID,
+		PipelineName:            "pipe-ts",
+		Status:                  drevtypes.StatusRunning,
+		StartedAt:               time.Now().UTC().Add(-10 * time.Minute),
+		FinishedAt:              existingRunFin,
+		CancellationRequestedAt: &cancelTime,
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	jobID := uuid.New().String()
+	jobs := []*drevtypes.RunJob{
+		{
+			ID:         jobID,
+			RunID:      runID,
+			JobName:    "step-ts",
+			Status:     drevtypes.StatusRunning,
+			StartedAt:  time.Now().UTC().Add(-5 * time.Minute),
+			FinishedAt: existingJobFin,
+		},
+	}
+	if err := s.CreateRunJobs(ctx, runID, jobs); err != nil {
+		t.Fatalf("CreateRunJobs: %v", err)
+	}
+
+	interrupted, err := s.ResetGhostRuns(ctx)
+	if err != nil {
+		t.Fatalf("ResetGhostRuns failed: %v", err)
+	}
+	if len(interrupted) != 1 || interrupted[0] != runID {
+		t.Fatalf("expected [%s], got %v", runID, interrupted)
+	}
+
+	updatedRun, err := s.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if updatedRun.CancellationRequestedAt == nil || !updatedRun.CancellationRequestedAt.Equal(cancelTime) {
+		t.Errorf("cancellation_requested_at corrupted: got %v, want %v", updatedRun.CancellationRequestedAt, cancelTime)
+	}
+	if !updatedRun.FinishedAt.Equal(existingRunFin) {
+		t.Errorf("existing run finished_at was overwritten: got %v, want %v", updatedRun.FinishedAt, existingRunFin)
+	}
+
+	updatedJobs, err := s.GetRunJobs(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRunJobs: %v", err)
+	}
+	if len(updatedJobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(updatedJobs))
+	}
+	if !updatedJobs[0].FinishedAt.Equal(existingJobFin) {
+		t.Errorf("existing job finished_at was overwritten: got %v, want %v", updatedJobs[0].FinishedAt, existingJobFin)
+	}
+}
+
 func TestPostgres_Migration007_FileExistsAndValid(t *testing.T) {
 	data, err := os.ReadFile("../../migrations/007_cancellation_intent.sql")
 	if err != nil {

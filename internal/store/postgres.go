@@ -614,7 +614,7 @@ func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, status, started_at FROM runs
+		SELECT id, status, started_at, cancellation_requested_at FROM runs
 		WHERE status = 'running'
 		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))
 		FOR UPDATE SKIP LOCKED`)
@@ -624,14 +624,15 @@ func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	defer rows.Close()
 
 	type candidate struct {
-		id        string
-		status    string
-		startedAt sql.NullTime
+		id                      string
+		status                  string
+		startedAt               sql.NullTime
+		cancellationRequestedAt sql.NullTime
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.id, &c.status, &c.startedAt); err != nil {
+		if err := rows.Scan(&c.id, &c.status, &c.startedAt, &c.cancellationRequestedAt); err != nil {
 			return nil, err
 		}
 		candidates = append(candidates, c)
@@ -671,56 +672,104 @@ func (s *PostgresStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("reading postgres jobs for ghost run %s: %w", c.id, err)
 		}
 
+		cancelReq := scanNullTimePtr(&c.cancellationRequestedAt)
+
 		// 2. Formulate candidate Run for stage deduction
 		runObj := &drevtypes.Run{
-			ID:        c.id,
-			Status:    drevtypes.RunStatus(c.status),
-			StartedAt: scanNullTime(&c.startedAt),
+			ID:                      c.id,
+			Status:                  drevtypes.RunStatus(c.status),
+			StartedAt:               scanNullTime(&c.startedAt),
+			CancellationRequestedAt: cancelReq,
 		}
 		stage := drevtypes.DeduceInterruptedStage(runObj, jobs)
 
-		// 3. Atomically update run status to failed with failure_reason and deduced stage
-		res, err := tx.ExecContext(ctx, `
-			UPDATE runs
-			SET status = 'failed',
-			    failure_reason = 'interrupted_by_daemon_restart',
-			    interrupted_stage = $1,
-			    finished_at = CASE WHEN finished_at IS NULL THEN $2 ELSE finished_at END
-			WHERE id = $3 AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
-		if err != nil {
-			return nil, fmt.Errorf("updating postgres ghost run %s: %w", c.id, err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
+		if cancelReq != nil {
+			// Cancellation-intent recovery path:
+			// Run was requested to be cancelled before crash. Recover as cancelled.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE runs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    interrupted_stage = $1,
+				    finished_at = CASE WHEN finished_at IS NULL THEN $2 ELSE finished_at END
+				WHERE id = $3 AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+			if err != nil {
+				return nil, fmt.Errorf("updating postgres cancelled ghost run %s: %w", c.id, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				continue
+			}
 
-		// 4. Mark active running jobs as failed
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs
-			SET status = 'failed',
-			    failure_reason = 'interrupted_by_daemon_restart',
-			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
-			WHERE run_id = $2 AND status = 'running'`, now, c.id); err != nil {
-			return nil, fmt.Errorf("updating postgres running ghost jobs for %s: %w", c.id, err)
-		}
+			// Mark active running jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+				WHERE run_id = $2 AND status = 'running'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating postgres running jobs to cancelled for ghost run %s: %w", c.id, err)
+			}
 
-		// 5. Mark unstarted pending jobs as cancelled
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs
-			SET status = 'cancelled',
-			    failure_reason = 'cancelled_by_daemon_restart',
-			    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
-			WHERE run_id = $2 AND status = 'pending'`, now, c.id); err != nil {
-			return nil, fmt.Errorf("updating postgres pending ghost jobs for %s: %w", c.id, err)
-		}
+			// Mark unstarted pending jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+				WHERE run_id = $2 AND status = 'pending'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating postgres pending jobs to cancelled for ghost run %s: %w", c.id, err)
+			}
 
-		// 6. Release webhook delivery claim
-		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = $1`, c.id); err != nil {
-			return nil, fmt.Errorf("releasing postgres webhook delivery for ghost run %s: %w", c.id, err)
+			// Note: webhook_deliveries is strictly preserved for idempotency when cancelled.
+		} else {
+			// Ordinary daemon-restart recovery path:
+			// Run crashed unexpectedly without cancellation intent. Recover as failed.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE runs
+				SET status = 'failed',
+				    failure_reason = 'interrupted_by_daemon_restart',
+				    interrupted_stage = $1,
+				    finished_at = CASE WHEN finished_at IS NULL THEN $2 ELSE finished_at END
+				WHERE id = $3 AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+			if err != nil {
+				return nil, fmt.Errorf("updating postgres ghost run %s: %w", c.id, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				continue
+			}
+
+			// Mark active running jobs as failed
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'failed',
+				    failure_reason = 'interrupted_by_daemon_restart',
+				    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+				WHERE run_id = $2 AND status = 'running'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating postgres running ghost jobs for %s: %w", c.id, err)
+			}
+
+			// Mark unstarted pending jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled_by_daemon_restart',
+				    finished_at = CASE WHEN finished_at IS NULL THEN $1 ELSE finished_at END
+				WHERE run_id = $2 AND status = 'pending'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating postgres pending ghost jobs for %s: %w", c.id, err)
+			}
+
+			// Release webhook delivery claim
+			if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = $1`, c.id); err != nil {
+				return nil, fmt.Errorf("releasing postgres webhook delivery for ghost run %s: %w", c.id, err)
+			}
 		}
 
 		ids = append(ids, c.id)

@@ -863,7 +863,7 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, status, started_at FROM runs
+		SELECT id, status, started_at, cancellation_requested_at FROM runs
 		WHERE status = 'running'
 		   OR (status = 'pending' AND id NOT IN (SELECT run_id FROM pipeline_outbox))`)
 	if err != nil {
@@ -872,14 +872,15 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 	defer rows.Close()
 
 	type candidate struct {
-		id        string
-		status    string
-		startedAt sql.NullString
+		id                      string
+		status                  string
+		startedAt               sql.NullString
+		cancellationRequestedAt sql.NullString
 	}
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.id, &c.status, &c.startedAt); err != nil {
+		if err := rows.Scan(&c.id, &c.status, &c.startedAt, &c.cancellationRequestedAt); err != nil {
 			return nil, err
 		}
 		candidates = append(candidates, c)
@@ -919,57 +920,106 @@ func (s *SQLiteStore) ResetGhostRuns(ctx context.Context) ([]string, error) {
 			return nil, fmt.Errorf("reading jobs for ghost run %s: %w", c.id, err)
 		}
 
+		cancelReq := scanTimePtr(&c.cancellationRequestedAt)
+
 		// 2. Formulate candidate Run for stage deduction
 		runObj := &drevtypes.Run{
-			ID:        c.id,
-			Status:    drevtypes.RunStatus(c.status),
-			StartedAt: scanTime(&c.startedAt),
+			ID:                      c.id,
+			Status:                  drevtypes.RunStatus(c.status),
+			StartedAt:               scanTime(&c.startedAt),
+			CancellationRequestedAt: cancelReq,
 		}
 		stage := drevtypes.DeduceInterruptedStage(runObj, jobs)
 
-		// 3. Atomically update run status to failed with failure_reason and deduced stage
-		res, err := tx.ExecContext(ctx, `
-			UPDATE runs
-			SET status = 'failed',
-			    failure_reason = 'interrupted_by_daemon_restart',
-			    interrupted_stage = ?,
-			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-			WHERE id = ? AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
-		if err != nil {
-			return nil, fmt.Errorf("updating ghost run %s: %w", c.id, err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			// Another concurrent transaction already transitioned this run
-			continue
-		}
+		if cancelReq != nil {
+			// Cancellation-intent recovery path:
+			// Run was requested to be cancelled before crash. Recover as cancelled.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE runs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    interrupted_stage = ?,
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE id = ? AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+			if err != nil {
+				return nil, fmt.Errorf("updating cancelled ghost run %s: %w", c.id, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				// Another concurrent transaction already transitioned this run
+				continue
+			}
 
-		// 4. Mark active running jobs as failed
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs
-			SET status = 'failed',
-			    failure_reason = 'interrupted_by_daemon_restart',
-			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-			WHERE run_id = ? AND status = 'running'`, now, c.id); err != nil {
-			return nil, fmt.Errorf("updating running ghost jobs for %s: %w", c.id, err)
-		}
+			// Mark active running jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE run_id = ? AND status = 'running'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating running ghost jobs to cancelled for %s: %w", c.id, err)
+			}
 
-		// 5. Mark unstarted pending jobs as cancelled
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE run_jobs
-			SET status = 'cancelled',
-			    failure_reason = 'cancelled_by_daemon_restart',
-			    finished_at = CASE WHEN finished_at IS NULL THEN ? ELSE finished_at END
-			WHERE run_id = ? AND status = 'pending'`, now, c.id); err != nil {
-			return nil, fmt.Errorf("updating pending ghost jobs for %s: %w", c.id, err)
-		}
+			// Mark unstarted pending jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled',
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE run_id = ? AND status = 'pending'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating pending ghost jobs to cancelled for %s: %w", c.id, err)
+			}
 
-		// 6. Release webhook delivery claim
-		if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, c.id); err != nil {
-			return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", c.id, err)
+			// Note: webhook_deliveries is strictly preserved for idempotency when cancelled.
+		} else {
+			// Ordinary daemon-restart recovery path:
+			// Run crashed unexpectedly without cancellation intent. Recover as failed.
+			res, err := tx.ExecContext(ctx, `
+				UPDATE runs
+				SET status = 'failed',
+				    failure_reason = 'interrupted_by_daemon_restart',
+				    interrupted_stage = ?,
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE id = ? AND (status = 'running' OR status = 'pending')`, stage, now, c.id)
+			if err != nil {
+				return nil, fmt.Errorf("updating ghost run %s: %w", c.id, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				// Another concurrent transaction already transitioned this run
+				continue
+			}
+
+			// Mark active running jobs as failed
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'failed',
+				    failure_reason = 'interrupted_by_daemon_restart',
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE run_id = ? AND status = 'running'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating running ghost jobs for %s: %w", c.id, err)
+			}
+
+			// Mark unstarted pending jobs as cancelled
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE run_jobs
+				SET status = 'cancelled',
+				    failure_reason = 'cancelled_by_daemon_restart',
+				    finished_at = CASE WHEN finished_at IS NULL OR finished_at = '' THEN ? ELSE finished_at END
+				WHERE run_id = ? AND status = 'pending'`, now, c.id); err != nil {
+				return nil, fmt.Errorf("updating pending ghost jobs for %s: %w", c.id, err)
+			}
+
+			// Release webhook delivery claim
+			if _, err := tx.ExecContext(ctx, `DELETE FROM webhook_deliveries WHERE run_id = ?`, c.id); err != nil {
+				return nil, fmt.Errorf("releasing webhook delivery for ghost run %s: %w", c.id, err)
+			}
 		}
 
 		ids = append(ids, c.id)
